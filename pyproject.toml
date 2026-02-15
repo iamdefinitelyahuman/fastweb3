@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastweb3"
+version = "0.1.0"
+description = "High-performance Web3 client with batching and latency optimization."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+    { name = "iamdefinitelyahuman" }
+]
+
+dependencies = [
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.9",
+    "pre-commit>=3",
+    "build",
+    "twine",
+]
+
+[project.urls]
+Homepage = "https://github.com/iamdefinitelyahuman/fastweb3"
+Repository = "https://github.com/iamdefinitelyahuman/fastweb3"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
