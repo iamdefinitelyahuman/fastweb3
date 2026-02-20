@@ -1,9 +1,9 @@
-# fastweb3/web3.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence, Union
 
+from .deferred import Handle, deferred_response
 from .errors import NoEndpoints
 from .formatters import to_int
 from .provider import Provider, RetryPolicy
@@ -72,7 +72,14 @@ class Web3:
         kind: "read" or "write" (routing hint)
         formatter: optional post-processor for result
         """
-        return self.provider.request(method, params, kind=kind, formatter=formatter)
+
+        def bg_func(h: Handle) -> None:
+            # No formatter here: formatting must only happen in format_func.
+            raw = self.provider.request(method, params, kind=kind, formatter=None)
+            h.set_value(raw)
+
+        # ref_func unused for now (later: batching flush barrier)
+        return deferred_response(bg_func, format_func=formatter, ref_func=None)
 
     # ---- scaffolding for later batching ----
 
