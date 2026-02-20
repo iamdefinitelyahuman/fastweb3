@@ -1,4 +1,5 @@
 import threading
+import traceback
 from typing import Any, Callable, Optional
 
 from lazy_object_proxy import Proxy
@@ -44,6 +45,9 @@ class Handle:
         self._ref_func = ref_func
         self._ref_ran = False
 
+        # Capture creation site (strip this __init__ frame)
+        self._created_stack = traceback.format_stack()[:-1]
+
         def execute_in_background() -> None:
             try:
                 bg_func(self)
@@ -54,19 +58,12 @@ class Handle:
 
         threading.Thread(target=execute_in_background, daemon=True).start()
 
-    # ---- setters (single-assignment) ----
-
     def set_exc(self, exc: BaseException) -> None:
         with self.lock:
             if self._exc is None:
                 self._exc = exc
 
     def set_value(self, raw_value: Any) -> None:
-        """
-        Publish the final value exactly once.
-
-        If format_func is provided, it is applied to raw_value before storing.
-        """
         with self.lock:
             if self._exc is not None:
                 raise self._exc
@@ -87,14 +84,6 @@ class Handle:
                 raise Exception("Value already set")
             self._value = final_value
 
-    # ---- internal helpers ----
-
-    def _raise_if_exc(self) -> None:
-        with self.lock:
-            exc = self._exc
-        if exc is not None:
-            raise exc
-
     def _maybe_run_ref(self) -> None:
         with self.lock:
             if self._value is not _UNSET:
@@ -110,21 +99,36 @@ class Handle:
             self.set_exc(exc)
             raise
 
-    # ---- public ----
+    def _add_creation_note(self, exc: BaseException) -> None:
+        # Add exactly once per exception instance
+        if getattr(exc, "_fastweb3_creation_note", False):
+            return
+        setattr(exc, "_fastweb3_creation_note", True)
+
+        exc.add_note(
+            "Deferred value was created at (most recent call last):\n"
+            + "".join(self._created_stack)
+        )
 
     def get_value(self) -> Any:
         self.event.wait()
-        self._raise_if_exc()
 
         self._maybe_run_ref()
-        self._raise_if_exc()
 
         with self.lock:
-            if self._exc is not None:
-                raise self._exc
-            if self._value is _UNSET:
-                raise AttributeError("Deferred value was not set")
-            return self._value
+            exc = self._exc
+            value = self._value
+
+        if exc is not None:
+            self._add_creation_note(exc)
+            raise exc
+
+        if value is _UNSET:
+            e = AttributeError("Deferred value was not set")
+            self._add_creation_note(e)
+            raise e
+
+        return value
 
 
 def deferred_response(
