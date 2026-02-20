@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, List, Mapping, Optional, Union
 
 import httpx
+
+JSONObj = Mapping[str, Any]
+JSONPayload = Union[JSONObj, List[JSONObj]]
+JSONResp = Union[dict[str, Any], list[dict[str, Any]]]
 
 
 @dataclass(frozen=True)
@@ -64,10 +68,12 @@ class HTTPTransport:
         if self._owns_client:
             self._client.close()
 
-    def send(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def send(self, payload: JSONPayload) -> JSONResp:
         resp = self._client.post(self.url, json=payload)
         resp.raise_for_status()
         data = resp.json()
-        if not isinstance(data, dict):
-            raise TypeError(f"Expected JSON object (dict), got {type(data).__name__}")
+        if not isinstance(data, (dict, list)):
+            raise TypeError(f"Expected JSON object or array, got {type(data).__name__}")
+        if isinstance(data, list) and not all(isinstance(x, dict) for x in data):
+            raise TypeError("Expected JSON array of objects")
         return data

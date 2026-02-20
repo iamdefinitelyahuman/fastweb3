@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import httpx
 
@@ -93,10 +93,78 @@ class Endpoint:
             result = formatter(result)
         return result
 
-    # ---- scaffolding for later batching (intentionally inert for now) ----
+    def request_batch(
+        self,
+        calls: Sequence[tuple[str, list[Any] | tuple[Any, ...]]],
+        *,
+        formatters: Mapping[int, Formatter] | None = None,  # keyed by index in calls
+    ) -> list[Any]:
+        # allocate ids
+        ids: list[int] = []
+        payload: list[dict[str, Any]] = []
+        for method, params in calls:
+            request_id = next(self._counter)
+            ids.append(request_id)
+            payload.append(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": list(params),
+                }
+            )
 
-    def batch(self):
-        """
-        Placeholder for future per-thread batching on this endpoint.
-        """
-        raise NotImplementedError("Batching not implemented yet")
+        try:
+            resp = self.transport.send(payload)
+        except httpx.HTTPError as exc:
+            raise TransportError(str(exc)) from exc
+        except TransportError:
+            raise
+
+        if not isinstance(resp, list):
+            raise RPCMalformedResponse(f"Batch response must be a list, got: {type(resp).__name__}")
+
+        by_id: dict[int, dict[str, Any]] = {}
+        for item in resp:
+            if not isinstance(item, dict):
+                raise RPCMalformedResponse(f"Batch item must be dict: {item!r}")
+            if item.get("jsonrpc") != "2.0":
+                raise RPCMalformedResponse(f"Invalid jsonrpc in batch item: {item!r}")
+            if "id" not in item:
+                raise RPCMalformedResponse(f"Missing id in batch item: {item!r}")
+            _id = item["id"]
+            if not isinstance(_id, int):
+                raise RPCMalformedResponse(f"Non-int id in batch item: {item!r}")
+            if _id in by_id:
+                raise RPCMalformedResponse(f"Duplicate id in batch response: {_id}")
+            by_id[_id] = item
+
+        # ensure all requested ids exist
+        for _id in ids:
+            if _id not in by_id:
+                raise RPCMalformedResponse(f"Missing id {_id} in batch response")
+
+        out: list[Any] = []
+        for i, _id in enumerate(ids):
+            item = by_id[_id]
+            if item.get("error") is not None:
+                err = item["error"]
+                if isinstance(err, dict):
+                    details = RPCErrorDetails(
+                        code=err.get("code"),
+                        message=err.get("message"),
+                        data=err.get("data"),
+                    )
+                else:
+                    details = RPCErrorDetails(code=None, message=str(err), data=None)
+                raise RPCError(details)
+
+            if "result" not in item:
+                raise RPCMalformedResponse(f"Missing result in batch item: {item!r}")
+
+            val = item["result"]
+            if formatters is not None and i in formatters:
+                val = formatters[i](val)
+            out.append(val)
+
+        return out
