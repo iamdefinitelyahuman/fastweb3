@@ -70,6 +70,8 @@ class Web3:
             self.provider = provider_for_chain(
                 int(chain_id),
                 priority_endpoints=endpoints,
+                retry_policy_read=self.config.retry_policy_read,
+                retry_policy_write=self.config.retry_policy_write,
             )
 
         # Namespaces

@@ -11,7 +11,7 @@ from typing import Iterator, Optional, Sequence
 import httpx
 
 from .deferred import Handle, deferred_response
-from .provider import Provider
+from .provider import Provider, RetryPolicy
 from .transport.http import HTTPTransport, HTTPTransportConfig
 
 CHAINS_URL = (
@@ -206,6 +206,8 @@ def provider_for_chain(
     max_lag_blocks: int = 8,
     probe_timeout_s: float = 1.5,
     probe_workers: int = 32,
+    retry_policy_read: Optional[RetryPolicy] = None,
+    retry_policy_write: Optional[RetryPolicy] = None,
 ) -> Provider:
     """
     Returns a Provider proxy (deferred) for a given chain_id.
@@ -229,9 +231,12 @@ def provider_for_chain(
         best_head: int | None = None
 
         # Hybrid mode: publish immediately with user endpoints as primary.
-        # (We do not validate these yet; discovery is still used to add reliable public fallbacks.)
         if priority_urls:
-            provider = Provider(priority_urls)
+            provider = Provider(
+                priority_urls,
+                retry_policy_read=retry_policy_read,
+                retry_policy_write=retry_policy_write,
+            )
             h.set_value(provider)  # READY NOW (user endpoints)
 
         # Probe public endpoints and grow the pool over time.
@@ -243,12 +248,15 @@ def provider_for_chain(
         ):
             best_head = pr.head if best_head is None else max(best_head, pr.head)
 
-            # Drop nodes that are materially behind our best observed head.
             if best_head is not None and (best_head - pr.head) > max_lag_blocks:
                 continue
 
             if provider is None:
-                provider = Provider([pr.url])
+                provider = Provider(
+                    [pr.url],
+                    retry_policy_read=retry_policy_read,
+                    retry_policy_write=retry_policy_write,
+                )
                 h.set_value(provider)  # READY NOW (first good public endpoint)
             else:
                 provider.add_url(pr.url, priority=False)
@@ -256,7 +264,6 @@ def provider_for_chain(
             if provider.endpoint_count() >= max(target_pool, len(priority_urls)):
                 break
 
-        # If we never published a provider at all, discovery fully failed.
         if provider is None:
             raise RuntimeError(
                 f"No usable batch-capable RPC endpoints found for chain_id={chain_id}"
