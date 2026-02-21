@@ -21,6 +21,18 @@ CHAINS_URL = (
 )
 
 
+POOL_EPOCH_SLEEP_S = 15 * 60  # how often we rescan the public list
+POOL_HEALTH_INTERVAL_S = 60.0  # how often we probe active endpoints
+POOL_IMPROVE_FRACTION = 0.20  # candidate must be 20% faster to replace
+POOL_REPLACE_COOLDOWN_S = 10.0  # minimum seconds between replacements
+POOL_EVICTION_COOLDOWN_S = 15 * 60  # don't re-add recently evicted URLs
+
+# Probe safety net: probe pass terminates within a bounded wall-clock time.
+# This prevents discovery from hanging forever if transports wedge.
+PROBE_DEADLINE_MULTIPLIER = 4.0
+PROBE_DEADLINE_MIN_S = 5.0
+
+
 _provider_pool_lock = threading.Lock()
 _provider_pool_by_chain: dict[int, Provider] = {}
 
@@ -107,12 +119,73 @@ def _hex_to_int(x: object) -> int:
     return int(x, 16)
 
 
+_PROBE_PAYLOAD = [
+    {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []},
+    {"jsonrpc": "2.0", "id": 2, "method": "eth_blockNumber", "params": []},
+]
+
+
+def _probe_one(
+    url: str,
+    *,
+    expected_chain_id: int,
+    timeout_s: float,
+) -> ProbeResult:
+    """
+    Probe a single URL using the strict batch contract.
+    Raises on any mismatch / batch violation / transport error.
+    """
+    expected_hex = hex(expected_chain_id).lower()
+
+    cfg = HTTPTransportConfig(
+        timeout=timeout_s,
+        connect_timeout=timeout_s,
+        read_timeout=timeout_s,
+        write_timeout=timeout_s,
+        pool_timeout=timeout_s,
+        max_connections=10,
+        max_keepalive_connections=5,
+        keepalive_expiry=10.0,
+    )
+
+    t0 = time.perf_counter()
+    tr = HTTPTransport(url, config=cfg)
+    try:
+        resp = tr.send(_PROBE_PAYLOAD)
+
+        if not isinstance(resp, list) or not all(isinstance(x, dict) for x in resp):
+            raise RuntimeError("Non-batch response")
+
+        by_id: dict[int, dict] = {}
+        for item in resp:
+            _id = item.get("id")
+            if not isinstance(_id, int) or _id in by_id:
+                raise RuntimeError("Bad/duplicate id")
+            by_id[_id] = item
+
+        if 1 not in by_id or 2 not in by_id:
+            raise RuntimeError("Missing response ids")
+
+        chain = by_id[1].get("result")
+        if not isinstance(chain, str) or chain.lower() != expected_hex:
+            raise RuntimeError("Wrong chainId")
+
+        head_hex = by_id[2].get("result")
+        head = _hex_to_int(head_hex)
+
+        rtt_ms = (time.perf_counter() - t0) * 1000.0
+        return ProbeResult(url=url, rtt_ms=rtt_ms, head=head)
+    finally:
+        tr.close()
+
+
 def probe_urls_streaming(
     urls: list[str],
     *,
     expected_chain_id: int,
     timeout_s: float = 1.5,
     max_workers: int = 32,
+    deadline_s: float | None = None,
 ) -> Iterator[ProbeResult]:
     """
     Probe candidate RPC URLs and stream back successes as they arrive.
@@ -122,8 +195,6 @@ def probe_urls_streaming(
       - must answer eth_chainId == expected_chain_id
       - must answer eth_blockNumber (parsed as int)
       - records RTT
-
-    This is intentionally strict because fastweb3 will rely heavily on batching.
     """
 
     # Dedup + normalize upfront so we don't waste probe workers.
@@ -138,13 +209,24 @@ def probe_urls_streaming(
         seen.add(nu)
         candidates.append(nu)
 
-    out: "queue.Queue[Optional[ProbeResult]]" = queue.Queue()
+    if not candidates:
+        return
+        yield  # unreachable, keeps typing happy
 
-    # Batch probe: validate both chain and head.
-    payload = [
-        {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []},
-        {"jsonrpc": "2.0", "id": 2, "method": "eth_blockNumber", "params": []},
-    ]
+    if deadline_s is None:
+        deadline_s = max(PROBE_DEADLINE_MIN_S, PROBE_DEADLINE_MULTIPLIER * float(timeout_s))
+    deadline = time.perf_counter() + float(deadline_s)
+
+    work_q: "queue.Queue[Optional[str]]" = queue.Queue()
+    out_q: "queue.Queue[ProbeResult]" = queue.Queue()
+
+    for u in candidates:
+        work_q.put(u)
+
+    worker_count = max(1, min(int(max_workers), len(candidates)))
+    for _ in range(worker_count):
+        work_q.put(None)
+
     expected_hex = hex(expected_chain_id).lower()
 
     cfg = HTTPTransportConfig(
@@ -153,79 +235,184 @@ def probe_urls_streaming(
         read_timeout=timeout_s,
         write_timeout=timeout_s,
         pool_timeout=timeout_s,
-        # keep connections modest during probing; this is a one-shot burst
-        max_connections=max(50, max_workers),
-        max_keepalive_connections=min(20, max_workers),
+        # keep connections modest during probing; this is a burst
+        max_connections=max(50, worker_count),
+        max_keepalive_connections=min(20, worker_count),
         keepalive_expiry=10.0,
     )
 
-    sem = threading.Semaphore(max_workers)
-    threads: list[threading.Thread] = []
-
-    def worker(u: str) -> None:
-        t0 = time.perf_counter()
-        tr = HTTPTransport(u, config=cfg)
-        try:
-            resp = tr.send(payload)
-
-            # Strict: must be a list[dict]
-            if not isinstance(resp, list) or not all(isinstance(x, dict) for x in resp):
+    def worker() -> None:
+        while True:
+            u = work_q.get()
+            if u is None:
                 return
 
-            by_id: dict[int, dict] = {}
-            for item in resp:
-                _id = item.get("id")
-                if not isinstance(_id, int):
-                    return
-                if _id in by_id:
-                    return
-                by_id[_id] = item
-
-            if 1 not in by_id or 2 not in by_id:
-                return
-
-            chain = by_id[1].get("result")
-            if not isinstance(chain, str) or chain.lower() != expected_hex:
-                return
-
-            head_hex = by_id[2].get("result")
-            head = _hex_to_int(head_hex)
-
-            rtt_ms = (time.perf_counter() - t0) * 1000.0
-            out.put(ProbeResult(url=u, rtt_ms=rtt_ms, head=head))
-        except Exception:
-            return
-        finally:
-            tr.close()
-
-    def launch(u: str) -> None:
-        sem.acquire()
-
-        def run() -> None:
+            t0 = time.perf_counter()
+            tr = HTTPTransport(u, config=cfg)
             try:
-                worker(u)
+                resp = tr.send(_PROBE_PAYLOAD)
+
+                if not isinstance(resp, list) or not all(isinstance(x, dict) for x in resp):
+                    continue
+
+                by_id: dict[int, dict] = {}
+                ok = True
+                for item in resp:
+                    _id = item.get("id")
+                    if not isinstance(_id, int) or _id in by_id:
+                        ok = False
+                        break
+                    by_id[_id] = item
+
+                if not ok or 1 not in by_id or 2 not in by_id:
+                    continue
+
+                chain = by_id[1].get("result")
+                if not isinstance(chain, str) or chain.lower() != expected_hex:
+                    continue
+
+                head_hex = by_id[2].get("result")
+                head = _hex_to_int(head_hex)
+
+                rtt_ms = (time.perf_counter() - t0) * 1000.0
+                out_q.put(ProbeResult(url=u, rtt_ms=rtt_ms, head=head))
+            except Exception:
+                continue
             finally:
-                sem.release()
+                tr.close()
 
-        t = threading.Thread(target=run, daemon=True)
-        t.start()
-        threads.append(t)
+    for _ in range(worker_count):
+        threading.Thread(target=worker, daemon=True).start()
 
-    for u in candidates:
-        launch(u)
-
-    def joiner() -> None:
-        for t in threads:
-            t.join()
-        out.put(None)
-
-    threading.Thread(target=joiner, daemon=True).start()
-
+    # Stream successes until deadline. We do NOT join workers; a wedged transport
+    # could prevent joins and hang the generator.
     while True:
-        item = out.get()
-        if item is None:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
             break
+        try:
+            item = out_q.get(timeout=min(0.2, remaining))
+        except queue.Empty:
+            continue
         yield item
+
+
+def _start_pool_maintainer(
+    *,
+    provider: Provider,
+    meta: ChainMeta,
+    chain_id: int,
+    pinned: set[str],
+    target_pool: int,
+    max_lag_blocks: int,
+    probe_timeout_s: float,
+    probe_workers: int,
+) -> None:
+    """
+    Start a daemon thread that continuously improves/repairs the provider pool.
+    This is intentionally decoupled from deferred.Handle completion semantics.
+    """
+
+    def maintain() -> None:
+        best_head: int | None = None
+        rtt_by_url: dict[str, float] = {}
+        cooldown_until: dict[str, float] = {}
+
+        next_health_ts = time.time() + POOL_HEALTH_INTERVAL_S
+        next_replace_ts = 0.0
+
+        def desired_active_count() -> int:
+            return max(target_pool, len(pinned))
+
+        def non_pinned_active_urls() -> list[str]:
+            return [u for u in provider.urls() if u not in pinned]
+
+        def try_fill(url: str) -> None:
+            # Provider handles normalization+dedup internally.
+            if url not in provider.urls():
+                provider.add_url(url)
+
+        def evict(url: str) -> None:
+            if url in pinned:
+                return
+            provider.remove_url(url)
+            cooldown_until[url] = time.time() + POOL_EVICTION_COOLDOWN_S
+
+        def health_check() -> None:
+            nonlocal next_health_ts, best_head
+            now = time.time()
+            if now < next_health_ts:
+                return
+            next_health_ts = now + POOL_HEALTH_INTERVAL_S
+
+            for u in list(provider.urls()):
+                if cooldown_until.get(u, 0.0) > now:
+                    continue
+                try:
+                    pr = _probe_one(
+                        u,
+                        expected_chain_id=chain_id,
+                        timeout_s=min(1.0, probe_timeout_s),
+                    )
+                    rtt_by_url[u] = pr.rtt_ms
+                    best_head = pr.head if best_head is None else max(best_head, pr.head)
+
+                    if best_head is not None and (best_head - pr.head) > max_lag_blocks:
+                        if u not in pinned:
+                            evict(u)
+                except Exception:
+                    if u not in pinned:
+                        evict(u)
+
+        while True:
+            # One epoch: scan public list once (bounded by probe_urls_streaming deadline)
+            for pr in probe_urls_streaming(
+                meta.rpc,
+                expected_chain_id=chain_id,
+                timeout_s=probe_timeout_s,
+                max_workers=probe_workers,
+            ):
+                health_check()
+
+                now = time.time()
+                if now < next_replace_ts:
+                    continue
+                if cooldown_until.get(pr.url, 0.0) > now:
+                    continue
+
+                best_head = pr.head if best_head is None else max(best_head, pr.head)
+                if best_head is not None and (best_head - pr.head) > max_lag_blocks:
+                    continue
+
+                rtt_by_url[pr.url] = pr.rtt_ms
+
+                if provider.endpoint_count() < desired_active_count():
+                    try_fill(pr.url)
+                    continue
+
+                act = non_pinned_active_urls()
+                if not act:
+                    continue
+
+                def rtt(u: str) -> float:
+                    return rtt_by_url.get(u, float("inf"))
+
+                victim = max(act, key=rtt)
+                victim_rtt = rtt(victim)
+
+                # Replace only if meaningfully better to avoid churn.
+                if pr.rtt_ms < victim_rtt * (1.0 - POOL_IMPROVE_FRACTION):
+                    evict(victim)
+                    try_fill(pr.url)
+                    next_replace_ts = now + POOL_REPLACE_COOLDOWN_S
+
+            # Sleep between epochs, but keep health checks running.
+            sleep_end = time.time() + POOL_EPOCH_SLEEP_S
+            while time.time() < sleep_end:
+                health_check()
+                time.sleep(5)
+
+    threading.Thread(target=maintain, daemon=True).start()
 
 
 def provider_for_chain(
@@ -271,6 +458,8 @@ def provider_for_chain(
         seen_priority.add(nu)
         priority_urls.append(nu)
 
+    pinned = set(priority_urls)
+
     def bg(h: Handle) -> None:
         reg = ChainsRegistry()
         meta = reg.get(chain_id)
@@ -278,45 +467,61 @@ def provider_for_chain(
         provider: Provider | None = None
         best_head: int | None = None
 
-        # Hybrid mode: publish immediately with user endpoints as primary.
+        # HYBRID: publish immediately and return quickly.
         if priority_urls:
             provider = Provider(
                 priority_urls,
                 retry_policy_read=retry_policy_read,
                 retry_policy_write=retry_policy_write,
             )
-            h.set_value(provider)  # READY NOW (user endpoints)
+            h.set_value(provider)  # READY NOW
 
-        # Probe public endpoints and grow the pool over time.
+            _start_pool_maintainer(
+                provider=provider,
+                meta=meta,
+                chain_id=chain_id,
+                pinned=pinned,
+                target_pool=target_pool,
+                max_lag_blocks=max_lag_blocks,
+                probe_timeout_s=probe_timeout_s,
+                probe_workers=probe_workers,
+            )
+            return
+
+        # DISCOVERY-ONLY: find the first usable public endpoint and return quickly.
+        deadline_s = max(PROBE_DEADLINE_MIN_S, PROBE_DEADLINE_MULTIPLIER * float(probe_timeout_s))
         for pr in probe_urls_streaming(
             meta.rpc,
             expected_chain_id=chain_id,
             timeout_s=probe_timeout_s,
             max_workers=probe_workers,
+            deadline_s=deadline_s,
         ):
             best_head = pr.head if best_head is None else max(best_head, pr.head)
 
             if best_head is not None and (best_head - pr.head) > max_lag_blocks:
                 continue
 
-            if provider is None:
-                provider = Provider(
-                    [pr.url],  # already normalized by probe_urls_streaming
-                    retry_policy_read=retry_policy_read,
-                    retry_policy_write=retry_policy_write,
-                )
-                h.set_value(provider)  # READY NOW (first good public endpoint)
-            else:
-                # Provider should also dedup internally, but we normalize anyway.
-                provider.add_url(normalize_url(pr.url), priority=False)
-
-            if provider.endpoint_count() >= max(target_pool, len(priority_urls)):
-                break
-
-        if provider is None:
-            raise RuntimeError(
-                f"No usable batch-capable RPC endpoints found for chain_id={chain_id}"
+            provider = Provider(
+                [pr.url],
+                retry_policy_read=retry_policy_read,
+                retry_policy_write=retry_policy_write,
             )
+            h.set_value(provider)  # READY NOW (first good public endpoint)
+
+            _start_pool_maintainer(
+                provider=provider,
+                meta=meta,
+                chain_id=chain_id,
+                pinned=pinned,
+                target_pool=target_pool,
+                max_lag_blocks=max_lag_blocks,
+                probe_timeout_s=probe_timeout_s,
+                probe_workers=probe_workers,
+            )
+            return
+
+        raise RuntimeError(f"No usable batch-capable RPC endpoints found for chain_id={chain_id}")
 
     # Create once; if another thread raced us, return the already-registered one.
     proxy = deferred_response(bg)

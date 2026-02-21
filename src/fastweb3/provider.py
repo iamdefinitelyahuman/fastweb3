@@ -122,7 +122,6 @@ class Provider:
         now = time.time()
         with self._lock:
             eps = list(self._endpoints)
-            # read states under lock for consistency
             eligible = [
                 ep for ep in eps if self._state.get(ep, _EndpointState()).cooldown_until <= now
             ]
@@ -148,6 +147,32 @@ class Provider:
                 self._endpoints.insert(0, ep)
             else:
                 self._endpoints.append(ep)
+
+    def urls(self) -> list[str]:
+        """
+        Return current endpoint URLs in provider order (thread-safe snapshot).
+        """
+        with self._lock:
+            return [e.url for e in self._endpoints]
+
+    def remove_url(self, url: str) -> None:
+        """
+        Remove an endpoint URL from the provider pool (thread-safe). No-op if missing.
+        """
+        nu = normalize_url(url)
+        ep_to_close: Endpoint | None = None
+
+        with self._lock:
+            for i, ep in enumerate(self._endpoints):
+                if normalize_url(ep.url) == nu:
+                    ep_to_close = ep
+                    del self._endpoints[i]
+                    self._seen_urls.discard(nu)
+                    self._state.pop(ep, None)
+                    break
+
+        if ep_to_close is not None:
+            ep_to_close.close()
 
     def endpoint_count(self) -> int:
         with self._lock:
@@ -198,7 +223,6 @@ class Provider:
         if kind == "write":
             chosen = self._primary()
         else:
-            # Pinning should respect cooldown so you don't pin onto a rate-limited endpoint.
             eps = self._eligible_snapshot()
             if not eps:
                 raise NoEndpoints("No endpoints available")
@@ -223,11 +247,8 @@ class Provider:
 
         pinned = self._get_pinned()
         if pinned is not None:
-            # If pinned, do no failover here; the whole point is determinism.
-            # Later you can decide if you want pinned+retry-on-same-endpoint.
             return pinned.request(method, params, formatter=formatter)
 
-        # Writes go only to primary (v0 conservative).
         if kind == "write":
             ep = self._primary()
             try:
@@ -235,7 +256,6 @@ class Provider:
                 self._mark_success(ep)
                 return result
             except Exception as exc:
-                # Still apply cooldown signals for write failures, even though we won't failover yet
                 if self.is_retryable_exc(exc):
                     self._mark_failure(ep, exc)
                 raise AllEndpointsFailed(exc) from exc
@@ -249,7 +269,6 @@ class Provider:
         last_exc: Exception | None = None
 
         for attempt in range(1, attempts + 1):
-            # Choose rr start and walk across the eligible snapshot
             with self._lock:
                 start = self._rr % len(eps)
                 self._rr = (self._rr + 1) % (1 << 30)
@@ -262,7 +281,6 @@ class Provider:
 
             except RPCError as exc:
                 last_exc = exc
-                # RPC errors are usually deterministic; only retry if configured.
                 if policy.retry_on_rpc_error and attempt < attempts:
                     time.sleep(policy.backoff_seconds)
                     continue
@@ -271,11 +289,8 @@ class Provider:
             except Exception as exc:
                 last_exc = exc
                 if self.is_retryable_exc(exc):
-                    # Cooldown this endpoint (rate-limit / timeout / transport failures)
                     self._mark_failure(ep, exc)
-
                     if attempt < attempts:
-                        # Keep the existing small global backoff between attempts
                         time.sleep(policy.backoff_seconds)
                         continue
                 break
