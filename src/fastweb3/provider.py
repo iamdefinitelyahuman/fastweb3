@@ -9,6 +9,7 @@ from typing import Any, Callable, Iterator, Optional
 from .endpoint import Endpoint, Formatter
 from .errors import AllEndpointsFailed, NoEndpoints, RPCError, TransportError
 from .transport import HTTPTransport, Transport
+from .utils import normalize_url
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,10 @@ class Provider:
       - writes: primary only
     Scaffolding:
       - per-thread pinning context (for future batching determinism)
+
+    Notes:
+      - supports dynamic pool growth via add_url()
+      - dedups URLs using a normalized form
     """
 
     def __init__(
@@ -49,9 +54,12 @@ class Provider:
 
         self._mk_transport = transport_factory or (lambda url: HTTPTransport(url))
         self._endpoints: list[Endpoint] = []
+        self._seen_urls: set[str] = set()
+
         if urls:
+            # Reuse add_url logic so normalization + dedup is identical.
             for u in urls:
-                self._endpoints.append(Endpoint(u, transport=self._mk_transport(u)))
+                self.add_url(u, priority=False)
 
         self._rr = 0
         self._tls = threading.local()
@@ -63,10 +71,17 @@ class Provider:
     def add_url(self, url: str, *, priority: bool = False) -> None:
         """
         Add a new endpoint URL to the provider pool (thread-safe).
-        """
 
-        ep = Endpoint(url, transport=self._mk_transport(url))
+        If the (normalized) URL already exists, this is a no-op.
+        """
+        nu = normalize_url(url)
+
         with self._lock:
+            if nu in self._seen_urls:
+                return
+            self._seen_urls.add(nu)
+
+            ep = Endpoint(nu, transport=self._mk_transport(nu))
             if priority:
                 self._endpoints.insert(0, ep)
             else:
@@ -161,16 +176,10 @@ class Provider:
             raise NoEndpoints("No endpoints available")
 
         policy = self.retry_policy_read
-        max_attempts = max(1, policy.max_attempts)
-        attempts = min(max_attempts, len(eps))
-
+        attempts = min(max(1, policy.max_attempts), len(eps))
         last_exc: Exception | None = None
 
-        # We rotate through a snapshot to avoid races with dynamic pool mutation.
-        # If the pool grows mid-flight, it will be picked up on the next request.
-        # If it shrinks (unlikely in v1), this call remains stable.
         for attempt in range(1, attempts + 1):
-            # round-robin start point + linear walk across snapshot
             with self._lock:
                 start = self._rr % len(eps)
                 self._rr = (self._rr + 1) % (1 << 30)

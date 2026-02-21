@@ -13,6 +13,7 @@ import httpx
 from .deferred import Handle, deferred_response
 from .provider import Provider, RetryPolicy
 from .transport.http import HTTPTransport, HTTPTransportConfig
+from .utils import normalize_url
 
 CHAINS_URL = (
     "https://raw.githubusercontent.com/ethereum-lists/chains/master/_data/chains/"
@@ -107,7 +108,18 @@ def probe_urls_streaming(
     This is intentionally strict because fastweb3 will rely heavily on batching.
     """
 
-    candidates = [u for u in urls if _is_http(u) and not _is_templated(u)]
+    # Dedup + normalize upfront so we don't waste probe workers.
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for u in urls:
+        if not _is_http(u) or _is_templated(u):
+            continue
+        nu = normalize_url(u)
+        if nu in seen:
+            continue
+        seen.add(nu)
+        candidates.append(nu)
+
     out: "queue.Queue[Optional[ProbeResult]]" = queue.Queue()
 
     # Batch probe: validate both chain and head.
@@ -221,7 +233,15 @@ def provider_for_chain(
     Endpoints that are too far behind the best observed head are dropped.
     """
 
-    priority_urls = list(priority_endpoints or [])
+    # Dedup + normalize user endpoints before creating the Provider
+    priority_urls: list[str] = []
+    seen_priority: set[str] = set()
+    for u in priority_endpoints or []:
+        nu = normalize_url(u)
+        if nu in seen_priority:
+            continue
+        seen_priority.add(nu)
+        priority_urls.append(nu)
 
     def bg(h: Handle) -> None:
         reg = ChainsRegistry()
@@ -253,13 +273,14 @@ def provider_for_chain(
 
             if provider is None:
                 provider = Provider(
-                    [pr.url],
+                    [pr.url],  # already normalized by probe_urls_streaming
                     retry_policy_read=retry_policy_read,
                     retry_policy_write=retry_policy_write,
                 )
                 h.set_value(provider)  # READY NOW (first good public endpoint)
             else:
-                provider.add_url(pr.url, priority=False)
+                # Provider should also dedup internally, but we normalize anyway.
+                provider.add_url(normalize_url(pr.url), priority=False)
 
             if provider.endpoint_count() >= max(target_pool, len(priority_urls)):
                 break
