@@ -26,6 +26,12 @@ def _default_is_retryable_exc(exc: Exception) -> bool:
 TransportFactory = Callable[[str], Transport]
 
 
+@dataclass
+class _EndpointState:
+    cooldown_until: float = 0.0
+    failures: int = 0
+
+
 class Provider:
     """
     Routes requests across multiple endpoints.
@@ -39,6 +45,7 @@ class Provider:
     Notes:
       - supports dynamic pool growth via add_url()
       - dedups URLs using a normalized form
+      - cooldown/backoff: temporarily avoid endpoints that are failing (esp. 429s)
     """
 
     def __init__(
@@ -55,6 +62,7 @@ class Provider:
         self._mk_transport = transport_factory or (lambda url: HTTPTransport(url))
         self._endpoints: list[Endpoint] = []
         self._seen_urls: set[str] = set()
+        self._state: dict[Endpoint, _EndpointState] = {}
 
         if urls:
             # Reuse add_url logic so normalization + dedup is identical.
@@ -67,6 +75,58 @@ class Provider:
         self.retry_policy_read = retry_policy_read or RetryPolicy(max_attempts=3)
         self.retry_policy_write = retry_policy_write or RetryPolicy(max_attempts=1)
         self.is_retryable_exc = is_retryable_exc
+
+    def _cooldown_seconds(self, exc: Exception, failures: int) -> float:
+        """
+        Decide how long to avoid an endpoint after a failure.
+
+        - Transport errors get exponential-ish backoff (capped).
+        - HTTP 429 gets a longer cooldown (also capped).
+        """
+        # Base exponential backoff (fast growth but capped)
+        # failures=1 -> 0.25s, 2 -> 0.5s, 3 -> 1s, 4 -> 2s, ...
+        base = 0.25 * (2 ** min(max(failures, 1) - 1, 6))
+        base_cap = 30.0
+
+        status = getattr(exc, "status_code", None) if isinstance(exc, TransportError) else None
+        if status == 429:
+            # Rate limiting: longer cooldown; keep minimum non-trivial.
+            return min(60.0, max(5.0, base * 4))
+
+        return min(base_cap, base)
+
+    def _mark_failure(self, ep: Endpoint, exc: Exception) -> None:
+        now = time.time()
+        with self._lock:
+            st = self._state.get(ep)
+            if st is None:
+                st = _EndpointState()
+                self._state[ep] = st
+            st.failures += 1
+            st.cooldown_until = now + self._cooldown_seconds(exc, st.failures)
+
+    def _mark_success(self, ep: Endpoint) -> None:
+        with self._lock:
+            st = self._state.get(ep)
+            if st is None:
+                st = _EndpointState()
+                self._state[ep] = st
+            st.failures = 0
+            st.cooldown_until = 0.0
+
+    def _eligible_snapshot(self) -> list[Endpoint]:
+        """
+        Return endpoints that are not currently in cooldown.
+        If all endpoints are in cooldown, returns the full snapshot (try anyway).
+        """
+        now = time.time()
+        with self._lock:
+            eps = list(self._endpoints)
+            # read states under lock for consistency
+            eligible = [
+                ep for ep in eps if self._state.get(ep, _EndpointState()).cooldown_until <= now
+            ]
+        return eligible if eligible else eps
 
     def add_url(self, url: str, *, priority: bool = False) -> None:
         """
@@ -82,6 +142,8 @@ class Provider:
             self._seen_urls.add(nu)
 
             ep = Endpoint(nu, transport=self._mk_transport(nu))
+            self._state[ep] = _EndpointState()
+
             if priority:
                 self._endpoints.insert(0, ep)
             else:
@@ -136,7 +198,8 @@ class Provider:
         if kind == "write":
             chosen = self._primary()
         else:
-            eps = self._snapshot()
+            # Pinning should respect cooldown so you don't pin onto a rate-limited endpoint.
+            eps = self._eligible_snapshot()
             if not eps:
                 raise NoEndpoints("No endpoints available")
             chosen = self._pick_rr_from(eps)
@@ -164,14 +227,20 @@ class Provider:
             # Later you can decide if you want pinned+retry-on-same-endpoint.
             return pinned.request(method, params, formatter=formatter)
 
-        # Writes go only to primary.
+        # Writes go only to primary (v0 conservative).
         if kind == "write":
+            ep = self._primary()
             try:
-                return self._primary().request(method, params, formatter=formatter)
+                result = ep.request(method, params, formatter=formatter)
+                self._mark_success(ep)
+                return result
             except Exception as exc:
+                # Still apply cooldown signals for write failures, even though we won't failover yet
+                if self.is_retryable_exc(exc):
+                    self._mark_failure(ep, exc)
                 raise AllEndpointsFailed(exc) from exc
 
-        eps = self._snapshot()
+        eps = self._eligible_snapshot()
         if not eps:
             raise NoEndpoints("No endpoints available")
 
@@ -180,24 +249,35 @@ class Provider:
         last_exc: Exception | None = None
 
         for attempt in range(1, attempts + 1):
+            # Choose rr start and walk across the eligible snapshot
             with self._lock:
                 start = self._rr % len(eps)
                 self._rr = (self._rr + 1) % (1 << 30)
             ep = eps[(start + (attempt - 1)) % len(eps)]
 
             try:
-                return ep.request(method, params, formatter=formatter)
+                result = ep.request(method, params, formatter=formatter)
+                self._mark_success(ep)
+                return result
+
             except RPCError as exc:
                 last_exc = exc
+                # RPC errors are usually deterministic; only retry if configured.
                 if policy.retry_on_rpc_error and attempt < attempts:
                     time.sleep(policy.backoff_seconds)
                     continue
                 raise
+
             except Exception as exc:
                 last_exc = exc
-                if self.is_retryable_exc(exc) and attempt < attempts:
-                    time.sleep(policy.backoff_seconds)
-                    continue
+                if self.is_retryable_exc(exc):
+                    # Cooldown this endpoint (rate-limit / timeout / transport failures)
+                    self._mark_failure(ep, exc)
+
+                    if attempt < attempts:
+                        # Keep the existing small global backoff between attempts
+                        time.sleep(policy.backoff_seconds)
+                        continue
                 break
 
         raise AllEndpointsFailed(last_exc)

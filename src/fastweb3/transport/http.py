@@ -5,6 +5,8 @@ from typing import Any, List, Mapping, Optional, Union
 
 import httpx
 
+from ..errors import TransportError
+
 JSONObj = Mapping[str, Any]
 JSONPayload = Union[JSONObj, List[JSONObj]]
 JSONResp = Union[dict[str, Any], list[dict[str, Any]]]
@@ -69,8 +71,12 @@ class HTTPTransport:
             self._client.close()
 
     def send(self, payload: JSONPayload) -> JSONResp:
-        resp = self._client.post(self.url, json=payload)
-        resp.raise_for_status()
+        try:
+            resp = self._client.post(self.url, json=payload)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # Preserve status for cooldown logic (429 etc.)
+            raise TransportError(str(exc), status_code=exc.response.status_code) from exc
         data = resp.json()
         if not isinstance(data, (dict, list)):
             raise TypeError(f"Expected JSON object or array, got {type(data).__name__}")
