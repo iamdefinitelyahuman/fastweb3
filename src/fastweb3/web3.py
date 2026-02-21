@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence, Union
 
+from .chains import provider_for_chain
 from .deferred import Handle, deferred_response
 from .errors import NoEndpoints
 from .formatters import to_int
@@ -22,40 +23,56 @@ class Web3Config:
 
 class Web3:
     """
-    Chain-id-centric Web3 entrypoint.
+    Web3 entrypoint.
 
-    v0 usage:
-        w3 = Web3(1, endpoints=[...])
-        w3.eth.block_number()
+    Usage:
+        w3 = Web3(1)                          # auto-discover public endpoints for chain 1
+        w3 = Web3(endpoints=[...])            # manual endpoints only (no discovery)
+        w3 = Web3(1, endpoints=[...])         # hybrid: user endpoints (primary) + public fallbacks
+        w3 = Web3(provider=my_provider)       # fully custom provider (advanced)
     """
 
     def __init__(
         self,
-        chain_id: int,
+        chain_id: Optional[int] = None,
         *,
         endpoints: Optional[Sequence[str]] = None,
         provider: Optional[Provider] = None,
         config: Optional[Web3Config] = None,
     ) -> None:
-        self.chain_id = int(chain_id)
         self.config = config or Web3Config()
 
+        # Chain id is metadata only in discovery/hybrid mode.
+        self._chain_id = int(chain_id) if chain_id is not None else None
+
         if provider is not None:
+            # Advanced mode: user supplies their own Provider.
             self.provider = provider
-        else:
+
+        elif chain_id is None:
+            # Manual mode: endpoints required, no discovery.
             urls = list(endpoints or [])
             if not urls:
                 raise NoEndpoints(
-                    f"No endpoints for chain_id={self.chain_id}. "
-                    "Provide endpoints=[...]. (Discovery/chainlist comes later.)"
+                    "No chain_id provided and no endpoints provided. "
+                    "Use Web3(<chain_id>) for discovery or Web3(endpoints=[...]) for manual mode."
                 )
+
             self.provider = Provider(
                 urls,
                 retry_policy_read=self.config.retry_policy_read,
                 retry_policy_write=self.config.retry_policy_write,
             )
 
-        # Namespaces (web3.py-style)
+        else:
+            # Discovery (or hybrid) mode.
+            # If endpoints are provided, they are injected as priority endpoints.
+            self.provider = provider_for_chain(
+                int(chain_id),
+                priority_endpoints=endpoints,
+            )
+
+        # Namespaces
         self.eth = Eth(self)
 
     def close(self) -> None:
