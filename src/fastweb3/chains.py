@@ -21,6 +21,24 @@ CHAINS_URL = (
 )
 
 
+_provider_pool_lock = threading.Lock()
+_provider_pool_by_chain: dict[int, Provider] = {}
+
+
+def _get_shared_provider(chain_id: int) -> Provider | None:
+    with _provider_pool_lock:
+        return _provider_pool_by_chain.get(chain_id)
+
+
+def _set_shared_provider(chain_id: int, provider_proxy: Provider) -> Provider:
+    with _provider_pool_lock:
+        existing = _provider_pool_by_chain.get(chain_id)
+        if existing is not None:
+            return existing
+        _provider_pool_by_chain[chain_id] = provider_proxy
+        return provider_proxy
+
+
 @dataclass(frozen=True)
 class ChainMeta:
     chain_id: int
@@ -231,7 +249,17 @@ def provider_for_chain(
 
     Probing is strict and batch-based: [eth_chainId, eth_blockNumber].
     Endpoints that are too far behind the best observed head are dropped.
+
+    Shared pools:
+      - The first call for a given chain_id creates the background discovery thread.
+      - Subsequent calls return the same deferred Provider proxy immediately.
+      - Configuration is "first call wins" per chain_id.
     """
+
+    # Shared pool: if already created, return immediately (no duplicate probing).
+    shared = _get_shared_provider(chain_id)
+    if shared is not None:
+        return shared
 
     # Dedup + normalize user endpoints before creating the Provider
     priority_urls: list[str] = []
@@ -290,4 +318,6 @@ def provider_for_chain(
                 f"No usable batch-capable RPC endpoints found for chain_id={chain_id}"
             )
 
-    return deferred_response(bg)
+    # Create once; if another thread raced us, return the already-registered one.
+    proxy = deferred_response(bg)
+    return _set_shared_provider(chain_id, proxy)
