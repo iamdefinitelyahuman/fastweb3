@@ -59,6 +59,7 @@ class Handle:
         threading.Thread(target=execute_in_background, daemon=True).start()
 
     def set_exc(self, exc: BaseException) -> None:
+        self._add_creation_note(exc)
         with self.lock:
             if self._exc is None:
                 self._exc = exc
@@ -84,21 +85,6 @@ class Handle:
                 raise Exception("Value already set")
             self._value = final_value
 
-    def _maybe_run_ref(self) -> None:
-        with self.lock:
-            if self._value is not _UNSET:
-                return
-            if self._ref_func is None or self._ref_ran:
-                return
-            self._ref_ran = True
-            ref = self._ref_func
-
-        try:
-            ref(self)
-        except BaseException as exc:
-            self.set_exc(exc)
-            raise
-
     def _add_creation_note(self, exc: BaseException) -> None:
         # Add exactly once per exception instance
         if getattr(exc, "_fastweb3_creation_note", False):
@@ -113,14 +99,35 @@ class Handle:
     def get_value(self) -> Any:
         self.event.wait()
 
-        self._maybe_run_ref()
+        # Fast-path: already resolved or already failed
+        with self.lock:
+            exc = self._exc
+            value = self._value
+            if exc is not None:
+                raise exc
+            if value is not _UNSET:
+                return value
 
+            # Decide whether to run ref (at most once)
+            if self._ref_func is None or self._ref_ran:
+                ref = None
+            else:
+                self._ref_ran = True
+                ref = self._ref_func
+
+        if ref is not None:
+            try:
+                ref(self)
+            except BaseException as exc:
+                self.set_exc(exc)
+                raise
+
+        # Re-check after ref
         with self.lock:
             exc = self._exc
             value = self._value
 
         if exc is not None:
-            self._add_creation_note(exc)
             raise exc
 
         if value is _UNSET:
