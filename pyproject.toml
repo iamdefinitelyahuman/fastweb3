@@ -21,6 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+    "pytest-cov>=5",
     "ruff>=0.9",
     "pre-commit>=3",
     "build",
@@ -39,7 +40,15 @@ where = ["src"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+addopts = [
+  "--cov=fastweb3",
+  "--cov-report=term-missing",
+  "--cov-report=xml",
+]
+testpaths = ["tests"]
