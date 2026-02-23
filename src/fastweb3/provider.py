@@ -8,7 +8,6 @@ from typing import Any, Callable, Iterator, Optional
 
 from .endpoint import Endpoint, Formatter
 from .errors import AllEndpointsFailed, NoEndpoints, RPCError, TransportError
-from .transport import Transport
 from .utils import normalize_url
 
 
@@ -21,9 +20,6 @@ class RetryPolicy:
 
 def _default_is_retryable_exc(exc: Exception) -> bool:
     return isinstance(exc, TransportError)
-
-
-TransportFactory = Callable[[str], Transport]
 
 
 @dataclass
@@ -63,7 +59,6 @@ class Provider:
         self._state: dict[Endpoint, _EndpointState] = {}
 
         if urls:
-            # Reuse add_url logic so normalization + dedup is identical.
             for u in urls:
                 self.add_url(u, priority=False)
 
@@ -81,14 +76,12 @@ class Provider:
         - Transport errors get exponential-ish backoff (capped).
         - HTTP 429 gets a longer cooldown (also capped).
         """
-        # Base exponential backoff (fast growth but capped)
         # failures=1 -> 0.25s, 2 -> 0.5s, 3 -> 1s, 4 -> 2s, ...
         base = 0.25 * (2 ** min(max(failures, 1) - 1, 6))
         base_cap = 30.0
 
         status = getattr(exc, "status_code", None) if isinstance(exc, TransportError) else None
         if status == 429:
-            # Rate limiting: longer cooldown; keep minimum non-trivial.
             return min(60.0, max(5.0, base * 4))
 
         return min(base_cap, base)
@@ -177,7 +170,6 @@ class Provider:
             return len(self._endpoints)
 
     def close(self) -> None:
-        # Close a snapshot to avoid holding the lock while closing transports.
         with self._lock:
             eps = list(self._endpoints)
         for e in eps:
@@ -192,13 +184,6 @@ class Provider:
             if not self._endpoints:
                 raise NoEndpoints("No endpoints available")
             return self._endpoints[0]
-
-    def _pick_rr_from(self, eps: list[Endpoint]) -> Endpoint:
-        # Caller provides a snapshot 'eps' (non-empty).
-        with self._lock:
-            start = self._rr % len(eps)
-            self._rr = (self._rr + 1) % (1 << 30)
-        return eps[start]
 
     def _get_pinned(self) -> Optional[Endpoint]:
         return getattr(self._tls, "pinned", None)
@@ -224,7 +209,10 @@ class Provider:
             eps = self._eligible_snapshot()
             if not eps:
                 raise NoEndpoints("No endpoints available")
-            chosen = self._pick_rr_from(eps)
+            with self._lock:
+                start = self._rr % len(eps)
+                self._rr = (self._rr + 1) % (1 << 30)
+            chosen = eps[start]
 
         self._tls.pinned = chosen
         try:
@@ -266,11 +254,12 @@ class Provider:
         attempts = min(max(1, policy.max_attempts), len(eps))
         last_exc: Exception | None = None
 
-        for attempt in range(1, attempts + 1):
-            with self._lock:
-                start = self._rr % len(eps)
-                self._rr = (self._rr + 1) % (1 << 30)
-            ep = eps[(start + (attempt - 1)) % len(eps)]
+        with self._lock:
+            start = self._rr % len(eps)
+            self._rr = (self._rr + 1) % (1 << 30)
+
+        for i in range(attempts):
+            ep = eps[(start + i) % len(eps)]
 
             try:
                 result = ep.request(method, params, formatter=formatter)
@@ -279,7 +268,7 @@ class Provider:
 
             except RPCError as exc:
                 last_exc = exc
-                if policy.retry_on_rpc_error and attempt < attempts:
+                if policy.retry_on_rpc_error and i < attempts - 1:
                     time.sleep(policy.backoff_seconds)
                     continue
                 raise
@@ -288,7 +277,7 @@ class Provider:
                 last_exc = exc
                 if self.is_retryable_exc(exc):
                     self._mark_failure(ep, exc)
-                    if attempt < attempts:
+                    if i < attempts - 1:
                         time.sleep(policy.backoff_seconds)
                         continue
                 break
