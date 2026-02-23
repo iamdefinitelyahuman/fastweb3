@@ -8,7 +8,7 @@ from typing import Any, Callable, Iterator, Optional
 
 from .endpoint import Endpoint, Formatter
 from .errors import AllEndpointsFailed, NoEndpoints, RPCError, TransportError
-from .transport import HTTPTransport, Transport
+from .transport import Transport
 from .utils import normalize_url
 
 
@@ -55,11 +55,9 @@ class Provider:
         retry_policy_read: RetryPolicy | None = None,
         retry_policy_write: RetryPolicy | None = None,
         is_retryable_exc: Callable[[Exception], bool] = _default_is_retryable_exc,
-        transport_factory: TransportFactory | None = None,
     ) -> None:
         self._lock = threading.Lock()
 
-        self._mk_transport = transport_factory or (lambda url: HTTPTransport(url))
         self._endpoints: list[Endpoint] = []
         self._seen_urls: set[str] = set()
         self._state: dict[Endpoint, _EndpointState] = {}
@@ -140,7 +138,7 @@ class Provider:
                 return
             self._seen_urls.add(nu)
 
-            ep = Endpoint(nu, transport=self._mk_transport(nu))
+            ep = Endpoint(nu)
             self._state[ep] = _EndpointState()
 
             if priority:
