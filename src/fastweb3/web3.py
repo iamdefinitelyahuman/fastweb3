@@ -7,7 +7,7 @@ from . import validation
 from .chains import provider_for_chain
 from .deferred import Handle, deferred_response
 from .errors import NoEndpoints, ValidationError
-from .formatters import to_int
+from .formatters import normalize_rpc_obj, to_int
 from .provider import Provider, RetryPolicy
 
 BlockId = Union[
@@ -21,7 +21,7 @@ class Web3Config:
     retry_policy_read: RetryPolicy = RetryPolicy(max_attempts=3, backoff_seconds=0.05)
     retry_policy_write: RetryPolicy = RetryPolicy(max_attempts=1)
     # later: batching/hedging/quorum knobs
-    # later: output formatting mode knobs
+    # later: output formatting mode knobs (raw vs normalized)
 
 
 class Web3:
@@ -120,6 +120,7 @@ class Eth:
       - For "filter object" params, methods take keyword-only args and build the dict.
       - Quantity inputs may be passed as int (we hex-encode) or as already-encoded 0x strings.
       - In strict mode, addresses/hashes/data/topics/quantities are validated; checksum NOT enforced
+      - Structured outputs (dict/list) are normalized via normalize_rpc_obj.
     """
 
     def __init__(self, w3: "Web3") -> None:
@@ -208,15 +209,11 @@ class Eth:
         validation.validate_filter_object(flt, strict=strict)
         return flt
 
-    # ----------------------------
-    # methods (ethereum.org list)
-    # ----------------------------
-
     def protocol_version(self) -> str:
         return self._w3.make_request("eth_protocolVersion", [])
 
     def syncing(self) -> bool | dict[str, Any]:
-        return self._w3.make_request("eth_syncing", [])
+        return self._w3.make_request("eth_syncing", [], formatter=normalize_rpc_obj)
 
     def coinbase(self) -> str:
         return self._w3.make_request("eth_coinbase", [])
@@ -470,19 +467,23 @@ class Eth:
     ) -> dict[str, Any] | None:
         strict = bool(self._w3.config.strict)
         h = validation.hash32(block_hash, name="block_hash", strict=strict)
-        return self._w3.make_request("eth_getBlockByHash", [h, full_transactions])
+        return self._w3.make_request(
+            "eth_getBlockByHash", [h, full_transactions], formatter=normalize_rpc_obj
+        )
 
     def get_block_by_number(
         self, block: BlockId, full_transactions: bool = False
     ) -> dict[str, Any] | None:
         strict = bool(self._w3.config.strict)
         blk = validation.block_id(block, strict=strict)
-        return self._w3.make_request("eth_getBlockByNumber", [blk, full_transactions])
+        return self._w3.make_request(
+            "eth_getBlockByNumber", [blk, full_transactions], formatter=normalize_rpc_obj
+        )
 
     def get_transaction_by_hash(self, tx_hash: str | bytes) -> dict[str, Any] | None:
         strict = bool(self._w3.config.strict)
         h = validation.hash32(tx_hash, name="tx_hash", strict=strict)
-        return self._w3.make_request("eth_getTransactionByHash", [h])
+        return self._w3.make_request("eth_getTransactionByHash", [h], formatter=normalize_rpc_obj)
 
     def get_transaction_by_block_hash_and_index(
         self, block_hash: str | bytes, index: int | str
@@ -490,7 +491,9 @@ class Eth:
         strict = bool(self._w3.config.strict)
         h = validation.hash32(block_hash, name="block_hash", strict=strict)
         idx = validation.index(index, strict=strict)
-        return self._w3.make_request("eth_getTransactionByBlockHashAndIndex", [h, idx])
+        return self._w3.make_request(
+            "eth_getTransactionByBlockHashAndIndex", [h, idx], formatter=normalize_rpc_obj
+        )
 
     def get_transaction_by_block_number_and_index(
         self, block: BlockId, index: int | str
@@ -498,12 +501,14 @@ class Eth:
         strict = bool(self._w3.config.strict)
         blk = validation.block_id(block, strict=strict)
         idx = validation.index(index, strict=strict)
-        return self._w3.make_request("eth_getTransactionByBlockNumberAndIndex", [blk, idx])
+        return self._w3.make_request(
+            "eth_getTransactionByBlockNumberAndIndex", [blk, idx], formatter=normalize_rpc_obj
+        )
 
     def get_transaction_receipt(self, tx_hash: str | bytes) -> dict[str, Any] | None:
         strict = bool(self._w3.config.strict)
         h = validation.hash32(tx_hash, name="tx_hash", strict=strict)
-        return self._w3.make_request("eth_getTransactionReceipt", [h])
+        return self._w3.make_request("eth_getTransactionReceipt", [h], formatter=normalize_rpc_obj)
 
     def get_uncle_by_block_hash_and_index(
         self, block_hash: str | bytes, index: int | str
@@ -511,7 +516,9 @@ class Eth:
         strict = bool(self._w3.config.strict)
         h = validation.hash32(block_hash, name="block_hash", strict=strict)
         idx = validation.index(index, strict=strict)
-        return self._w3.make_request("eth_getUncleByBlockHashAndIndex", [h, idx])
+        return self._w3.make_request(
+            "eth_getUncleByBlockHashAndIndex", [h, idx], formatter=normalize_rpc_obj
+        )
 
     def get_uncle_by_block_number_and_index(
         self, block: BlockId, index: int | str
@@ -519,7 +526,9 @@ class Eth:
         strict = bool(self._w3.config.strict)
         blk = validation.block_id(block, strict=strict)
         idx = validation.index(index, strict=strict)
-        return self._w3.make_request("eth_getUncleByBlockNumberAndIndex", [blk, idx])
+        return self._w3.make_request(
+            "eth_getUncleByBlockNumberAndIndex", [blk, idx], formatter=normalize_rpc_obj
+        )
 
     def new_filter(
         self,
@@ -549,10 +558,13 @@ class Eth:
         return self._w3.make_request("eth_uninstallFilter", [filter_id])
 
     def get_filter_changes(self, filter_id: str) -> list[Any]:
-        return self._w3.make_request("eth_getFilterChanges", [filter_id])
+        # could be list of logs or list of hashes, depending on filter type/client
+        return self._w3.make_request(
+            "eth_getFilterChanges", [filter_id], formatter=normalize_rpc_obj
+        )
 
     def get_filter_logs(self, filter_id: str) -> list[Any]:
-        return self._w3.make_request("eth_getFilterLogs", [filter_id])
+        return self._w3.make_request("eth_getFilterLogs", [filter_id], formatter=normalize_rpc_obj)
 
     def get_logs(
         self,
@@ -570,4 +582,4 @@ class Eth:
             topics=topics,
             block_hash=block_hash,
         )
-        return self._w3.make_request("eth_getLogs", [flt])
+        return self._w3.make_request("eth_getLogs", [flt], formatter=normalize_rpc_obj)
