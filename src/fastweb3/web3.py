@@ -6,7 +6,7 @@ from typing import Any, Mapping, Optional, Sequence, Union
 from . import validation
 from .chains import provider_for_chain
 from .deferred import Handle, deferred_response
-from .errors import NoEndpoints
+from .errors import NoEndpoints, ValidationError
 from .formatters import to_int
 from .provider import Provider, RetryPolicy
 
@@ -96,7 +96,6 @@ class Web3:
         """
 
         def bg_func(h: Handle) -> None:
-            # No formatter here: formatting must only happen in format_func.
             raw = self.provider.request(method, params, kind=kind, formatter=None)
             h.set_value(raw)
 
@@ -176,6 +175,7 @@ class Eth:
         if access_list is not None:
             tx["accessList"] = access_list
 
+        validation.validate_tx_object(tx, strict=strict)
         return tx
 
     def _filter_object(
@@ -190,7 +190,6 @@ class Eth:
         strict = bool(self._w3.config.strict)
         flt: dict[str, Any] = {}
 
-        # Spec: blockHash cannot be used with fromBlock/toBlock on most clients.
         if block_hash is not None:
             flt["blockHash"] = validation.hash32(block_hash, name="block_hash", strict=strict)
 
@@ -206,6 +205,7 @@ class Eth:
         if topics is not None:
             flt["topics"] = validation.topics(topics, strict=strict)
 
+        validation.validate_filter_object(flt, strict=strict)
         return flt
 
     # ----------------------------
@@ -299,7 +299,6 @@ class Eth:
         return self._w3.make_request("eth_getCode", [addr, blk])
 
     def sign(self, address: str | bytes, data: str | bytes) -> str:
-        # "write" routing hint: uses node-local account
         strict = bool(self._w3.config.strict)
         addr = validation.normalize_address(address, strict=strict)
         payload = validation.data_hex(data, name="data", strict=strict, allow_empty=True)
@@ -321,6 +320,13 @@ class Eth:
         type_: int | str | None = None,
         access_list: list[Mapping[str, Any]] | None = None,
     ) -> Any:
+        strict = bool(self._w3.config.strict)
+        if strict:
+            if from_ is None:
+                raise ValidationError("eth_signTransaction requires 'from'")
+            if to is None and data is None:
+                raise ValidationError("eth_signTransaction requires at least one of 'to' or 'data'")
+
         tx = self._tx_object(
             from_=from_,
             to=to,
@@ -353,6 +359,13 @@ class Eth:
         type_: int | str | None = None,
         access_list: list[Mapping[str, Any]] | None = None,
     ) -> str:
+        strict = bool(self._w3.config.strict)
+        if strict:
+            if from_ is None:
+                raise ValidationError("eth_sendTransaction requires 'from'")
+            if to is None and data is None:
+                raise ValidationError("eth_sendTransaction requires at least one of 'to' or 'data'")
+
         tx = self._tx_object(
             from_=from_,
             to=to,
@@ -392,6 +405,9 @@ class Eth:
         block: BlockId = "latest",
     ) -> str:
         strict = bool(self._w3.config.strict)
+        if strict and to is None and data is None:
+            raise ValidationError("eth_call requires at least one of 'to' or 'data'")
+
         tx = self._tx_object(
             from_=from_,
             to=to,
@@ -427,6 +443,9 @@ class Eth:
         block: BlockId | None = None,
     ) -> int:
         strict = bool(self._w3.config.strict)
+        if strict and to is None and data is None:
+            raise ValidationError("eth_estimateGas requires at least one of 'to' or 'data'")
+
         tx = self._tx_object(
             from_=from_,
             to=to,
@@ -527,7 +546,6 @@ class Eth:
         return self._w3.make_request("eth_newPendingTransactionFilter", [])
 
     def uninstall_filter(self, filter_id: str) -> bool:
-        # filter_id is quantity-like; we don't validate it yet
         return self._w3.make_request("eth_uninstallFilter", [filter_id])
 
     def get_filter_changes(self, filter_id: str) -> list[Any]:

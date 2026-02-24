@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, Mapping
+
 from .errors import ValidationError
 
 _HEX_CHARS = set("0123456789abcdefABCDEF")
@@ -184,3 +186,42 @@ def topics(
         else:
             raise ValidationError(f"topic[{i}] must be str|bytes|list[str|bytes]|None")
     return out
+
+
+def validate_tx_object(tx: Mapping[str, Any], *, strict: bool) -> None:
+    """
+    Validate invariants on a JSON-RPC "transaction object" dict.
+
+    This is NOT method-specific ("eth_call" vs "eth_sendTransaction") —
+    it's the generic object shape rules that are basically always user error when violated.
+    """
+    if not strict:
+        return
+
+    has_gas_price = "gasPrice" in tx
+    has_max_fee = "maxFeePerGas" in tx
+    has_max_priority = "maxPriorityFeePerGas" in tx
+
+    if has_gas_price and (has_max_fee or has_max_priority):
+        raise ValidationError(
+            "Transaction object cannot specify gasPrice together with "
+            "maxFeePerGas/maxPriorityFeePerGas"
+        )
+
+    # If user opts into 1559 fields, require both. (Otherwise it's usually a bug.)
+    if has_max_fee ^ has_max_priority:
+        raise ValidationError(
+            "Transaction object must specify both maxFeePerGas and maxPriorityFeePerGas "
+            "when using EIP-1559 fee fields"
+        )
+
+
+def validate_filter_object(flt: Mapping[str, Any], *, strict: bool) -> None:
+    """
+    Validate invariants on a JSON-RPC filter object dict.
+    """
+    if not strict:
+        return
+
+    if "blockHash" in flt and ("fromBlock" in flt or "toBlock" in flt):
+        raise ValidationError("Filter object cannot combine blockHash with fromBlock/toBlock")
