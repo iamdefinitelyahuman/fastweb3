@@ -89,11 +89,16 @@ def data_hex(x: str | bytes, *, name: str, strict: bool, allow_empty: bool = Tru
         return s
 
     _require(s.startswith(("0x", "0X")), f"{name} must be 0x-prefixed")
+
     body = s[2:]
-    if not body and allow_empty:
-        return "0x"
+    if not body:
+        if allow_empty:
+            return "0x"
+        raise ValidationError(f"{name} cannot be empty")
+
     _require(len(body) % 2 == 0, f"{name} hex must have even length")
     _require(_is_hex(body), f"{name} must be hex")
+
     return "0x" + body.lower()
 
 
