@@ -4,11 +4,11 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence, Union
 
 from . import validation
-from .chains import provider_for_chain
 from .deferred import Handle, deferred_response
 from .errors import NoEndpoints, ValidationError
 from .formatters import normalize_rpc_obj, to_int
 from .provider import Provider, RetryPolicy
+from .rpc_pool import get_pool_manager
 
 BlockId = Union[
     str, int
@@ -18,8 +18,8 @@ BlockId = Union[
 @dataclass(frozen=True)
 class Web3Config:
     strict: bool = True
-    retry_policy_read: RetryPolicy = RetryPolicy(max_attempts=3, backoff_seconds=0.05)
-    retry_policy_write: RetryPolicy = RetryPolicy(max_attempts=1)
+    desired_pool_size: int = 6
+    retry_policy_pool: RetryPolicy = RetryPolicy(max_attempts=3, backoff_seconds=0.05)
     # later: batching/hedging/quorum knobs
     # later: output formatting mode knobs (raw vs normalized)
 
@@ -29,10 +29,12 @@ class Web3:
     Web3 entrypoint.
 
     Usage:
-        w3 = Web3(1)                          # auto-discover public endpoints for chain 1
-        w3 = Web3(endpoints=[...])            # manual endpoints only (no discovery)
-        w3 = Web3(1, endpoints=[...])         # hybrid: user endpoints (primary) + public fallbacks
-        w3 = Web3(provider=my_provider)       # fully custom provider (advanced)
+        w3 = Web3(1)                                       # public pool for chain 1 (lazy-ready)
+        w3 = Web3(endpoints=[...])                         # manual internal pool only
+        w3 = Web3(1, endpoints=[...])                      # hybrid: internal pool + public pool
+        w3 = Web3(primary_endpoint="http://localhost:8545")# primary-only mode
+        w3 = Web3(1, primary_endpoint="http://localhost")  # hybrid: public pool + explicit primary
+        w3 = Web3(provider=my_provider)                    # fully custom provider (advanced)
     """
 
     def __init__(
@@ -40,42 +42,57 @@ class Web3:
         chain_id: Optional[int] = None,
         *,
         endpoints: Optional[Sequence[str]] = None,
+        primary_endpoint: Optional[str] = None,
         provider: Optional[Provider] = None,
         config: Optional[Web3Config] = None,
+        # pool manager tuning (only used when chain_id is provided)
+        target_pool: int = 6,
+        max_lag_blocks: int = 8,
+        probe_timeout_s: float = 1.5,
+        probe_workers: int = 32,
     ) -> None:
         self.config = config or Web3Config()
-
-        # Chain id is metadata only in discovery/hybrid mode.
         self._chain_id = int(chain_id) if chain_id is not None else None
 
         if provider is not None:
-            # Advanced mode: user supplies their own Provider.
             self.provider = provider
 
-        elif chain_id is None:
-            # Manual mode: endpoints required, no discovery.
-            urls = list(endpoints or [])
-            if not urls:
+        else:
+            internal_urls = list(endpoints or [])
+
+            pool_manager = None
+            if chain_id is not None:
+                pool_manager = get_pool_manager(
+                    int(chain_id),
+                    target_pool=target_pool,
+                    max_lag_blocks=max_lag_blocks,
+                    probe_timeout_s=probe_timeout_s,
+                    probe_workers=probe_workers,
+                )
+
+            # Primary-only mode: if there is no chain_id and no internal endpoints,
+            # interpret primary_endpoint as the sole pool endpoint.
+            if chain_id is None and not internal_urls and primary_endpoint is not None:
+                internal_urls = [primary_endpoint]
+
+            # No endpoints of any kind => error (primary-only mode handled above).
+            if chain_id is None and not internal_urls and primary_endpoint is None:
                 raise NoEndpoints(
                     "No chain_id provided and no endpoints provided. "
-                    "Use Web3(<chain_id>) for discovery or Web3(endpoints=[...]) for manual mode."
+                    "Use Web3(<chain_id>) for public discovery, "
+                    "Web3(endpoints=[...]) for manual mode, "
+                    "or Web3(primary_endpoint=...) for primary-only mode."
                 )
 
             self.provider = Provider(
-                urls,
-                retry_policy_read=self.config.retry_policy_read,
-                retry_policy_write=self.config.retry_policy_write,
+                internal_urls,
+                pool_manager=pool_manager,
+                desired_pool_size=self.config.desired_pool_size,
+                retry_policy_pool=self.config.retry_policy_pool,
             )
 
-        else:
-            # Discovery (or hybrid) mode.
-            # If endpoints are provided, they are injected as priority endpoints.
-            self.provider = provider_for_chain(
-                int(chain_id),
-                priority_endpoints=endpoints,
-                retry_policy_read=self.config.retry_policy_read,
-                retry_policy_write=self.config.retry_policy_write,
-            )
+        if primary_endpoint is not None:
+            self.provider.set_primary(primary_endpoint)
 
         # Namespaces
         self.eth = Eth(self)
@@ -84,19 +101,19 @@ class Web3:
         self.provider.close()
 
     def make_request(
-        self, method: str, params: list[Any], *, kind: str = "read", formatter=None
+        self, method: str, params: list[Any], *, route: str = "pool", formatter=None
     ) -> Any:
         """
         Perform a raw JSON-RPC request.
 
         method: e.g. "eth_getBalance"
         params: JSON-RPC params list. No validation is performed on this list.
-        kind: "read" or "write" (routing hint)
+        route: "pool" or "primary" (routing hint)
         formatter: optional post-processor for result
         """
 
         def bg_func(h: Handle) -> None:
-            raw = self.provider.request(method, params, kind=kind, formatter=None)
+            raw = self.provider.request(method, params, route=route, formatter=None)
             h.set_value(raw)
 
         # ref_func unused for now (later: batching flush barrier)
@@ -104,8 +121,8 @@ class Web3:
 
     # ---- scaffolding for later batching ----
 
-    def pin(self, *, kind: str = "read"):
-        return self.provider.pin(kind=kind)
+    def pin(self, *, route: str = "pool"):
+        return self.provider.pin(route=route)
 
     def batch(self):
         raise NotImplementedError("Batching not implemented yet")
@@ -121,6 +138,7 @@ class Eth:
       - Quantity inputs may be passed as int (we hex-encode) or as already-encoded 0x strings.
       - In strict mode, addresses/hashes/data/topics/quantities are validated; checksum NOT enforced
       - Structured outputs (dict/list) are normalized via normalize_rpc_obj.
+      - Node-local / stateful methods (filters, local signer, node status) route to primary.
     """
 
     def __init__(self, w3: "Web3") -> None:
@@ -209,32 +227,42 @@ class Eth:
         validation.validate_filter_object(flt, strict=strict)
         return flt
 
+    # ----------------------------
+    # basic / node-local
+    # ----------------------------
+
     def protocol_version(self) -> str:
         return self._w3.make_request("eth_protocolVersion", [])
 
     def syncing(self) -> bool | dict[str, Any]:
-        return self._w3.make_request("eth_syncing", [], formatter=normalize_rpc_obj)
+        return self._w3.make_request(
+            "eth_syncing", [], route="primary", formatter=normalize_rpc_obj
+        )
 
     def coinbase(self) -> str:
-        return self._w3.make_request("eth_coinbase", [])
+        return self._w3.make_request("eth_coinbase", [], route="primary")
 
     def chain_id(self) -> int:
         return self._w3.make_request("eth_chainId", [], formatter=to_int)
 
     def mining(self) -> bool:
-        return self._w3.make_request("eth_mining", [])
+        return self._w3.make_request("eth_mining", [], route="primary")
 
     def hashrate(self) -> int:
-        return self._w3.make_request("eth_hashrate", [], formatter=to_int)
+        return self._w3.make_request("eth_hashrate", [], route="primary", formatter=to_int)
 
     def gas_price(self) -> int:
         return self._w3.make_request("eth_gasPrice", [], formatter=to_int)
 
     def accounts(self) -> list[str]:
-        return self._w3.make_request("eth_accounts", [])
+        return self._w3.make_request("eth_accounts", [], route="primary")
 
     def block_number(self) -> int:
         return self._w3.make_request("eth_blockNumber", [], formatter=to_int)
+
+    # ----------------------------
+    # chain-state
+    # ----------------------------
 
     def get_balance(self, address: str | bytes, block: BlockId = "latest") -> int:
         strict = bool(self._w3.config.strict)
@@ -295,11 +323,15 @@ class Eth:
         blk = validation.block_id(block, strict=strict)
         return self._w3.make_request("eth_getCode", [addr, blk])
 
+    # ----------------------------
+    # signer / tx submission
+    # ----------------------------
+
     def sign(self, address: str | bytes, data: str | bytes) -> str:
         strict = bool(self._w3.config.strict)
         addr = validation.normalize_address(address, strict=strict)
         payload = validation.data_hex(data, name="data", strict=strict, allow_empty=True)
-        return self._w3.make_request("eth_sign", [addr, payload], kind="write")
+        return self._w3.make_request("eth_sign", [addr, payload], route="primary")
 
     def sign_transaction(
         self,
@@ -338,7 +370,7 @@ class Eth:
             type_=type_,
             access_list=access_list,
         )
-        return self._w3.make_request("eth_signTransaction", [tx], kind="write")
+        return self._w3.make_request("eth_signTransaction", [tx], route="primary")
 
     def send_transaction(
         self,
@@ -377,12 +409,16 @@ class Eth:
             type_=type_,
             access_list=access_list,
         )
-        return self._w3.make_request("eth_sendTransaction", [tx], kind="write")
+        return self._w3.make_request("eth_sendTransaction", [tx], route="primary")
 
     def send_raw_transaction(self, signed_tx: str | bytes) -> str:
         strict = bool(self._w3.config.strict)
         tx = validation.data_hex(signed_tx, name="signed_tx", strict=strict, allow_empty=False)
-        return self._w3.make_request("eth_sendRawTransaction", [tx], kind="write")
+        return self._w3.make_request("eth_sendRawTransaction", [tx])
+
+    # ----------------------------
+    # call / estimate
+    # ----------------------------
 
     def call(
         self,
@@ -462,6 +498,10 @@ class Eth:
             params.append(validation.block_id(block, strict=strict))
         return self._w3.make_request("eth_estimateGas", params, formatter=to_int)
 
+    # ----------------------------
+    # structured getters
+    # ----------------------------
+
     def get_block_by_hash(
         self, block_hash: str | bytes, full_transactions: bool = False
     ) -> dict[str, Any] | None:
@@ -530,6 +570,10 @@ class Eth:
             "eth_getUncleByBlockNumberAndIndex", [blk, idx], formatter=normalize_rpc_obj
         )
 
+    # ----------------------------
+    # filters (primary-only)
+    # ----------------------------
+
     def new_filter(
         self,
         *,
@@ -546,25 +590,32 @@ class Eth:
             topics=topics,
             block_hash=block_hash,
         )
-        return self._w3.make_request("eth_newFilter", [flt])
+        return self._w3.make_request("eth_newFilter", [flt], route="primary")
 
     def new_block_filter(self) -> str:
-        return self._w3.make_request("eth_newBlockFilter", [])
+        return self._w3.make_request("eth_newBlockFilter", [], route="primary")
 
     def new_pending_transaction_filter(self) -> str:
-        return self._w3.make_request("eth_newPendingTransactionFilter", [])
+        return self._w3.make_request("eth_newPendingTransactionFilter", [], route="primary")
 
     def uninstall_filter(self, filter_id: str) -> bool:
-        return self._w3.make_request("eth_uninstallFilter", [filter_id])
+        return self._w3.make_request("eth_uninstallFilter", [filter_id], route="primary")
 
     def get_filter_changes(self, filter_id: str) -> list[Any]:
-        # could be list of logs or list of hashes, depending on filter type/client
         return self._w3.make_request(
-            "eth_getFilterChanges", [filter_id], formatter=normalize_rpc_obj
+            "eth_getFilterChanges",
+            [filter_id],
+            route="primary",
+            formatter=normalize_rpc_obj,
         )
 
     def get_filter_logs(self, filter_id: str) -> list[Any]:
-        return self._w3.make_request("eth_getFilterLogs", [filter_id], formatter=normalize_rpc_obj)
+        return self._w3.make_request(
+            "eth_getFilterLogs",
+            [filter_id],
+            route="primary",
+            formatter=normalize_rpc_obj,
+        )
 
     def get_logs(
         self,

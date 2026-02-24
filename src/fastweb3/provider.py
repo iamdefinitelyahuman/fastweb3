@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 
 from .endpoint import Endpoint, Formatter
-from .errors import AllEndpointsFailed, NoEndpoints, RPCError, TransportError
+from .errors import AllEndpointsFailed, NoEndpoints, NoPrimaryEndpoint, RPCError, TransportError
+from .rpc_pool import PoolManager
 from .utils import normalize_url
 
 
@@ -30,44 +31,168 @@ class _EndpointState:
 
 class Provider:
     """
-    Routes requests across multiple endpoints.
+    Routes requests across:
+      - a primary endpoint (explicit, stable identity)
+      - an internal pool (per-instance, user-supplied, permanent)
+      - a shared PoolManager (per-chain public pool intelligence)
 
-    v0:
-      - reads: round-robin + retry/failover
-      - writes: primary only
-    Scaffolding:
-      - per-thread pinning context (for future batching determinism)
-
-    Notes:
-      - supports dynamic pool growth via add_url()
-      - dedups URLs using a normalized form
-      - cooldown/backoff: temporarily avoid endpoints that are failing (esp. 429s)
+    Pool routing:
+      candidates = internal_pool + pool_manager.best_urls(needed)
+      where needed fills up to desired_pool_size (option B)
     """
 
     def __init__(
         self,
-        urls: list[str] | None = None,
+        internal_urls: list[str] | None = None,
         *,
-        retry_policy_read: RetryPolicy | None = None,
-        retry_policy_write: RetryPolicy | None = None,
+        pool_manager: PoolManager | None = None,
+        desired_pool_size: int = 6,
+        retry_policy_pool: RetryPolicy | None = None,
         is_retryable_exc: Callable[[Exception], bool] = _default_is_retryable_exc,
     ) -> None:
         self._lock = threading.Lock()
+        self._tls = threading.local()
+        self._rr = 0
 
-        self._endpoints: list[Endpoint] = []
-        self._seen_urls: set[str] = set()
+        self.pool_manager = pool_manager
+        self.desired_pool_size = max(0, int(desired_pool_size))
+        self.retry_policy_pool = retry_policy_pool or RetryPolicy(max_attempts=3)
+        self.is_retryable_exc = is_retryable_exc
+
+        # Internal pool URLs (normalized, insertion-ordered) + membership set.
+        self._internal_urls: list[str] = []
+        self._internal_seen: set[str] = set()
+
+        # Endpoint cache for any URL we might touch (internal or manager).
+        self._eps_by_url: dict[str, Endpoint] = {}
         self._state: dict[Endpoint, _EndpointState] = {}
 
-        if urls:
-            for u in urls:
-                self.add_url(u, priority=False)
+        # Primary is a specific Endpoint instance (stable identity), or None.
+        self._primary: Endpoint | None = None
 
-        self._rr = 0
-        self._tls = threading.local()
+        for u in internal_urls or []:
+            self.add_url(u, priority=False)
 
-        self.retry_policy_read = retry_policy_read or RetryPolicy(max_attempts=3)
-        self.retry_policy_write = retry_policy_write or RetryPolicy(max_attempts=1)
-        self.is_retryable_exc = is_retryable_exc
+    # ----------------------------
+    # endpoint cache helpers
+    # ----------------------------
+
+    def _get_or_create_endpoint(self, url: str) -> Endpoint:
+        nu = normalize_url(url)
+        with self._lock:
+            ep = self._eps_by_url.get(nu)
+            if ep is not None:
+                return ep
+            ep = Endpoint(nu)
+            self._eps_by_url[nu] = ep
+            self._state[ep] = _EndpointState()
+            return ep
+
+    # ----------------------------
+    # primary management
+    # ----------------------------
+
+    def set_primary(self, url: str) -> None:
+        """
+        Set the primary endpoint to `url`.
+
+        Note: this does NOT add the URL to the internal pool.
+        (Web3 can choose to do that in primary-only mode.)
+        """
+        ep = self._get_or_create_endpoint(url)
+        with self._lock:
+            self._primary = ep
+
+    def clear_primary(self) -> None:
+        with self._lock:
+            self._primary = None
+
+    def primary_url(self) -> str | None:
+        with self._lock:
+            return self._primary.url if self._primary is not None else None
+
+    def has_primary(self) -> bool:
+        with self._lock:
+            return self._primary is not None
+
+    def _get_primary(self) -> Endpoint:
+        with self._lock:
+            if self._primary is None:
+                raise NoPrimaryEndpoint("Primary endpoint is unset")
+            return self._primary
+
+    # ----------------------------
+    # internal pool management
+    # ----------------------------
+
+    def add_url(self, url: str, *, priority: bool = False) -> None:
+        """
+        Add a URL to the internal pool (per-instance, permanent).
+        Deduped by normalized URL.
+        """
+        nu = normalize_url(url)
+        with self._lock:
+            if nu in self._internal_seen:
+                return
+            self._internal_seen.add(nu)
+            if priority:
+                self._internal_urls.insert(0, nu)
+            else:
+                self._internal_urls.append(nu)
+
+        # Ensure Endpoint exists in cache (outside lock is fine but keep simple)
+        self._get_or_create_endpoint(nu)
+
+    def remove_url(self, url: str) -> None:
+        """
+        Remove a URL from the internal pool. No-op if missing.
+
+        Does not delete the Endpoint from cache (it may be referenced by primary or manager).
+        If the removed URL is the primary, primary is cleared.
+        """
+        nu = normalize_url(url)
+        with self._lock:
+            if nu not in self._internal_seen:
+                return
+            self._internal_seen.remove(nu)
+            try:
+                self._internal_urls.remove(nu)
+            except ValueError:
+                pass
+
+            # If primary points at this endpoint, clear it.
+            ep = self._eps_by_url.get(nu)
+            if ep is not None and self._primary is ep:
+                self._primary = None
+
+    def urls(self) -> list[str]:
+        """Return internal pool URLs (snapshot)."""
+        with self._lock:
+            return list(self._internal_urls)
+
+    def endpoint_count(self) -> int:
+        """Count of internal pool endpoints (not including manager candidates)."""
+        with self._lock:
+            return len(self._internal_urls)
+
+    def close(self) -> None:
+        """
+        Close all cached Endpoint transports (internal + manager + primary).
+        """
+        with self._lock:
+            eps = list(self._eps_by_url.values())
+            self._eps_by_url.clear()
+            self._state.clear()
+            self._internal_urls.clear()
+            self._internal_seen.clear()
+            self._primary = None
+
+        for ep in eps:
+            ep.close()
+
+    # ----------------------------
+    # cooldown/backoff
+    # ----------------------------
 
     def _cooldown_seconds(self, exc: Exception, failures: int) -> float:
         """
@@ -76,7 +201,6 @@ class Provider:
         - Transport errors get exponential-ish backoff (capped).
         - HTTP 429 gets a longer cooldown (also capped).
         """
-        # failures=1 -> 0.25s, 2 -> 0.5s, 3 -> 1s, 4 -> 2s, ...
         base = 0.25 * (2 ** min(max(failures, 1) - 1, 6))
         base_cap = 30.0
 
@@ -105,110 +229,76 @@ class Provider:
             st.failures = 0
             st.cooldown_until = 0.0
 
-    def _eligible_snapshot(self) -> list[Endpoint]:
+    def _eligible_endpoints(self, eps: list[Endpoint]) -> list[Endpoint]:
         """
-        Return endpoints that are not currently in cooldown.
-        If all endpoints are in cooldown, returns the full snapshot (try anyway).
+        Filter endpoints that are not currently in cooldown.
+        If all are in cooldown, return the full list (try anyway).
         """
         now = time.time()
         with self._lock:
-            eps = list(self._endpoints)
             eligible = [
                 ep for ep in eps if self._state.get(ep, _EndpointState()).cooldown_until <= now
             ]
         return eligible if eligible else eps
 
-    def add_url(self, url: str, *, priority: bool = False) -> None:
+    # ----------------------------
+    # candidate building (pool route)
+    # ----------------------------
+
+    def _pool_candidates(self) -> list[Endpoint]:
         """
-        Add a new endpoint URL to the provider pool (thread-safe).
-
-        If the (normalized) URL already exists, this is a no-op.
-        """
-        nu = normalize_url(url)
-
-        with self._lock:
-            if nu in self._seen_urls:
-                return
-            self._seen_urls.add(nu)
-
-            ep = Endpoint(nu)
-            self._state[ep] = _EndpointState()
-
-            if priority:
-                self._endpoints.insert(0, ep)
-            else:
-                self._endpoints.append(ep)
-
-    def urls(self) -> list[str]:
-        """
-        Return current endpoint URLs in provider order (thread-safe snapshot).
+        Build the candidate endpoint list for pool routing:
+          internal_pool + pool_manager.best_urls(needed)
+        Deduped and ordered (internal first, then manager).
         """
         with self._lock:
-            return [e.url for e in self._endpoints]
+            internal = list(self._internal_urls)
 
-    def remove_url(self, url: str) -> None:
-        """
-        Remove an endpoint URL from the provider pool (thread-safe). No-op if missing.
-        """
-        nu = normalize_url(url)
-        ep_to_close: Endpoint | None = None
+        needed = max(0, self.desired_pool_size - len(internal))
+        manager_urls: list[str] = []
+        if needed > 0 and self.pool_manager is not None:
+            manager_urls = self.pool_manager.best_urls(needed)
 
-        with self._lock:
-            for i, ep in enumerate(self._endpoints):
-                if normalize_url(ep.url) == nu:
-                    ep_to_close = ep
-                    del self._endpoints[i]
-                    self._seen_urls.discard(nu)
-                    self._state.pop(ep, None)
-                    break
+        # Dedup preserve order by normalized URL
+        seen: set[str] = set()
+        merged: list[str] = []
 
-        if ep_to_close is not None:
-            ep_to_close.close()
+        for u in internal + manager_urls:
+            nu = normalize_url(u)
+            if nu in seen:
+                continue
+            seen.add(nu)
+            merged.append(nu)
 
-    def endpoint_count(self) -> int:
-        with self._lock:
-            return len(self._endpoints)
+        if not merged:
+            raise NoEndpoints("No endpoints available")
 
-    def close(self) -> None:
-        with self._lock:
-            eps = list(self._endpoints)
-        for e in eps:
-            e.close()
+        return [self._get_or_create_endpoint(u) for u in merged]
 
-    def _snapshot(self) -> list[Endpoint]:
-        with self._lock:
-            return list(self._endpoints)
-
-    def _primary(self) -> Endpoint:
-        with self._lock:
-            if not self._endpoints:
-                raise NoEndpoints("No endpoints available")
-            return self._endpoints[0]
+    # ----------------------------
+    # pinning
+    # ----------------------------
 
     def _get_pinned(self) -> Optional[Endpoint]:
         return getattr(self._tls, "pinned", None)
 
     @contextmanager
-    def pin(self, *, kind: str = "read") -> Iterator[Endpoint]:
+    def pin(self, *, route: str = "pool") -> Iterator[Endpoint]:
         """
         Pin this thread to a single endpoint for deterministic routing.
-        Intended for future batching contexts.
 
-        kind="read" pins to the current RR endpoint snapshot.
-        kind="write" pins to primary (conservative).
-
-        Note: If no endpoints exist yet, this raises NoEndpoints.
+        route="pool": pins to the current RR choice from the merged pool candidates.
+        route="primary": pins to primary (raises if unset).
         """
-        if kind not in ("read", "write"):
-            raise ValueError("kind must be 'read' or 'write'")
+        if route not in ("pool", "primary"):
+            raise ValueError("route must be 'pool' or 'primary'")
 
         prev = self._get_pinned()
-        if kind == "write":
-            chosen = self._primary()
+
+        if route == "primary":
+            chosen = self._get_primary()
         else:
-            eps = self._eligible_snapshot()
-            if not eps:
-                raise NoEndpoints("No endpoints available")
+            eps = self._eligible_endpoints(self._pool_candidates())
             with self._lock:
                 start = self._rr % len(eps)
                 self._rr = (self._rr + 1) % (1 << 30)
@@ -220,23 +310,33 @@ class Provider:
         finally:
             self._tls.pinned = prev
 
+    # ----------------------------
+    # request routing
+    # ----------------------------
+
     def request(
         self,
         method: str,
         params: list[Any] | tuple[Any, ...],
         *,
-        kind: str = "read",
+        route: str = "pool",
         formatter: Formatter | None = None,
     ) -> Any:
-        if kind not in ("read", "write"):
-            raise ValueError("kind must be 'read' or 'write'")
+        """
+        Perform a JSON-RPC request routed either to the merged pool or to the primary.
+
+        - route="pool": RR+retry across (internal_pool + pool_manager best URLs)
+        - route="primary": primary-only (raises if primary unset)
+        """
+        if route not in ("pool", "primary"):
+            raise ValueError("route must be 'pool' or 'primary'")
 
         pinned = self._get_pinned()
         if pinned is not None:
             return pinned.request(method, params, formatter=formatter)
 
-        if kind == "write":
-            ep = self._primary()
+        if route == "primary":
+            ep = self._get_primary()
             try:
                 result = ep.request(method, params, formatter=formatter)
                 self._mark_success(ep)
@@ -246,11 +346,11 @@ class Provider:
                     self._mark_failure(ep, exc)
                 raise AllEndpointsFailed(exc) from exc
 
-        eps = self._eligible_snapshot()
-        if not eps:
-            raise NoEndpoints("No endpoints available")
+        # route == "pool"
+        candidates = self._pool_candidates()
+        eps = self._eligible_endpoints(candidates)
 
-        policy = self.retry_policy_read
+        policy = self.retry_policy_pool
         attempts = min(max(1, policy.max_attempts), len(eps))
         last_exc: Exception | None = None
 
@@ -260,7 +360,6 @@ class Provider:
 
         for i in range(attempts):
             ep = eps[(start + i) % len(eps)]
-
             try:
                 result = ep.request(method, params, formatter=formatter)
                 self._mark_success(ep)

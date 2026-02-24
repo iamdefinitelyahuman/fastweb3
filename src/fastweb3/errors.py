@@ -39,6 +39,10 @@ class NoEndpoints(FastWeb3Error):
     """Provider has no endpoints configured."""
 
 
+class NoPrimaryEndpoint(FastWeb3Error):
+    """Primary endpoint is required for this call but is not set."""
+
+
 class AllEndpointsFailed(FastWeb3Error):
     """Provider tried all endpoints and none succeeded."""
 
