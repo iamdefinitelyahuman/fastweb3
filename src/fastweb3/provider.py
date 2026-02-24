@@ -271,6 +271,8 @@ class Provider:
             merged.append(nu)
 
         if not merged:
+            if self._primary is not None:
+                return [self._primary]
             raise NoEndpoints("No endpoints available")
 
         return [self._get_or_create_endpoint(u) for u in merged]

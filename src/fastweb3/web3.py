@@ -70,11 +70,6 @@ class Web3:
                     probe_workers=probe_workers,
                 )
 
-            # Primary-only mode: if there is no chain_id and no internal endpoints,
-            # interpret primary_endpoint as the sole pool endpoint.
-            if chain_id is None and not internal_urls and primary_endpoint is not None:
-                internal_urls = [primary_endpoint]
-
             # No endpoints of any kind => error (primary-only mode handled above).
             if chain_id is None and not internal_urls and primary_endpoint is None:
                 raise NoEndpoints(
