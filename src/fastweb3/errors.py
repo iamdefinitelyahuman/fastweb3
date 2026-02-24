@@ -45,3 +45,7 @@ class AllEndpointsFailed(FastWeb3Error):
     def __init__(self, last_exc: Exception | None = None) -> None:
         super().__init__("All endpoints failed")
         self.last_exc = last_exc
+
+
+class ValidationError(FastWeb3Error):
+    """Client-side validation error (inputs are malformed before RPC)."""
