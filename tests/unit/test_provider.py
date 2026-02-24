@@ -1,3 +1,4 @@
+# tests/unit/test_provider.py
 from __future__ import annotations
 
 from collections import deque
@@ -10,6 +11,7 @@ import fastweb3.provider as provider_mod
 from fastweb3.errors import (
     AllEndpointsFailed,
     NoEndpoints,
+    NoPrimaryEndpoint,
     RPCError,
     RPCErrorDetails,
     TransportError,
@@ -32,10 +34,8 @@ class FakeEndpoint:
     - .close() records closed
     """
 
-    def __init__(self, url: str, *, transport: Any = None, config: Any = None) -> None:
+    def __init__(self, url: str, *args: Any, **kwargs: Any) -> None:
         self.url = url
-        self.transport = transport
-        self.config = config
         self.closed = False
         self.calls: list[tuple[str, list[Any]]] = []
         self._outcomes: Deque[_Outcome] = deque()
@@ -62,14 +62,33 @@ class FakeEndpoint:
         self.closed = True
 
 
+class FakePoolManager:
+    """
+    Minimal PoolManager test double.
+
+    best_urls(n) returns up to n URLs from an internal list.
+    """
+
+    def __init__(self, urls: list[str]) -> None:
+        self._urls = list(urls)
+        self.calls: list[int] = []
+
+    def best_urls(self, n: int) -> list[str]:
+        self.calls.append(int(n))
+        if n <= 0:
+            return []
+        return list(self._urls[:n])
+
+
 def _rpc_error(code: int = -32000, message: str = "boom", data: Any = None) -> RPCError:
     return RPCError(RPCErrorDetails(code=code, message=message, data=data))
 
 
 @pytest.fixture(autouse=True)
-def _patch_endpoint_class(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Ensure Provider.add_url constructs FakeEndpoint instead of real Endpoint.
+def _patch_endpoint_and_normalize(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Ensure Provider constructs FakeEndpoint and normalization is predictable.
     monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
+    monkeypatch.setattr(provider_mod, "normalize_url", lambda u: str(u))
 
 
 @pytest.fixture
@@ -94,43 +113,37 @@ def fixed_time(monkeypatch: pytest.MonkeyPatch):
     return now
 
 
-def test_no_endpoints_read_raises() -> None:
+def _ep(p: Provider, url: str) -> FakeEndpoint:
+    # Helper: grab cached endpoint by URL (normalization patched to identity).
+    return p._eps_by_url[url]  # type: ignore[attr-defined]
+
+
+def test_no_endpoints_pool_route_raises() -> None:
     p = Provider([])
     with pytest.raises(NoEndpoints):
-        p.request("eth_chainId", (), kind="read")
+        p.request("eth_chainId", (), route="pool")
 
 
-def test_no_endpoints_write_raises() -> None:
-    p = Provider([])
-    with pytest.raises(NoEndpoints):
-        p.request("eth_sendRawTransaction", ("0xdead",), kind="write")
+def test_primary_route_requires_primary() -> None:
+    p = Provider(["a"])
+    with pytest.raises(NoPrimaryEndpoint):
+        p.request("eth_chainId", (), route="primary")
 
 
-def test_round_robin_reads_across_endpoints(no_sleep) -> None:
+def test_primary_route_hits_primary_only_and_wraps_retryable_errors() -> None:
     p = Provider(["a", "b", "c"])
-    # add_url created FakeEndpoints; script their returns
-    a, b, c = p._snapshot()
-    a.queue_return("A1")
-    b.queue_return("B1")
-    c.queue_return("C1")
-    a.queue_return("A2")
+    p.set_primary("a")
 
-    assert p.request("m", (), kind="read") == "A1"
-    assert p.request("m", (), kind="read") == "B1"
-    assert p.request("m", (), kind="read") == "C1"
-    assert p.request("m", (), kind="read") == "A2"
+    a = _ep(p, "a")
+    b = _ep(p, "b")
+    c = _ep(p, "c")
 
-
-def test_write_uses_primary_only_and_wraps_retryable_errors() -> None:
-    p = Provider(["a", "b", "c"])
-    a, b, c = p._snapshot()
     a.queue_raise(TransportError("nope"))
-    # Even if others would succeed, write must not failover
     b.queue_return("B")
     c.queue_return("C")
 
     with pytest.raises(AllEndpointsFailed) as excinfo:
-        p.request("eth_sendRawTransaction", ("0xdead",), kind="write")
+        p.request("eth_sendRawTransaction", ("0xdead",), route="primary")
 
     assert isinstance(excinfo.value.__cause__, TransportError)
     assert len(a.calls) == 1
@@ -138,125 +151,182 @@ def test_write_uses_primary_only_and_wraps_retryable_errors() -> None:
     assert len(c.calls) == 0
 
 
-def test_read_failover_on_transport_error_then_succeed(no_sleep) -> None:
+def test_pool_round_robin_across_internal_endpoints(no_sleep) -> None:
+    p = Provider(["a", "b", "c"])
+
+    a = _ep(p, "a")
+    b = _ep(p, "b")
+    c = _ep(p, "c")
+
+    a.queue_return("A1")
+    b.queue_return("B1")
+    c.queue_return("C1")
+    a.queue_return("A2")
+
+    assert p.request("m", (), route="pool") == "A1"
+    assert p.request("m", (), route="pool") == "B1"
+    assert p.request("m", (), route="pool") == "C1"
+    assert p.request("m", (), route="pool") == "A2"
+
+
+def test_pool_candidates_merge_internal_then_manager_fill_and_dedup() -> None:
+    pm = FakePoolManager(["b", "d", "e"])
+    p = Provider(["a", "b"], pool_manager=pm, desired_pool_size=4)
+
+    a = _ep(p, "a")
+    b = _ep(p, "b")
+    d = p._get_or_create_endpoint("d")  # type: ignore[attr-defined]
+
+    a.queue_return("A")
+    b.queue_return("B")
+    d.queue_return("D")
+
+    # First pool call should ask manager for 2 (need 4 total, have 2 internal)
+    assert p.request("m", (), route="pool") == "A"
+    assert pm.calls == [2]
+
+    out = p.request("m", (), route="pool")
+    assert out in ("B", "D")
+
+
+def test_pool_failover_on_transport_error_then_succeed(no_sleep) -> None:
     p = Provider(
         ["a", "b"],
-        retry_policy_read=RetryPolicy(max_attempts=2, backoff_seconds=0.123),
+        retry_policy_pool=RetryPolicy(max_attempts=2, backoff_seconds=0.123),
     )
-    a, b = p._snapshot()
+    a = _ep(p, "a")
+    b = _ep(p, "b")
+
     a.queue_raise(TransportError("rate limited?"))
     b.queue_return("OK")
 
-    assert p.request("eth_chainId", (), kind="read") == "OK"
+    assert p.request("eth_chainId", (), route="pool") == "OK"
     assert no_sleep == [0.123]
     assert len(a.calls) == 1
     assert len(b.calls) == 1
 
 
-def test_read_all_endpoints_fail_raises_allendpointsfailed(no_sleep) -> None:
-    p = Provider(["a", "b"], retry_policy_read=RetryPolicy(max_attempts=2, backoff_seconds=0.01))
-    a, b = p._snapshot()
+def test_pool_all_endpoints_fail_raises_allendpointsfailed(no_sleep) -> None:
+    p = Provider(["a", "b"], retry_policy_pool=RetryPolicy(max_attempts=2, backoff_seconds=0.01))
+    a = _ep(p, "a")
+    b = _ep(p, "b")
+
     a.queue_raise(TransportError("a down"))
     b.queue_raise(TransportError("b down"))
 
     with pytest.raises(AllEndpointsFailed) as excinfo:
-        p.request("eth_chainId", (), kind="read")
+        p.request("eth_chainId", (), route="pool")
 
     assert isinstance(excinfo.value.last_exc, TransportError)
     assert str(excinfo.value.last_exc) == "b down"
     assert no_sleep == [0.01]
 
 
-def test_read_rpcerror_does_not_retry_by_default(no_sleep) -> None:
-    p = Provider(["a", "b"], retry_policy_read=RetryPolicy(max_attempts=2, backoff_seconds=0.5))
-    a, b = p._snapshot()
+def test_pool_rpcerror_does_not_retry_by_default(no_sleep) -> None:
+    p = Provider(["a", "b"], retry_policy_pool=RetryPolicy(max_attempts=2, backoff_seconds=0.5))
+    a = _ep(p, "a")
+    b = _ep(p, "b")
+
     a.queue_raise(_rpc_error(message="nope"))
     b.queue_return("OK")
 
     with pytest.raises(RPCError):
-        p.request("eth_call", ("x",), kind="read")
+        p.request("eth_call", ("x",), route="pool")
 
-    # no retry sleep, no failover
     assert no_sleep == []
     assert len(a.calls) == 1
     assert len(b.calls) == 0
 
 
-def test_read_rpcerror_can_retry_when_enabled(no_sleep) -> None:
+def test_pool_rpcerror_can_retry_when_enabled(no_sleep) -> None:
     p = Provider(
         ["a", "b"],
-        retry_policy_read=RetryPolicy(max_attempts=2, backoff_seconds=0.2, retry_on_rpc_error=True),
+        retry_policy_pool=RetryPolicy(max_attempts=2, backoff_seconds=0.2, retry_on_rpc_error=True),
     )
-    a, b = p._snapshot()
+    a = _ep(p, "a")
+    b = _ep(p, "b")
+
     a.queue_raise(_rpc_error(message="transient?"))
     b.queue_return("OK")
 
-    assert p.request("eth_call", ("x",), kind="read") == "OK"
+    assert p.request("eth_call", ("x",), route="pool") == "OK"
     assert no_sleep == [0.2]
     assert len(a.calls) == 1
     assert len(b.calls) == 1
 
 
-def test_pin_read_forces_same_endpoint_and_restores_previous(no_sleep) -> None:
+def test_pin_pool_forces_same_endpoint_and_restores_previous() -> None:
     p = Provider(["a", "b"])
-    a, b = p._snapshot()
-    # If we didn't pin, we'd alternate. With pin, both go to pinned endpoint.
+    a = _ep(p, "a")
+    b = _ep(p, "b")
+
+    # Script enough outcomes for whichever endpoint gets pinned
     a.queue_return("A1")
     a.queue_return("A2")
     b.queue_return("B1")
+    b.queue_return("B2")
 
-    with p.pin(kind="read") as chosen:
+    with p.pin(route="pool") as chosen:
         assert chosen in (a, b)
-        r1 = p.request("m", (), kind="read")
-        r2 = p.request("m", (), kind="read")
-        assert (r1, r2) in (("A1", "A2"), ("B1", "B1")) or True  # value depends on which was pinned
+        r1 = p.request("m", (), route="pool")
+        r2 = p.request("m", (), route="pool")
+        # Both calls should go to the pinned endpoint (so same letter)
+        assert r1[0] == r2[0]
 
-    # After exiting, unpinned again: next call can hit the other endpoint depending on rr
-    # (we mainly care that pin didn't leak)
-    p.request("m", (), kind="read")
+    # pin should not leak
+    assert getattr(p._tls, "pinned", None) is None
+
+    # After exiting, unpinned again: just ensure it works (RR may hit either endpoint).
+    a.queue_return("A3")
+    b.queue_return("B3")
+    _ = p.request("m", (), route="pool")
 
 
-def test_pin_write_pins_primary() -> None:
+def test_pin_primary_pins_primary_and_overrides_route_while_pinned() -> None:
     p = Provider(["a", "b"])
-    a, b = p._snapshot()
+    p.set_primary("a")
+
+    a = _ep(p, "a")
+    b = _ep(p, "b")
 
     a.queue_return("A1")
     a.queue_return("A2")
-
-    # After unpin, next read might still go to 'a' depending on _rr.
-    a.queue_return("A3")
     b.queue_return("B1")
 
-    with p.pin(kind="write") as chosen:
+    with p.pin(route="primary") as chosen:
         assert chosen is a
-        assert p.request("m", (), kind="read") == "A1"
-        assert p.request("m", (), kind="write") == "A2"
+        assert p.request("m", (), route="pool") == "A1"
+        assert p.request("m", (), route="primary") == "A2"
 
-    out = p.request("m", (), kind="read")
-    assert out in ("A3", "B1")
+    # After unpin, pool routing can hit either; ensure both have outcomes.
+    a.queue_return("A3")
+    b.queue_return("B2")
+    out = p.request("m", (), route="pool")
+    assert out in ("A3", "B1", "B2")
 
 
 def test_cooldown_skips_failed_endpoint_until_expired(fixed_time, no_sleep) -> None:
-    p = Provider(["a", "b"], retry_policy_read=RetryPolicy(max_attempts=2, backoff_seconds=0.0))
-    a, b = p._snapshot()
+    p = Provider(["a", "b"], retry_policy_pool=RetryPolicy(max_attempts=2, backoff_seconds=0.0))
+    a = _ep(p, "a")
+    b = _ep(p, "b")
 
     a.queue_raise(TransportError("429", status_code=429))
     b.queue_return("OK")
 
-    assert p.request("m", (), kind="read") == "OK"
+    assert p.request("m", (), route="pool") == "OK"
 
-    eligible = p._eligible_snapshot()
+    candidates = p._pool_candidates()  # type: ignore[attr-defined]
+    eligible = p._eligible_endpoints(candidates)  # type: ignore[attr-defined]
     assert b in eligible
     assert a not in eligible
 
     fixed_time["t"] += 10_000.0
-    eligible2 = p._eligible_snapshot()
+    eligible2 = p._eligible_endpoints(candidates)  # type: ignore[attr-defined]
     assert a in eligible2
     assert b in eligible2
 
 
 def test_add_url_dedups_normalized_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Make normalization deterministic for the test
     monkeypatch.setattr(provider_mod, "normalize_url", lambda u: u.strip().lower())
 
     p = Provider([])
@@ -266,14 +336,18 @@ def test_add_url_dedups_normalized_url(monkeypatch: pytest.MonkeyPatch) -> None:
     assert p.urls() == ["http://example.invalid"]
 
 
-def test_remove_url_closes_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_remove_url_removes_from_internal_pool_but_does_not_close_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(provider_mod, "normalize_url", lambda u: u.strip().lower())
 
     p = Provider(["http://example.invalid", "http://other.invalid"])
-    eps = p._snapshot()
-    target = next(ep for ep in eps if ep.url == "http://example.invalid")
+    target = p._eps_by_url["http://example.invalid"]  # type: ignore[attr-defined]
     assert target.closed is False
 
     p.remove_url(" HTTP://EXAMPLE.INVALID ")
-    assert target.closed is True
+    assert target.closed is False  # remove_url does not close cached endpoints
     assert p.urls() == ["http://other.invalid"]
+
+    p.close()
+    assert target.closed is True
