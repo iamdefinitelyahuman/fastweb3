@@ -321,7 +321,7 @@ class PoolManager:
         # Start the maintainer thread immediately.
         threading.Thread(target=self._maintain, daemon=True).start()
 
-    def best_urls(self, n: int) -> list[str]:
+    def best_urls(self, n: int, await_first: bool) -> list[str]:
         """
         Return up to n URLs from the active set, best-first.
 
@@ -336,7 +336,8 @@ class PoolManager:
                 return list(self._active[:n])
 
         # No active URLs yet: block until at least one is available.
-        self._ready.wait()
+        if await_first:
+            self._ready.wait()
 
         with self._lock:
             return list(self._active[:n])
@@ -469,6 +470,8 @@ class PoolManager:
                 now = time.time()
                 self._health_check(state=state, meta=meta, now=now)
                 self._handle_probe_result(state=state, pr=pr, now=now)
+
+            self._ready.set()
 
             # Epoch sleep, but still do periodic health checks while idle.
             sleep_end = time.time() + POOL_EPOCH_SLEEP_S

@@ -257,7 +257,8 @@ class Provider:
         needed = max(0, self.desired_pool_size - len(internal))
         manager_urls: list[str] = []
         if needed > 0 and self.pool_manager is not None:
-            manager_urls = self.pool_manager.best_urls(needed)
+            await_first = not (internal or self._primary)
+            manager_urls = self.pool_manager.best_urls(needed, await_first)
 
         # Dedup preserve order by normalized URL
         seen: set[str] = set()
