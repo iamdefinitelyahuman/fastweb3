@@ -66,15 +66,16 @@ class FakePoolManager:
     """
     Minimal PoolManager test double.
 
-    best_urls(n) returns up to n URLs from an internal list.
+    best_urls(n, await_first) returns up to n URLs from an internal list.
+    Records calls as tuples: (n, await_first).
     """
 
     def __init__(self, urls: list[str]) -> None:
         self._urls = list(urls)
-        self.calls: list[int] = []
+        self.calls: list[tuple[int, bool]] = []
 
-    def best_urls(self, n: int) -> list[str]:
-        self.calls.append(int(n))
+    def best_urls(self, n: int, await_first: bool) -> list[str]:
+        self.calls.append((int(n), bool(await_first)))
         if n <= 0:
             return []
         return list(self._urls[:n])
@@ -183,7 +184,7 @@ def test_pool_candidates_merge_internal_then_manager_fill_and_dedup() -> None:
 
     # First pool call should ask manager for 2 (need 4 total, have 2 internal)
     assert p.request("m", (), route="pool") == "A"
-    assert pm.calls == [2]
+    assert pm.calls == [(2, False)]  # await_first False because internal exists
 
     out = p.request("m", (), route="pool")
     assert out in ("B", "D")
@@ -351,3 +352,50 @@ def test_remove_url_removes_from_internal_pool_but_does_not_close_endpoint(
 
     p.close()
     assert target.closed is True
+
+
+def test_poolmanager_await_first_false_when_internal_present() -> None:
+    pm = FakePoolManager(["m1", "m2"])
+    p = Provider(["a"], pool_manager=pm, desired_pool_size=2)
+
+    # Drive one pool request; should consult pool manager to fill 1 slot
+    a = _ep(p, "a")
+    m1 = p._get_or_create_endpoint("m1")  # type: ignore[attr-defined]
+
+    a.queue_return("A")
+    m1.queue_return("M1")
+
+    out = p.request("m", (), route="pool")
+    assert out in ("A", "M1")
+    assert pm.calls == [(1, False)]  # internal exists => never await
+
+
+def test_poolmanager_await_first_false_when_primary_present_and_internal_empty() -> None:
+    pm = FakePoolManager(["m1"])
+    p = Provider([], pool_manager=pm, desired_pool_size=1)
+    p.set_primary("p1")
+
+    # Even though internal is empty, primary exists => await_first False
+    p1 = _ep(p, "p1")
+    p1.queue_return("P1")
+
+    # Manager might be asked (depending on desired_pool_size) but must be await_first False
+    # In this configuration: needed = 1 (internal empty), so manager is called.
+    # If manager returns empty, Provider would fall back to primary; ours returns ["m1"].
+    m1 = p._get_or_create_endpoint("m1")  # type: ignore[attr-defined]
+    m1.queue_return("M1")
+
+    out = p.request("m", (), route="pool")
+    assert out in ("M1",)  # pool candidates non-empty, so it can pick m1
+    assert pm.calls == [(1, False)]
+
+
+def test_poolmanager_await_first_true_when_no_internal_and_no_primary() -> None:
+    pm = FakePoolManager(["m1"])
+    p = Provider([], pool_manager=pm, desired_pool_size=1)
+
+    m1 = p._get_or_create_endpoint("m1")  # type: ignore[attr-defined]
+    m1.queue_return("M1")
+
+    assert p.request("m", (), route="pool") == "M1"
+    assert pm.calls == [(1, True)]

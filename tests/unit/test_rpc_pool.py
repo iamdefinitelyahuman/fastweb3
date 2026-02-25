@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -9,6 +10,8 @@ from typing import Any
 import pytest
 
 import fastweb3.rpc_pool as rpc_pool
+
+_REAL_THREAD = threading.Thread
 
 
 class DummyResp:
@@ -258,7 +261,7 @@ def test_probe_urls_streaming_empty_candidates_returns_no_items(monkeypatch: pyt
     assert list(rpc_pool.probe_urls_streaming(urls, expected_chain_id=1, deadline_s=0.05)) == []
 
 
-def test_get_pool_manager_returns_shared_instance(monkeypatch: pytest.MonkeyPatch, no_pool_thread):
+def test_get_pool_manager_returns_shared_instance(no_pool_thread):
     pm1 = rpc_pool.get_pool_manager(1)
     pm2 = rpc_pool.get_pool_manager(1)
     pm3 = rpc_pool.get_pool_manager(2)
@@ -273,7 +276,7 @@ def test_poolmanager_fill_until_target_pool(no_pool_thread):
     pm._handle_probe_result(state=state, pr=pr("https://a", 100, 10), now=0.0)
     pm._handle_probe_result(state=state, pr=pr("https://b", 90, 11), now=0.0)
 
-    assert pm.best_urls(10) == ["https://b", "https://a"]
+    assert pm.best_urls(10, await_first=False) == ["https://b", "https://a"]
 
 
 def test_poolmanager_replace_worst_when_significantly_better(no_pool_thread):
@@ -282,11 +285,11 @@ def test_poolmanager_replace_worst_when_significantly_better(no_pool_thread):
 
     pm._handle_probe_result(state=state, pr=pr("https://slow", 200, 10), now=0.0)
     pm._handle_probe_result(state=state, pr=pr("https://fast", 80, 10), now=0.0)
-    assert set(pm.best_urls(10)) == {"https://slow", "https://fast"}
+    assert set(pm.best_urls(10, await_first=False)) == {"https://slow", "https://fast"}
 
     pm._handle_probe_result(state=state, pr=pr("https://new", 50, 10), now=0.0)
 
-    urls = pm.best_urls(10)
+    urls = pm.best_urls(10, await_first=False)
     assert "https://new" in urls
     assert "https://slow" not in urls
 
@@ -300,7 +303,7 @@ def test_poolmanager_replace_cooldown_blocks_replacement(no_pool_thread):
 
     pm._handle_probe_result(state=state, pr=pr("https://new", 50, 10), now=0.0)
 
-    urls = pm.best_urls(10)
+    urls = pm.best_urls(10, await_first=False)
     assert "https://slow" in urls
     assert "https://new" not in urls
 
@@ -314,11 +317,7 @@ def test_poolmanager_eviction_cooldown_blocks_readd(no_pool_thread):
 
     pm._handle_probe_result(state=state, pr=pr("https://a", 50, 10), now=0.0)
 
-    # IMPORTANT: best_urls() blocks until pool is non-empty at least once.
-    # Here the pool stays empty by design, so assert via internal state.
-    with pm._lock:
-        assert pm._active == []
-        assert pm._active_set == set()
+    assert pm.best_urls(10, await_first=False) == []
 
 
 def test_poolmanager_health_check_eviction_on_lag(monkeypatch: pytest.MonkeyPatch, no_pool_thread):
@@ -326,7 +325,7 @@ def test_poolmanager_health_check_eviction_on_lag(monkeypatch: pytest.MonkeyPatc
     state = rpc_pool._MaintainerState()
 
     pm._handle_probe_result(state=state, pr=pr("https://a", 100, 100), now=0.0)
-    assert pm.best_urls(10) == ["https://a"]
+    assert pm.best_urls(10, await_first=False) == ["https://a"]
 
     pm._best_head = 100
 
@@ -339,7 +338,7 @@ def test_poolmanager_health_check_eviction_on_lag(monkeypatch: pytest.MonkeyPatc
     state.next_health_ts = -1.0
     pm._health_check(state=state, meta=rpc_pool.ChainMeta(1, "X", ["https://a"]), now=0.0)
 
-    assert pm.best_urls(10) == []
+    assert pm.best_urls(10, await_first=False) == []
 
 
 def test_poolmanager_health_check_eviction_on_failure(
@@ -349,7 +348,7 @@ def test_poolmanager_health_check_eviction_on_failure(
     state = rpc_pool._MaintainerState()
 
     pm._handle_probe_result(state=state, pr=pr("https://a", 100, 10), now=0.0)
-    assert pm.best_urls(10) == ["https://a"]
+    assert pm.best_urls(10, await_first=False) == ["https://a"]
 
     def fake_probe_one(url: str, **kwargs):
         raise RuntimeError("boom")
@@ -359,4 +358,35 @@ def test_poolmanager_health_check_eviction_on_failure(
     state.next_health_ts = -1.0
     pm._health_check(state=state, meta=rpc_pool.ChainMeta(1, "X", ["https://a"]), now=0.0)
 
-    assert pm.best_urls(10) == []
+    assert pm.best_urls(10, await_first=False) == []
+
+
+def test_poolmanager_best_urls_empty_returns_immediately_when_not_awaiting(no_pool_thread):
+    pm = rpc_pool.PoolManager(1, target_pool=2)
+    assert pm.best_urls(5, await_first=False) == []
+
+
+def test_poolmanager_best_urls_blocks_when_awaiting_until_ready_then_returns(no_pool_thread):
+    pm = rpc_pool.PoolManager(1, target_pool=2)
+
+    result: dict[str, object] = {}
+    started = threading.Event()
+
+    def run() -> None:
+        started.set()
+        result["urls"] = pm.best_urls(5, await_first=True)
+
+    t = _REAL_THREAD(target=run, daemon=True)
+    t.start()
+
+    assert started.wait(timeout=0.2)
+
+    # Should still be blocked
+    t.join(timeout=0.05)
+    assert t.is_alive()
+
+    # Mark ready without adding active: should unblock and return []
+    pm._ready.set()
+    t.join(timeout=0.5)
+    assert not t.is_alive()
+    assert result["urls"] == []
