@@ -1,4 +1,3 @@
-# tests/unit/test_provider.py
 from __future__ import annotations
 
 from collections import deque
@@ -24,40 +23,110 @@ from fastweb3.provider import Provider, RetryPolicy
 class _Outcome:
     value: Any | None = None
     exc: Exception | None = None
+    tip_hex: str | None = None  # optional override for eth_blockNumber result
 
 
 class FakeEndpoint:
     """
     Minimal Endpoint test double for Provider tests.
 
-    - Has .url
-    - .request() pops scripted outcomes
-    - .close() records closed
+    Provider uses:
+      - request_batch(("eth_blockNumber", (), to_int), (method, params, formatter_or_none))
+        when pooling is enabled
+      - request(method, params, formatter) when in primary-only mode (desired_pool_size == 0)
+
+    We keep .calls as the *user-call* history: (method, params_list)
+    We also keep:
+      - .batch_calls to assert on the full batch contents
+      - .request_calls to assert when primary-only mode uses request()
     """
 
     def __init__(self, url: str, *args: Any, **kwargs: Any) -> None:
         self.url = url
         self.closed = False
+
+        # User-call history (attempted), for backwards-compatible assertions
         self.calls: list[tuple[str, list[Any]]] = []
+
+        # Full batch call history: list of tuples passed to request_batch
+        self.batch_calls: list[tuple[tuple[Any, ...], ...]] = []
+
+        # Single-call history for primary-only mode
+        self.request_calls: list[tuple[str, list[Any], Any]] = []
+
         self._outcomes: Deque[_Outcome] = deque()
 
-    def queue_return(self, value: Any) -> None:
-        self._outcomes.append(_Outcome(value=value))
+    def queue_return(self, value: Any, *, tip_hex: str | None = None) -> None:
+        self._outcomes.append(_Outcome(value=value, tip_hex=tip_hex))
 
     def queue_raise(self, exc: Exception) -> None:
         self._outcomes.append(_Outcome(exc=exc))
 
-    def request(self, method: str, params: list[Any] | tuple[Any, ...], *, formatter=None) -> Any:
-        self.calls.append((method, list(params)))
+    def request(self, method: str, params: list[Any] | tuple[Any, ...], formatter=None) -> Any:
+        # Record attempted user call immediately (even if it errors)
+        self.calls.append((str(method), list(params)))
+        self.request_calls.append((str(method), list(params), formatter))
+
         if not self._outcomes:
             raise AssertionError(f"No scripted outcomes for endpoint {self.url}")
         o = self._outcomes.popleft()
         if o.exc is not None:
             raise o.exc
+
         out = o.value
         if formatter is not None:
             out = formatter(out)
         return out
+
+    def request_batch(self, *calls: tuple[Any, ...]) -> list[Any]:
+        """
+        Expects:
+          ("eth_blockNumber", (), to_int)
+          (method, params, formatter_or_none)
+        """
+        self.batch_calls.append(calls)
+
+        # Validate shape lightly (helps catch accidental test misuse)
+        if len(calls) != 2:
+            raise AssertionError(f"Provider should batch exactly 2 calls, got {len(calls)}")
+
+        # First call is the probe
+        probe = calls[0]
+        if len(probe) != 3:
+            raise AssertionError("Probe call must be (method, params, formatter)")
+        probe_method, probe_params, probe_fmt = probe
+        if probe_method != "eth_blockNumber":
+            raise AssertionError(f"First call must be eth_blockNumber, got {probe_method!r}")
+        if list(probe_params) != []:
+            raise AssertionError("eth_blockNumber params must be empty")
+        if not callable(probe_fmt):
+            raise AssertionError("eth_blockNumber formatter must be callable")
+
+        # Second call is the user's request
+        user = calls[1]
+        if len(user) != 3:
+            raise AssertionError("User call must be (method, params, formatter_or_none)")
+        method, params, fmt = user
+
+        # Record attempted user call immediately (even if it errors)
+        self.calls.append((str(method), list(params)))
+
+        if not self._outcomes:
+            raise AssertionError(f"No scripted outcomes for endpoint {self.url}")
+        o = self._outcomes.popleft()
+        if o.exc is not None:
+            raise o.exc
+
+        # Tip result: default stable tip unless overridden
+        tip_raw = o.tip_hex if o.tip_hex is not None else "0x64"  # 100
+        tip_val = probe_fmt(tip_raw)
+
+        # User result + optional formatting
+        out = o.value
+        if fmt is not None:
+            out = fmt(out)
+
+        return [tip_val, out]
 
     def close(self) -> None:
         self.closed = True
@@ -387,8 +456,6 @@ def test_poolmanager_await_first_false_when_primary_present_and_internal_empty()
     p1.queue_return("P1")
 
     # Manager might be asked (depending on desired_pool_size) but must be await_first False
-    # In this configuration: needed = 1 (internal empty), so manager is called.
-    # If manager returns empty, Provider would fall back to primary; ours returns ["m1"].
     m1 = p._get_or_create_endpoint("m1")  # type: ignore[attr-defined]
     m1.queue_return("M1")
 
@@ -427,3 +494,85 @@ def test_provider_add_url_missing_env_raises(monkeypatch: pytest.MonkeyPatch) ->
     p = Provider([])
     with pytest.raises(ValueError, match="RPC_MISSING.*not set|not.*set"):
         p.add_url("https://example.com/$RPC_MISSING")
+
+
+def test_provider_batches_eth_blocknumber_before_user_call() -> None:
+    p = Provider(["a"])
+    a = _ep(p, "a")
+    a.queue_return("OK")
+
+    assert p.request("eth_chainId", (), route="pool") == "OK"
+
+    assert len(a.batch_calls) == 1
+    batch = a.batch_calls[0]
+    assert batch[0][0] == "eth_blockNumber"
+    assert list(batch[0][1]) == []
+    assert callable(batch[0][2])
+
+    assert batch[1][0] == "eth_chainId"
+    assert list(batch[1][1]) == []
+    # third element is formatter_or_none
+    assert len(batch[1]) == 3
+
+
+def test_provider_tracks_best_tip_and_demotes_stale_endpoint(fixed_time) -> None:
+    # Use fixed time so we can reason about cooldown windows deterministically.
+    p = Provider(["a", "b"], retry_policy_pool=RetryPolicy(max_attempts=1, backoff_seconds=0.0))
+    a = _ep(p, "a")
+    b = _ep(p, "b")
+
+    # First call via a sets best_tip=200
+    a.queue_return("A", tip_hex="0xc8")  # 200
+    assert p.request("m", (), route="pool") == "A"
+
+    # Now b reports tip=150 while best=200 -> should get tip demoted
+    b.queue_return("B", tip_hex="0x96")  # 150
+    assert p.request("m", (), route="pool") == "B"
+
+    # b should now be ineligible (tip cooldown) while a is eligible
+    candidates = p._pool_candidates()  # type: ignore[attr-defined]
+    eligible = p._eligible_endpoints(candidates)  # type: ignore[attr-defined]
+    assert a in eligible
+    assert b not in eligible
+
+    # After cooldown passes, b becomes eligible again
+    fixed_time["t"] += 10_000.0
+    eligible2 = p._eligible_endpoints(candidates)  # type: ignore[attr-defined]
+    assert a in eligible2
+    assert b in eligible2
+
+
+def test_primary_only_mode_skips_batching_for_primary_route() -> None:
+    p = Provider([])
+    p.set_primary("p1")
+
+    p1 = _ep(p, "p1")
+    p1.queue_return("OK")
+
+    out = p.request("eth_chainId", (), route="primary")
+    assert out == "OK"
+
+    assert len(p1.request_calls) == 1
+    assert len(p1.batch_calls) == 0
+    assert p1.calls == [("eth_chainId", [])]
+
+    # No tip probing => best tip should remain unset
+    assert getattr(p, "_best_tip") is None  # type: ignore[attr-defined]
+
+
+def test_primary_only_mode_pool_route_falls_back_to_primary_and_skips_batching() -> None:
+    # Pool is empty, but primary exists => _pool_candidates falls back to primary.
+    # In primary-only mode, _make_request should still use request() (no batching).
+    p = Provider([])
+    p.set_primary("p1")
+
+    p1 = _ep(p, "p1")
+    p1.queue_return("OK")
+
+    out = p.request("net_version", (), route="pool")
+    assert out == "OK"
+
+    assert len(p1.request_calls) == 1
+    assert len(p1.batch_calls) == 0
+    assert p1.calls == [("net_version", [])]
+    assert getattr(p, "_best_tip") is None  # type: ignore[attr-defined]
