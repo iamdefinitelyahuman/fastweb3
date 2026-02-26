@@ -1,3 +1,4 @@
+# src/fastweb3/provider.py
 from __future__ import annotations
 
 import threading
@@ -7,7 +8,14 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 
 from .endpoint import Endpoint, Formatter
-from .errors import AllEndpointsFailed, NoEndpoints, NoPrimaryEndpoint, RPCError, TransportError
+from .errors import (
+    AllEndpointsFailed,
+    NoEndpoints,
+    NoPrimaryEndpoint,
+    RPCError,
+    TransportError,
+)
+from .formatters import to_int
 from .rpc_pool import PoolManager
 from .utils import normalize_url
 
@@ -25,8 +33,12 @@ def _default_is_retryable_exc(exc: Exception) -> bool:
 
 @dataclass
 class _EndpointState:
-    cooldown_until: float = 0.0
+    # Cooldown due to request/transport failures (exponential-ish backoff)
+    error_cooldown_until: float = 0.0
     failures: int = 0
+
+    # Cooldown due to stale tip observation
+    tip_cooldown_until: float = 0.0
 
 
 class Provider:
@@ -39,6 +51,11 @@ class Provider:
     Pool routing:
       candidates = internal_pool + pool_manager.best_urls(needed)
       where needed fills up to desired_pool_size (option B)
+
+    Freshness tracking (v1):
+      - Every request is executed as a batch: [eth_blockNumber, userCall]
+      - We track the best (highest) tip we've ever observed
+      - If an endpoint reports a tip lower than best, we temporarily demote it (cooldown)
     """
 
     def __init__(
@@ -69,6 +86,9 @@ class Provider:
 
         # Primary is a specific Endpoint instance (stable identity), or None.
         self._primary: Endpoint | None = None
+
+        # Best (highest) chain tip we've observed across any endpoint.
+        self._best_tip: int | None = None
 
         for u in internal_urls or []:
             self.add_url(u, priority=False)
@@ -186,12 +206,13 @@ class Provider:
             self._internal_urls.clear()
             self._internal_seen.clear()
             self._primary = None
+            self._best_tip = None
 
         for ep in eps:
             ep.close()
 
     # ----------------------------
-    # cooldown/backoff
+    # cooldown/backoff (errors)
     # ----------------------------
 
     def _cooldown_seconds(self, exc: Exception, failures: int) -> float:
@@ -218,16 +239,53 @@ class Provider:
                 st = _EndpointState()
                 self._state[ep] = st
             st.failures += 1
-            st.cooldown_until = now + self._cooldown_seconds(exc, st.failures)
+            st.error_cooldown_until = now + self._cooldown_seconds(exc, st.failures)
 
     def _mark_success(self, ep: Endpoint) -> None:
+        # Reset *error* failures/cooldown. Do NOT clear tip demotion.
         with self._lock:
             st = self._state.get(ep)
             if st is None:
                 st = _EndpointState()
                 self._state[ep] = st
             st.failures = 0
-            st.cooldown_until = 0.0
+            st.error_cooldown_until = 0.0
+
+    # ----------------------------
+    # freshness tracking / demotion (tips)
+    # ----------------------------
+
+    def _tip_cooldown_seconds(self, lag_blocks: int) -> float:
+        """
+        Cooldown for endpoints that report a stale tip vs best known.
+
+        Keep this simple and bounded; it's just "temporary demotion", not a ban.
+        """
+        # Base 0.5s, +0.25s per block behind, capped at 30s.
+        return min(30.0, 0.5 + 0.25 * max(0, int(lag_blocks)))
+
+    def _update_tip_and_maybe_demote(self, ep: Endpoint, returned_tip: int) -> None:
+        now = time.time()
+        with self._lock:
+            st = self._state.get(ep)
+            if st is None:
+                st = _EndpointState()
+                self._state[ep] = st
+
+            best = self._best_tip
+            if best is None or returned_tip > best:
+                self._best_tip = returned_tip
+                return
+
+            if returned_tip < best:
+                lag = best - returned_tip
+                st.tip_cooldown_until = max(
+                    st.tip_cooldown_until, now + self._tip_cooldown_seconds(lag)
+                )
+
+    # ----------------------------
+    # eligibility
+    # ----------------------------
 
     def _eligible_endpoints(self, eps: list[Endpoint]) -> list[Endpoint]:
         """
@@ -236,9 +294,13 @@ class Provider:
         """
         now = time.time()
         with self._lock:
-            eligible = [
-                ep for ep in eps if self._state.get(ep, _EndpointState()).cooldown_until <= now
-            ]
+            eligible = []
+            for ep in eps:
+                st = self._state.get(ep, _EndpointState())
+                cooldown_until = max(st.error_cooldown_until, st.tip_cooldown_until)
+                if cooldown_until <= now:
+                    eligible.append(ep)
+
         return eligible if eligible else eps
 
     # ----------------------------
@@ -314,6 +376,34 @@ class Provider:
             self._tls.pinned = prev
 
     # ----------------------------
+    # batching wrapper (v1 freshness probe)
+    # ----------------------------
+
+    def _make_request(
+        self,
+        ep: Endpoint,
+        method: str,
+        params: list[Any] | tuple[Any, ...],
+        formatter: Formatter | None = None,
+    ) -> Any:
+        """
+        Always execute as a batch: [eth_blockNumber, userCall], in that order.
+
+        Updates:
+          - best tip tracking
+          - per-endpoint stale-tip demotion
+          - error success/failure state via callers
+        """
+        tip, result = ep.request_batch(
+            ("eth_blockNumber", (), to_int),
+            (method, params, formatter),
+        )
+
+        # tip is an int via to_int
+        self._update_tip_and_maybe_demote(ep, int(tip))
+        return result
+
+    # ----------------------------
     # request routing
     # ----------------------------
 
@@ -330,18 +420,21 @@ class Provider:
 
         - route="pool": RR+retry across (internal_pool + pool_manager best URLs)
         - route="primary": primary-only (raises if primary unset)
+
+        Freshness tracking:
+          Every request batches eth_blockNumber alongside the user call.
         """
         if route not in ("pool", "primary"):
             raise ValueError("route must be 'pool' or 'primary'")
 
         pinned = self._get_pinned()
         if pinned is not None:
-            return pinned.request(method, params, formatter=formatter)
+            return self._make_request(pinned, method, params, formatter)
 
         if route == "primary":
             ep = self._get_primary()
             try:
-                result = ep.request(method, params, formatter=formatter)
+                result = self._make_request(ep, method, params, formatter)
                 self._mark_success(ep)
                 return result
             except Exception as exc:
@@ -364,12 +457,13 @@ class Provider:
         for i in range(attempts):
             ep = eps[(start + i) % len(eps)]
             try:
-                result = ep.request(method, params, formatter=formatter)
+                result = self._make_request(ep, method, params, formatter)
                 self._mark_success(ep)
                 return result
 
             except RPCError as exc:
                 last_exc = exc
+                # RPCError is not a transport failure; do not mark_failure unless caller wants it.
                 if policy.retry_on_rpc_error and i < attempts - 1:
                     time.sleep(policy.backoff_seconds)
                     continue
