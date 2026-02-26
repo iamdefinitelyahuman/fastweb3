@@ -3,12 +3,37 @@ from __future__ import annotations
 
 import json
 import socket
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
+import pytest
+
 from fastweb3.transport.ipc import IPCTransport, IPCTransportConfig
+
+
+def _supports_ipc_unix_socket() -> bool:
+    # "IPC" here is AF_UNIX domain sockets. Some Windows Python builds don't expose it.
+    return hasattr(socket, "AF_UNIX")
+
+
+@pytest.fixture
+def ipc_sock_path() -> Path:
+    """
+    Use a short path for AF_UNIX sockets.
+
+    On macOS, AF_UNIX path length is small, and pytest's tmp_path in CI can be
+    too long (e.g. /private/var/folders/.../pytest-0/...).
+    """
+    if not _supports_ipc_unix_socket():
+        pytest.skip("AF_UNIX (unix domain sockets) not supported on this platform")
+
+    # Prefer a short base dir. On Unix runners, /tmp is available and short.
+    base_dir = "/tmp" if Path("/tmp").exists() else None
+    d = Path(tempfile.mkdtemp(prefix="fw3_ipc_", dir=base_dir))
+    return d / "node.ipc"
 
 
 def _ipc_server_once(
@@ -53,8 +78,8 @@ def _ipc_server_once(
             pass
 
 
-def test_ipc_transport_single_request_roundtrip(tmp_path: Path) -> None:
-    sock_path = tmp_path / "node.ipc"
+def test_ipc_transport_single_request_roundtrip(ipc_sock_path: Path) -> None:
+    sock_path = ipc_sock_path
     ready = threading.Event()
 
     def handler(req: Any) -> Any:
@@ -78,8 +103,8 @@ def test_ipc_transport_single_request_roundtrip(tmp_path: Path) -> None:
         tr.close()
 
 
-def test_ipc_transport_batch_request_roundtrip(tmp_path: Path) -> None:
-    sock_path = tmp_path / "node.ipc"
+def test_ipc_transport_batch_request_roundtrip(ipc_sock_path: Path) -> None:
+    sock_path = ipc_sock_path
     ready = threading.Event()
 
     def handler(req: Any) -> Any:
@@ -110,8 +135,8 @@ def test_ipc_transport_batch_request_roundtrip(tmp_path: Path) -> None:
         tr.close()
 
 
-def test_ipc_transport_reconnects_after_server_closes(tmp_path: Path) -> None:
-    sock_path = tmp_path / "node.ipc"
+def test_ipc_transport_reconnects_after_server_closes(ipc_sock_path: Path) -> None:
+    sock_path = ipc_sock_path
 
     tr = IPCTransport(
         str(sock_path), config=IPCTransportConfig(connect_timeout=1.0, recv_timeout=2.0)
@@ -131,7 +156,7 @@ def test_ipc_transport_reconnects_after_server_closes(tmp_path: Path) -> None:
         resp1 = tr.send({"jsonrpc": "2.0", "id": 1, "method": "m", "params": []})
         assert resp1["result"] == "first"
 
-        # Ensure server unlinked and client notices on next connect attempt
+        # Give the server a moment to close/unlink before the next accept/bind.
         time.sleep(0.05)
 
         ready2 = threading.Event()
