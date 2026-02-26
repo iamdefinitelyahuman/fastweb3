@@ -71,8 +71,14 @@ class Provider:
         self._tls = threading.local()
         self._rr = 0
 
+        if pool_manager is None:
+            desired_pool_size = 0
+        self.desired_pool_size = max(
+            len(internal_urls or []),
+            max(0, int(desired_pool_size)),
+        )
+
         self.pool_manager = pool_manager
-        self.desired_pool_size = max(0, int(desired_pool_size))
         self.retry_policy_pool = retry_policy_pool or RetryPolicy(max_attempts=3)
         self.is_retryable_exc = is_retryable_exc
 
@@ -375,10 +381,6 @@ class Provider:
         finally:
             self._tls.pinned = prev
 
-    # ----------------------------
-    # batching wrapper (v1 freshness probe)
-    # ----------------------------
-
     def _make_request(
         self,
         ep: Endpoint,
@@ -387,13 +389,31 @@ class Provider:
         formatter: Formatter | None = None,
     ) -> Any:
         """
-        Always execute as a batch: [eth_blockNumber, userCall], in that order.
+        Execute a JSON-RPC request against a single endpoint.
 
-        Updates:
-          - best tip tracking
-          - per-endpoint stale-tip demotion
-          - error success/failure state via callers
+        Behavior depends on whether pooling is enabled:
+
+        - Primary-only mode (desired_pool_size == 0):
+            Performs a single RPC call via Endpoint.request(method, params, formatter).
+            No tip probing or stale-tip demotion is performed, since there are no alternative
+            endpoints to route to.
+
+        - Pooling enabled (desired_pool_size > 0):
+            Performs a 2-call batch via Endpoint.request_batch():
+                1) ("eth_blockNumber", (), to_int)
+                2) (method, params, formatter)
+
+            Uses the returned block number to:
+            - update the provider's best observed tip
+            - demote the endpoint (temporary cooldown) if it reports a tip lower than best
+
+        Note:
+        - The batch order is always [eth_blockNumber, userCall] so results unpack as (tip, result).
+        - Error success/failure state is handled by the caller via _mark_success/_mark_failure.
         """
+        if self.desired_pool_size == 0:
+            return ep.request(method, params, formatter)
+
         tip, result = ep.request_batch(
             ("eth_blockNumber", (), to_int),
             (method, params, formatter),
@@ -402,10 +422,6 @@ class Provider:
         # tip is an int via to_int
         self._update_tip_and_maybe_demote(ep, int(tip))
         return result
-
-    # ----------------------------
-    # request routing
-    # ----------------------------
 
     def request(
         self,
