@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence, Union
 
 from . import validation
 from .deferred import Handle, deferred_response
+from .endpoint import Endpoint
+from .env import (
+    get_default_primary_endpoint,
+    get_pool_mode,
+    resolve_primary_endpoint,
+    should_use_pool,
+)
 from .errors import NoEndpoints, ValidationError
 from .formatters import normalize_rpc_obj, to_int
 from .provider import Provider, RetryPolicy
@@ -15,6 +23,11 @@ BlockId = Union[
 ]  # "latest" | "pending" | "earliest" | "safe" | "finalized" | hex str | int
 
 
+_DEFAULT_PRIMARY_CHAIN_ID_LOCK = threading.Lock()
+_DEFAULT_PRIMARY_CHAIN_ID_SET = False
+_DEFAULT_PRIMARY_CHAIN_ID: Optional[int] = None
+
+
 @dataclass(frozen=True)
 class Web3Config:
     strict: bool = True
@@ -22,6 +35,38 @@ class Web3Config:
     retry_policy_pool: RetryPolicy = RetryPolicy(max_attempts=3, backoff_seconds=0.05)
     # later: batching/hedging/quorum knobs
     # later: output formatting mode knobs (raw vs normalized)
+
+
+def _get_default_primary_chain_id_once() -> Optional[int]:
+    """
+    Probe FASTWEB3_PRIMARY_ENDPOINT's chain id once per process.
+    Returns None if not set or probe fails.
+    """
+    global _DEFAULT_PRIMARY_CHAIN_ID_SET, _DEFAULT_PRIMARY_CHAIN_ID
+
+    if _DEFAULT_PRIMARY_CHAIN_ID_SET:
+        return _DEFAULT_PRIMARY_CHAIN_ID
+
+    with _DEFAULT_PRIMARY_CHAIN_ID_LOCK:
+        if _DEFAULT_PRIMARY_CHAIN_ID_SET:
+            return _DEFAULT_PRIMARY_CHAIN_ID
+
+        url = get_default_primary_endpoint()
+        if not url:
+            _DEFAULT_PRIMARY_CHAIN_ID = None
+            _DEFAULT_PRIMARY_CHAIN_ID_SET = True
+            return None
+
+        ep = Endpoint(url)
+        try:
+            _DEFAULT_PRIMARY_CHAIN_ID = ep.request("eth_chainId", (), formatter=to_int)
+        except Exception:
+            _DEFAULT_PRIMARY_CHAIN_ID = None
+        finally:
+            ep.close()
+
+        _DEFAULT_PRIMARY_CHAIN_ID_SET = True
+        return _DEFAULT_PRIMARY_CHAIN_ID
 
 
 class Web3:
@@ -60,23 +105,50 @@ class Web3:
         else:
             internal_urls = list(endpoints or [])
 
+            # If we're in env split mode, we need to know which chain the *global*
+            # FASTWEB3_PRIMARY_ENDPOINT is on, so we can disable pool only there.
+            env_default_primary_chain_id: Optional[int] = None
+            if (
+                primary_endpoint is None
+                and chain_id is not None
+                and get_pool_mode() == "split"
+                and get_default_primary_endpoint() is not None
+            ):
+                env_default_primary_chain_id = _get_default_primary_chain_id_once()
+
             pool_manager = None
             if chain_id is not None:
-                pool_manager = get_pool_manager(
+                if should_use_pool(
                     int(chain_id),
-                    target_pool=target_pool,
-                    max_lag_blocks=max_lag_blocks,
-                    probe_timeout_s=probe_timeout_s,
-                    probe_workers=probe_workers,
-                )
+                    default_primary_chain_id=env_default_primary_chain_id,
+                ):
+                    pool_manager = get_pool_manager(
+                        int(chain_id),
+                        target_pool=target_pool,
+                        max_lag_blocks=max_lag_blocks,
+                        probe_timeout_s=probe_timeout_s,
+                        probe_workers=probe_workers,
+                    )
 
-            # No endpoints of any kind => error (primary-only mode handled above).
-            if chain_id is None and not internal_urls and primary_endpoint is None:
+            # Allow env default primary-only mode when no chain_id/endpoints/primary provided
+            env_default_primary = None
+            if primary_endpoint is None:
+                env_default_primary = get_default_primary_endpoint()
+
+            if (
+                chain_id is None
+                and not internal_urls
+                and primary_endpoint is None
+                and env_default_primary is None
+            ):
+                extra = ""
+                if get_pool_mode() == "off":
+                    extra = " (pool disabled by FASTWEB3_POOL_MODE=off)"
                 raise NoEndpoints(
                     "No chain_id provided and no endpoints provided. "
                     "Use Web3(<chain_id>) for public discovery, "
                     "Web3(endpoints=[...]) for manual mode, "
-                    "or Web3(primary_endpoint=...) for primary-only mode."
+                    "or Web3(primary_endpoint=...) for primary-only mode." + extra
                 )
 
             self.provider = Provider(
@@ -86,6 +158,19 @@ class Web3:
                 retry_policy_pool=self.config.retry_policy_pool,
             )
 
+            # Apply env primary if caller didn't pass one explicitly
+            if primary_endpoint is None:
+                if chain_id is not None:
+                    env_primary_for_chain = resolve_primary_endpoint(
+                        int(chain_id),
+                        default_primary_chain_id=env_default_primary_chain_id,
+                    )
+                    if env_primary_for_chain is not None:
+                        self.provider.set_primary(env_primary_for_chain)
+                elif env_default_primary is not None:
+                    self.provider.set_primary(env_default_primary)
+
+        # Explicit primary always wins (over provider/env)
         if primary_endpoint is not None:
             self.provider.set_primary(primary_endpoint)
 
