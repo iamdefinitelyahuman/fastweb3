@@ -4,7 +4,6 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Deque, List, Mapping
 
-import httpx
 import pytest
 
 from fastweb3.endpoint import Endpoint
@@ -90,25 +89,12 @@ def test_request_applies_formatter() -> None:
     assert out == 42
 
 
-def test_request_wraps_httpx_error_as_transport_error() -> None:
-    # Build a realistic httpx exception (many httpx errors want a request object)
-    req = httpx.Request("POST", "https://example.invalid")
-    exc = httpx.ConnectError("boom", request=req)
-
+def test_request_propagates_transport_error() -> None:
     t = ScriptedTransport()
-    t.queue_raise(exc)
+    t.queue_raise(TransportError("boom"))
 
     e = Endpoint("https://example.invalid", transport=t)
-    with pytest.raises(TransportError):
-        e.request("eth_chainId", ())
-
-
-def test_request_preserves_transport_error() -> None:
-    t = ScriptedTransport()
-    t.queue_raise(TransportError("nope"))
-
-    e = Endpoint("https://example.invalid", transport=t)
-    with pytest.raises(TransportError):
+    with pytest.raises(TransportError, match="boom"):
         e.request("eth_chainId", ())
 
 
@@ -190,6 +176,15 @@ def test_request_id_increments_across_calls() -> None:
 
     assert t.calls[0].payload["id"] == 1
     assert t.calls[1].payload["id"] == 2
+
+
+def test_request_raises_malformed_if_transport_returns_non_dict() -> None:
+    t = ScriptedTransport()
+    t.queue_return([{"jsonrpc": "2.0", "id": 1, "result": "nope"}])  # list in single-call
+
+    e = Endpoint("https://example.invalid", transport=t)
+    with pytest.raises(RPCMalformedResponse, match="Single response must be a JSON object"):
+        e.request("eth_chainId", ())
 
 
 # -------------------------
@@ -326,13 +321,92 @@ def test_request_batch_applies_formatters_by_call_index() -> None:
     assert out == ["0x2a", 43]
 
 
-def test_request_batch_wraps_httpx_error_as_transport_error() -> None:
-    req = httpx.Request("POST", "https://example.invalid")
-    exc = httpx.ReadTimeout("timeout", request=req)
-
+def test_request_batch_propagates_transport_error() -> None:
     t = ScriptedTransport()
-    t.queue_raise(exc)
+    t.queue_raise(TransportError("timeout"))
 
     e = Endpoint("https://example.invalid", transport=t)
-    with pytest.raises(TransportError):
+    with pytest.raises(TransportError, match="timeout"):
         e.request_batch([("a", ())])
+
+
+# -------------------------
+# Factory / scheme tests
+# -------------------------
+
+
+def test_endpoint_uses_factory_for_wss_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Endpoint should be transport-agnostic: if no transport is provided,
+    it should call make_transport(url) and work for wss:// targets.
+    """
+    import fastweb3.endpoint as endpoint_mod
+
+    seen: list[str] = []
+    t = ScriptedTransport()
+    t.queue_return({"jsonrpc": "2.0", "id": 1, "result": "0x1"})
+
+    def fake_make_transport(url: str, **kwargs: Any) -> ScriptedTransport:
+        seen.append(url)
+        return t
+
+    monkeypatch.setattr(endpoint_mod, "make_transport", fake_make_transport)
+
+    e = Endpoint("wss://example.invalid")  # no transport passed
+    out = e.request("eth_chainId", ())
+
+    assert out == "0x1"
+    assert seen == ["wss://example.invalid"]
+    assert t.calls[0].payload["method"] == "eth_chainId"
+
+
+def test_endpoint_uses_factory_for_ipc_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Same as above but for ipc:// targets.
+    """
+    import fastweb3.endpoint as endpoint_mod
+
+    seen: list[str] = []
+    t = ScriptedTransport()
+    t.queue_return({"jsonrpc": "2.0", "id": 1, "result": "0x2a"})
+
+    def fake_make_transport(url: str, **kwargs: Any) -> ScriptedTransport:
+        seen.append(url)
+        return t
+
+    monkeypatch.setattr(endpoint_mod, "make_transport", fake_make_transport)
+
+    e = Endpoint("ipc:///tmp/geth.ipc")  # no transport passed
+    out = e.request("eth_chainId", ())
+
+    assert out == "0x2a"
+    assert seen == ["ipc:///tmp/geth.ipc"]
+
+
+def test_endpoint_factory_transport_supports_batch_for_wss(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Endpoint.request_batch() should work regardless of scheme as long as transport supports batch
+    """
+    import fastweb3.endpoint as endpoint_mod
+
+    t = ScriptedTransport()
+    t.queue_return(
+        [
+            {"jsonrpc": "2.0", "id": 2, "result": "B"},
+            {"jsonrpc": "2.0", "id": 1, "result": "A"},
+        ]
+    )
+
+    def fake_make_transport(url: str, **kwargs: Any) -> ScriptedTransport:
+        assert url.startswith("wss://")
+        return t
+
+    monkeypatch.setattr(endpoint_mod, "make_transport", fake_make_transport)
+
+    e = Endpoint("wss://example.invalid")
+    out = e.request_batch([("a", ()), ("b", ())])
+
+    assert out == ["A", "B"]
+    payload = t.calls[0].payload
+    assert isinstance(payload, list)
+    assert [p["id"] for p in payload] == [1, 2]

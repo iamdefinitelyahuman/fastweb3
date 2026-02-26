@@ -24,11 +24,11 @@ class DummyResp:
             raise RuntimeError(f"HTTP {self.status_code}")
 
 
-class FakeHTTPTransport:
+class FakeTransport:
     """
     Default fake transport for probe tests.
 
-    Set FakeHTTPTransport.behavior[url] to either:
+    Set FakeTransport.behavior[url] to either:
       - a response object to return from send(payload)
       - a callable(payload)->response
       - or omit to raise
@@ -36,9 +36,8 @@ class FakeHTTPTransport:
 
     behavior: dict[str, object] = {}
 
-    def __init__(self, url: str, config=None) -> None:
+    def __init__(self, url: str) -> None:
         self.url = url
-        self.config = config
         self.closed = False
 
     def send(self, payload):
@@ -91,6 +90,19 @@ def no_pool_thread(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(rpc_pool.threading, "Thread", FakeThread)
 
 
+@pytest.fixture
+def fake_make_transport(monkeypatch: pytest.MonkeyPatch):
+    """
+    Make rpc_pool use FakeTransport regardless of scheme (http/https/ws/wss),
+    and ignore any config kwargs.
+    """
+
+    def _fake_make_transport(url: str, **kwargs: Any) -> FakeTransport:
+        return FakeTransport(url)
+
+    monkeypatch.setattr(rpc_pool, "make_transport", _fake_make_transport)
+
+
 def test_hex_to_int_ok():
     assert rpc_pool._hex_to_int("0x0") == 0
     assert rpc_pool._hex_to_int("0x10") == 16
@@ -103,10 +115,16 @@ def test_hex_to_int_bad_raises(bad):
         rpc_pool._hex_to_int(bad)
 
 
-def test_is_http_and_is_templated():
-    assert rpc_pool._is_http("http://x")
-    assert rpc_pool._is_http("https://x")
-    assert not rpc_pool._is_http("ws://x")
+def test_is_probeable_and_is_templated(monkeypatch: pytest.MonkeyPatch):
+    # default: assume no WSS support => ws/wss not probeable
+    monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: False)
+
+    assert rpc_pool._is_probeable("http://x")
+    assert rpc_pool._is_probeable("https://x")
+    assert not rpc_pool._is_probeable("ws://x")
+    assert not rpc_pool._is_probeable("wss://x")
+    assert not rpc_pool._is_probeable("ftp://x")
+
     assert rpc_pool._is_templated("https://x/${INFURA_API_KEY}")
     assert not rpc_pool._is_templated("https://x/")
 
@@ -166,10 +184,8 @@ def test_registry_refreshes_after_ttl(monkeypatch: pytest.MonkeyPatch):
     assert m2.name == "B"
 
 
-def test_probe_one_success(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(rpc_pool, "HTTPTransport", FakeHTTPTransport)
-
-    FakeHTTPTransport.behavior = {
+def test_probe_one_success(monkeypatch: pytest.MonkeyPatch, fake_make_transport):
+    FakeTransport.behavior = {
         "https://ok": _batch_ok(chain_id=1, head_hex="0x2a"),
     }
 
@@ -189,9 +205,10 @@ def test_probe_one_success(monkeypatch: pytest.MonkeyPatch):
         ([{"id": 1, "result": "0x1"}, {"id": 2, "result": "potato"}], "Expected 0x-hex string"),
     ],
 )
-def test_probe_one_strict_failures(monkeypatch: pytest.MonkeyPatch, resp: Any, err_substr: str):
-    monkeypatch.setattr(rpc_pool, "HTTPTransport", FakeHTTPTransport)
-    FakeHTTPTransport.behavior = {"https://bad": resp}
+def test_probe_one_strict_failures(
+    monkeypatch: pytest.MonkeyPatch, fake_make_transport, resp: Any, err_substr: str
+):
+    FakeTransport.behavior = {"https://bad": resp}
 
     with pytest.raises(Exception) as e:
         rpc_pool._probe_one("https://bad", expected_chain_id=1, timeout_s=0.1)
@@ -199,20 +216,23 @@ def test_probe_one_strict_failures(monkeypatch: pytest.MonkeyPatch, resp: Any, e
     assert err_substr in str(e.value)
 
 
-def test_probe_urls_streaming_filters_and_dedups(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(rpc_pool, "HTTPTransport", FakeHTTPTransport)
+def test_probe_urls_streaming_filters_and_dedups_http_only(
+    monkeypatch: pytest.MonkeyPatch, fake_make_transport
+):
+    monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: False)
     monkeypatch.setattr(rpc_pool, "normalize_url", lambda u: u.strip().rstrip("/"))
 
     urls = [
         "https://ok/",
         "https://ok",
         "http://also-ok",
-        "ws://nope",
+        "ws://nope",  # filtered (no wss support)
+        "wss://nope2",  # filtered (no wss support)
         "https://templated/${KEY}",
         "not-a-url",
     ]
 
-    FakeHTTPTransport.behavior = {
+    FakeTransport.behavior = {
         "https://ok": _batch_ok(chain_id=1, head_hex="0x10"),
         "http://also-ok": _batch_ok(chain_id=1, head_hex="0x11"),
     }
@@ -231,11 +251,39 @@ def test_probe_urls_streaming_filters_and_dedups(monkeypatch: pytest.MonkeyPatch
     assert got == [("http://also-ok", 0x11), ("https://ok", 0x10)]
 
 
-def test_probe_urls_streaming_ignores_bad_responses(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(rpc_pool, "HTTPTransport", FakeHTTPTransport)
+def test_probe_urls_streaming_includes_wss_when_supported(
+    monkeypatch: pytest.MonkeyPatch, fake_make_transport
+):
+    monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: True)
+    monkeypatch.setattr(rpc_pool, "normalize_url", lambda u: u.strip().rstrip("/"))
+
+    urls = ["wss://ok/", "https://ok"]
+
+    FakeTransport.behavior = {
+        "wss://ok": _batch_ok(chain_id=1, head_hex="0x12"),
+        "https://ok": _batch_ok(chain_id=1, head_hex="0x10"),
+    }
+
+    results = list(
+        rpc_pool.probe_urls_streaming(
+            urls,
+            expected_chain_id=1,
+            timeout_s=0.05,
+            max_workers=2,
+            deadline_s=0.05,
+        )
+    )
+    got = sorted((r.url, r.head) for r in results)
+    assert got == [("https://ok", 0x10), ("wss://ok", 0x12)]
+
+
+def test_probe_urls_streaming_ignores_bad_responses(
+    monkeypatch: pytest.MonkeyPatch, fake_make_transport
+):
+    monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: False)
     monkeypatch.setattr(rpc_pool, "normalize_url", lambda u: u)
 
-    FakeHTTPTransport.behavior = {
+    FakeTransport.behavior = {
         "https://ok": _batch_ok(chain_id=1, head_hex="0x10"),
         "https://wrong-chain": _batch_ok(chain_id=2, head_hex="0x10"),
         "https://non-batch": {"id": 1},
@@ -256,8 +304,9 @@ def test_probe_urls_streaming_ignores_bad_responses(monkeypatch: pytest.MonkeyPa
 
 
 def test_probe_urls_streaming_empty_candidates_returns_no_items(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: False)
     monkeypatch.setattr(rpc_pool, "normalize_url", lambda u: u)
-    urls = ["ws://x", "https://x/${KEY}"]
+    urls = ["ws://x", "wss://y", "https://x/${KEY}"]
     assert list(rpc_pool.probe_urls_streaming(urls, expected_chain_id=1, deadline_s=0.05)) == []
 
 
