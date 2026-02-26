@@ -27,6 +27,7 @@ dev = [
     "build",
     "twine",
 ]
+wss = ["websocket-client>=1.6"]
 
 [project.urls]
 Homepage = "https://github.com/iamdefinitelyahuman/fastweb3"
