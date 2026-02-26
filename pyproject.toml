@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "fastweb3[wss]",
     "pytest>=8",
     "pytest-cov>=5",
     "ruff>=0.9",
