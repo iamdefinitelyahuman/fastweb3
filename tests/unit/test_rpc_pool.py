@@ -115,18 +115,20 @@ def test_hex_to_int_bad_raises(bad):
         rpc_pool._hex_to_int(bad)
 
 
-def test_is_probeable_and_is_templated(monkeypatch: pytest.MonkeyPatch):
+def test_is_probeable(monkeypatch: pytest.MonkeyPatch):
     # default: assume no WSS support => ws/wss not probeable
     monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: False)
 
     assert rpc_pool._is_probeable("http://x")
     assert rpc_pool._is_probeable("https://x")
+
     assert not rpc_pool._is_probeable("ws://x")
     assert not rpc_pool._is_probeable("wss://x")
     assert not rpc_pool._is_probeable("ftp://x")
 
-    assert rpc_pool._is_templated("https://x/${INFURA_API_KEY}")
-    assert not rpc_pool._is_templated("https://x/")
+    monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: True)
+    assert rpc_pool._is_probeable("ws://x")
+    assert rpc_pool._is_probeable("wss://x")
 
 
 def test_registry_caches_within_ttl(monkeypatch: pytest.MonkeyPatch):
@@ -439,3 +441,21 @@ def test_poolmanager_best_urls_blocks_when_awaiting_until_ready_then_returns(no_
     t.join(timeout=0.5)
     assert not t.is_alive()
     assert result["urls"] == []
+
+
+def test_probe_urls_streaming_skips_missing_env_without_crashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NOPE", raising=False)
+
+    # This must not raise; it should just yield nothing.
+    results = list(
+        rpc_pool.probe_urls_streaming(
+            ["https://example.com/$NOPE"],
+            expected_chain_id=1,
+            timeout_s=0.01,
+            max_workers=1,
+            deadline_s=0.05,
+        )
+    )
+    assert results == []

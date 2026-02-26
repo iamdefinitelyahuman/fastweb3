@@ -8,6 +8,7 @@ from typing import Any, Deque
 import pytest
 
 import fastweb3.provider as provider_mod
+import fastweb3.utils as utils_mod
 from fastweb3.errors import (
     AllEndpointsFailed,
     NoEndpoints,
@@ -86,10 +87,15 @@ def _rpc_error(code: int = -32000, message: str = "boom", data: Any = None) -> R
 
 
 @pytest.fixture(autouse=True)
-def _patch_endpoint_and_normalize(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Ensure Provider constructs FakeEndpoint and normalization is predictable.
+def _patch_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Ensure Provider constructs FakeEndpoint.
     monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
-    monkeypatch.setattr(provider_mod, "normalize_url", lambda u: str(u))
+
+
+@pytest.fixture(autouse=True)
+def _patch_normalize(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Ensure Provider uses the real normalize_url by default (includes env expansion).
+    monkeypatch.setattr(provider_mod, "normalize_url", utils_mod.normalize_url)
 
 
 @pytest.fixture
@@ -115,8 +121,9 @@ def fixed_time(monkeypatch: pytest.MonkeyPatch):
 
 
 def _ep(p: Provider, url: str) -> FakeEndpoint:
-    # Helper: grab cached endpoint by URL (normalization patched to identity).
-    return p._eps_by_url[url]  # type: ignore[attr-defined]
+    # Helper: grab cached endpoint by URL.
+    nu = provider_mod.normalize_url(url)
+    return p._eps_by_url[nu]  # type: ignore[attr-defined]
 
 
 def test_no_endpoints_pool_route_raises() -> None:
@@ -399,3 +406,24 @@ def test_poolmanager_await_first_true_when_no_internal_and_no_primary() -> None:
 
     assert p.request("m", (), route="pool") == "M1"
     assert pm.calls == [(1, True)]
+
+
+def test_provider_add_url_expands_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RPC_HOST", "node.local")
+    p = Provider([])
+    p.add_url("https://$RPC_HOST/rpc")
+    assert p.urls() == ["https://node.local/rpc"]
+
+
+def test_provider_set_primary_expands_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RPC_HOST", "node.local")
+    p = Provider([])
+    p.set_primary("https://$RPC_HOST/rpc/")
+    assert p.primary_url() == "https://node.local/rpc"
+
+
+def test_provider_add_url_missing_env_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RPC_MISSING", raising=False)
+    p = Provider([])
+    with pytest.raises(ValueError, match="RPC_MISSING.*not set|not.*set"):
+        p.add_url("https://example.com/$RPC_MISSING")
