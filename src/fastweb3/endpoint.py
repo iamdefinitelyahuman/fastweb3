@@ -4,10 +4,8 @@ import itertools
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 
-import httpx
-
 from .errors import RPCError, RPCErrorDetails, RPCMalformedResponse, TransportError
-from .transport import HTTPTransport, Transport
+from .transport import Transport, make_transport
 
 Formatter = Callable[[Any], Any]
 
@@ -20,13 +18,13 @@ class EndpointConfig:
 
 class Endpoint:
     """
-    JSON-RPC semantics for a single endpoint URL.
+    JSON-RPC semantics for a single endpoint target.
 
     Owns:
       - request id counter
       - JSON-RPC envelope
       - response validation / error parsing
-    Delegates wire I/O to Transport (HTTP now; WS/IPC later).
+    Delegates wire I/O to Transport (HTTP / WSS / IPC).
     """
 
     def __init__(
@@ -36,9 +34,10 @@ class Endpoint:
         transport: Optional[Transport] = None,
         config: EndpointConfig | None = None,
     ) -> None:
+        # keep name `url` for backwards compatibility, but it's really a "target"
         self.url = url
         self.config = config or EndpointConfig()
-        self.transport = transport or HTTPTransport(url)
+        self.transport = transport or make_transport(url)
         self._counter = itertools.count(1)
 
     def close(self) -> None:
@@ -61,12 +60,13 @@ class Endpoint:
 
         try:
             resp = self.transport.send(payload)
-        except httpx.HTTPError as exc:
-            # If the underlying transport is HTTPTransport, it may throw httpx errors.
-            # Normalize anyway. Other transports should raise TransportError directly.
-            raise TransportError(str(exc)) from exc
         except TransportError:
             raise
+
+        if not isinstance(resp, dict):
+            raise RPCMalformedResponse(
+                f"Single response must be a JSON object, got: {type(resp).__name__}"
+            )
 
         if resp.get("jsonrpc") != "2.0":
             raise RPCMalformedResponse(f"Missing/invalid jsonrpc field: {resp!r}")
@@ -116,8 +116,6 @@ class Endpoint:
 
         try:
             resp = self.transport.send(payload)
-        except httpx.HTTPError as exc:
-            raise TransportError(str(exc)) from exc
         except TransportError:
             raise
 
@@ -132,6 +130,7 @@ class Endpoint:
                 raise RPCMalformedResponse(f"Invalid jsonrpc in batch item: {item!r}")
             if "id" not in item:
                 raise RPCMalformedResponse(f"Missing id in batch item: {item!r}")
+
             _id = item["id"]
             if not isinstance(_id, int):
                 raise RPCMalformedResponse(f"Non-int id in batch item: {item!r}")
@@ -147,6 +146,7 @@ class Endpoint:
         out: list[Any] = []
         for i, _id in enumerate(ids):
             item = by_id[_id]
+
             if item.get("error") is not None:
                 err = item["error"]
                 if isinstance(err, dict):

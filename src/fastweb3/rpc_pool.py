@@ -10,7 +10,7 @@ from typing import Iterator
 
 import httpx
 
-from .transport.http import HTTPTransport, HTTPTransportConfig
+from .transport import HTTPTransportConfig, WSSTransportConfig, make_transport
 from .utils import normalize_url
 
 CHAINS_URL = (
@@ -74,8 +74,25 @@ class ProbeResult:
     head: int
 
 
-def _is_http(url: str) -> bool:
-    return url.startswith("http://") or url.startswith("https://")
+def _has_wss_support() -> bool:
+    """
+    WebSocket support is optional. If websocket-client isn't installed,
+    we treat ws/wss URLs as not probeable to avoid exception hot paths.
+    """
+    try:
+        import fastweb3.transport.ws as ws_mod
+    except Exception:
+        return False
+    return ws_mod.websocket is not None
+
+
+def _is_probeable(url: str) -> bool:
+    u = url.lower()
+    if u.startswith(("http://", "https://")):
+        return True
+    if u.startswith(("ws://", "wss://")):
+        return _has_wss_support()
+    return False
 
 
 def _is_templated(url: str) -> bool:
@@ -102,7 +119,7 @@ def _probe_one(
 ) -> ProbeResult:
     expected_hex = hex(expected_chain_id).lower()
 
-    cfg = HTTPTransportConfig(
+    http_cfg = HTTPTransportConfig(
         timeout=timeout_s,
         connect_timeout=timeout_s,
         read_timeout=timeout_s,
@@ -112,9 +129,13 @@ def _probe_one(
         max_keepalive_connections=5,
         keepalive_expiry=10.0,
     )
+    wss_cfg = WSSTransportConfig(
+        connect_timeout=timeout_s,
+        recv_timeout=timeout_s,
+    )
 
     t0 = time.perf_counter()
-    tr = HTTPTransport(url, config=cfg)
+    tr = make_transport(url, http=http_cfg, wss=wss_cfg)
     try:
         resp = tr.send(_PROBE_PAYLOAD)
 
@@ -166,7 +187,7 @@ def probe_urls_streaming(
     candidates: list[str] = []
 
     for u in urls:
-        if not _is_http(u) or _is_templated(u):
+        if not _is_probeable(u) or _is_templated(u):
             continue
         nu = normalize_url(u)
         if nu in seen:
@@ -195,7 +216,7 @@ def probe_urls_streaming(
 
     expected_hex = hex(expected_chain_id).lower()
 
-    cfg = HTTPTransportConfig(
+    http_cfg = HTTPTransportConfig(
         timeout=timeout_s,
         connect_timeout=timeout_s,
         read_timeout=timeout_s,
@@ -205,6 +226,10 @@ def probe_urls_streaming(
         max_keepalive_connections=min(20, worker_count),
         keepalive_expiry=10.0,
     )
+    wss_cfg = WSSTransportConfig(
+        connect_timeout=timeout_s,
+        recv_timeout=timeout_s,
+    )
 
     def worker() -> None:
         while True:
@@ -213,7 +238,7 @@ def probe_urls_streaming(
                 return
 
             t0 = time.perf_counter()
-            tr = HTTPTransport(u, config=cfg)
+            tr = make_transport(u, http=http_cfg, wss=wss_cfg)
             try:
                 resp = tr.send(_PROBE_PAYLOAD)
 
@@ -438,7 +463,6 @@ class PoolManager:
         def rtt(u: str) -> float:
             return self._rtt_by_url.get(u, float("inf"))
 
-        # victim = worst RTT in active
         victim = max(active_urls, key=rtt, default=None)
         if victim is None:
             return
@@ -460,7 +484,6 @@ class PoolManager:
         state = _MaintainerState(next_health_ts=time.time() + POOL_HEALTH_INTERVAL_S)
 
         while True:
-            # Stream successes; promote/replace based on results.
             for pr in probe_urls_streaming(
                 meta.rpc,
                 expected_chain_id=self.chain_id,
@@ -473,7 +496,6 @@ class PoolManager:
 
             self._ready.set()
 
-            # Epoch sleep, but still do periodic health checks while idle.
             sleep_end = time.time() + POOL_EPOCH_SLEEP_S
             while time.time() < sleep_end:
                 now = time.time()
