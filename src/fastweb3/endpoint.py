@@ -1,3 +1,4 @@
+# src/fastweb3/endpoint.py
 from __future__ import annotations
 
 import itertools
@@ -47,7 +48,6 @@ class Endpoint:
         self,
         method: str,
         params: list[Any] | tuple[Any, ...],
-        *,
         formatter: Formatter | None = None,
     ) -> Any:
         request_id = next(self._counter)
@@ -95,16 +95,44 @@ class Endpoint:
 
     def request_batch(
         self,
-        calls: Sequence[tuple[str, list[Any] | tuple[Any, ...]]],
-        *,
-        formatters: Mapping[int, Formatter] | None = None,  # keyed by index in calls
+        *calls: tuple[str, Sequence[Any]]
+        | tuple[str, Sequence[Any], Formatter]
+        | tuple[str, Sequence[Any], None],
     ) -> list[Any]:
-        # allocate ids
+        """
+        Execute a JSON-RPC batch request.
+
+        Each call is either:
+          - (method, params)
+          - (method, params, formatter)
+
+        Formatters are applied positionally to the corresponding result.
+        """
+        if not calls:
+            return []
+
+        # Allocate ids and build payload
         ids: list[int] = []
         payload: list[dict[str, Any]] = []
-        for method, params in calls:
+        formatters: list[Formatter | None] = []
+
+        for call in calls:
+            if not isinstance(call, tuple):
+                raise TypeError(f"Batch call must be a tuple, got: {type(call).__name__}")
+
+            if len(call) == 2:
+                method, params = call  # type: ignore[misc]
+                fmt: Formatter | None = None
+            elif len(call) == 3:
+                method, params, fmt = call  # type: ignore[misc]
+            else:
+                raise TypeError(
+                    "Batch call must be (method, params) or (method, params, formatter)"
+                )
+
             request_id = next(self._counter)
             ids.append(request_id)
+            formatters.append(fmt)
             payload.append(
                 {
                     "jsonrpc": "2.0",
@@ -138,7 +166,7 @@ class Endpoint:
                 raise RPCMalformedResponse(f"Duplicate id in batch response: {_id}")
             by_id[_id] = item
 
-        # ensure all requested ids exist
+        # Ensure all requested ids exist
         for _id in ids:
             if _id not in by_id:
                 raise RPCMalformedResponse(f"Missing id {_id} in batch response")
@@ -163,8 +191,9 @@ class Endpoint:
                 raise RPCMalformedResponse(f"Missing result in batch item: {item!r}")
 
             val = item["result"]
-            if formatters is not None and i in formatters:
-                val = formatters[i](val)
+            fmt = formatters[i]
+            if fmt is not None:
+                val = fmt(val)
             out.append(val)
 
         return out
