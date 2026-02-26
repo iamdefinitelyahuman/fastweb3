@@ -205,7 +205,7 @@ def test_request_batch_builds_payload_and_reorders_by_id() -> None:
     )
 
     e = Endpoint("https://example.invalid", transport=t)
-    out = e.request_batch([("a", ()), ("b", ())])
+    out = e.request_batch(("a", ()), ("b", ()))
 
     assert out == ["first", "second"]
 
@@ -223,7 +223,7 @@ def test_request_batch_requires_list_response() -> None:
 
     e = Endpoint("https://example.invalid", transport=t)
     with pytest.raises(RPCMalformedResponse, match="must be a list"):
-        e.request_batch([("a", ())])
+        e.request_batch(("a", ()))
 
 
 def test_request_batch_validates_items_and_ids() -> None:
@@ -232,21 +232,21 @@ def test_request_batch_validates_items_and_ids() -> None:
     t.queue_return([{"jsonrpc": "2.0", "id": 1, "result": "ok"}, "bad"])
     e = Endpoint("https://example.invalid", transport=t)
     with pytest.raises(RPCMalformedResponse, match="Batch item must be dict"):
-        e.request_batch([("a", ())])
+        e.request_batch(("a", ()))
 
     # Missing id
     t2 = ScriptedTransport()
     t2.queue_return([{"jsonrpc": "2.0", "result": "ok"}])
     e2 = Endpoint("https://example.invalid", transport=t2)
     with pytest.raises(RPCMalformedResponse, match="Missing id"):
-        e2.request_batch([("a", ())])
+        e2.request_batch(("a", ()))
 
     # Non-int id
     t3 = ScriptedTransport()
     t3.queue_return([{"jsonrpc": "2.0", "id": "1", "result": "ok"}])
     e3 = Endpoint("https://example.invalid", transport=t3)
     with pytest.raises(RPCMalformedResponse, match="Non-int id"):
-        e3.request_batch([("a", ())])
+        e3.request_batch(("a", ()))
 
     # Duplicate id
     t4 = ScriptedTransport()
@@ -258,7 +258,7 @@ def test_request_batch_validates_items_and_ids() -> None:
     )
     e4 = Endpoint("https://example.invalid", transport=t4)
     with pytest.raises(RPCMalformedResponse, match="Duplicate id"):
-        e4.request_batch([("a", ())])
+        e4.request_batch(("a", ()))
 
 
 def test_request_batch_requires_all_requested_ids_present() -> None:
@@ -268,7 +268,7 @@ def test_request_batch_requires_all_requested_ids_present() -> None:
 
     e = Endpoint("https://example.invalid", transport=t)
     with pytest.raises(RPCMalformedResponse, match="Missing id 2"):
-        e.request_batch([("a", ()), ("b", ())])
+        e.request_batch(("a", ()), ("b", ()))
 
 
 def test_request_batch_raises_rpcerror_on_any_error_item() -> None:
@@ -282,7 +282,7 @@ def test_request_batch_raises_rpcerror_on_any_error_item() -> None:
 
     e = Endpoint("https://example.invalid", transport=t)
     with pytest.raises(RPCError) as excinfo:
-        e.request_batch([("a", ()), ("b", ())])
+        e.request_batch(("a", ()), ("b", ()))
 
     details = excinfo.value.details
     assert details.code == 123
@@ -300,10 +300,10 @@ def test_request_batch_raises_malformed_on_missing_result_when_no_error() -> Non
 
     e = Endpoint("https://example.invalid", transport=t)
     with pytest.raises(RPCMalformedResponse, match="Missing result"):
-        e.request_batch([("a", ()), ("b", ())])
+        e.request_batch(("a", ()), ("b", ()))
 
 
-def test_request_batch_applies_formatters_by_call_index() -> None:
+def test_request_batch_applies_formatters_positionally() -> None:
     t = ScriptedTransport()
     t.queue_return(
         [
@@ -314,8 +314,8 @@ def test_request_batch_applies_formatters_by_call_index() -> None:
 
     e = Endpoint("https://example.invalid", transport=t)
     out = e.request_batch(
-        [("a", ()), ("b", ())],
-        formatters={1: lambda x: int(x, 16)},  # only format second call (index 1)
+        ("a", (), None),
+        ("b", (), lambda x: int(x, 16)),
     )
 
     assert out == ["0x2a", 43]
@@ -327,7 +327,7 @@ def test_request_batch_propagates_transport_error() -> None:
 
     e = Endpoint("https://example.invalid", transport=t)
     with pytest.raises(TransportError, match="timeout"):
-        e.request_batch([("a", ())])
+        e.request_batch(("a", ()))
 
 
 # -------------------------
@@ -404,7 +404,7 @@ def test_endpoint_factory_transport_supports_batch_for_wss(monkeypatch: pytest.M
     monkeypatch.setattr(endpoint_mod, "make_transport", fake_make_transport)
 
     e = Endpoint("wss://example.invalid")
-    out = e.request_batch([("a", ()), ("b", ())])
+    out = e.request_batch(("a", ()), ("b", ()))
 
     assert out == ["A", "B"]
     payload = t.calls[0].payload
