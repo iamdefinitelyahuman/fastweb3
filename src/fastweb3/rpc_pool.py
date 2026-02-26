@@ -95,10 +95,6 @@ def _is_probeable(url: str) -> bool:
     return False
 
 
-def _is_templated(url: str) -> bool:
-    return "${" in url
-
-
 def _hex_to_int(x: object) -> int:
     if not isinstance(x, str) or not x.startswith("0x"):
         raise ValueError(f"Expected 0x-hex string, got {x!r}")
@@ -187,9 +183,12 @@ def probe_urls_streaming(
     candidates: list[str] = []
 
     for u in urls:
-        if not _is_probeable(u) or _is_templated(u):
+        try:
+            nu = normalize_url(u)
+        except Exception:
             continue
-        nu = normalize_url(u)
+        if not _is_probeable(nu):
+            continue
         if nu in seen:
             continue
         seen.add(nu)
