@@ -1,8 +1,9 @@
+# src/fastweb3/web3.py
 from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence, Union
+from typing import Any, Callable, Mapping, Optional, Sequence, Union
 
 from . import validation
 from .deferred import Handle, deferred_response
@@ -26,6 +27,29 @@ BlockId = Union[
 _DEFAULT_PRIMARY_CHAIN_ID_LOCK = threading.Lock()
 _DEFAULT_PRIMARY_CHAIN_ID_SET = False
 _DEFAULT_PRIMARY_CHAIN_ID: Optional[int] = None
+
+
+FreshnessFn = Callable[[Any, int, int], bool]
+
+
+def _is_latest_like_block(x: BlockId | None) -> bool:
+    # We enforce freshness only for semantics that are implicitly "latest/pending".
+    # (If x is None, many RPC methods default to "latest".)
+    if x is None:
+        return True
+    return isinstance(x, str) and x in ("latest", "pending")
+
+
+def _fresh_latest(_resp: Any, required_tip: int, returned_tip: int) -> bool:
+    # Strict monotonicity: never accept a response from a node behind what we knew
+    # at the start of the attempt (required_tip is concurrency-safe snapshot).
+    return returned_tip >= required_tip
+
+
+def _fresh_negative_requires_latest(resp: Any, required_tip: int, returned_tip: int) -> bool:
+    # For maybe-null lookups: any positive result is acceptable even if the node is behind,
+    # but a negative result is only trustworthy when the node is not behind required_tip.
+    return (resp is not None) or (returned_tip >= required_tip)
 
 
 @dataclass(frozen=True)
@@ -181,7 +205,13 @@ class Web3:
         self.provider.close()
 
     def make_request(
-        self, method: str, params: list[Any], *, route: str = "pool", formatter=None
+        self,
+        method: str,
+        params: list[Any],
+        *,
+        route: str = "pool",
+        formatter=None,
+        freshness: FreshnessFn | None = None,
     ) -> Any:
         """
         Perform a raw JSON-RPC request.
@@ -190,10 +220,18 @@ class Web3:
         params: JSON-RPC params list. No validation is performed on this list.
         route: "pool" or "primary" (routing hint)
         formatter: optional post-processor for result
+        freshness: optional freshness policy:
+            freshness(response, required_tip, returned_tip) -> bool
         """
 
         def bg_func(h: Handle) -> None:
-            raw = self.provider.request(method, params, route=route, formatter=None)
+            raw = self.provider.request(
+                method,
+                params,
+                route=route,
+                formatter=None,
+                freshness=freshness,
+            )
             h.set_value(raw)
 
         # ref_func unused for now (later: batching flush barrier)
@@ -348,7 +386,10 @@ class Eth:
         strict = bool(self._w3.config.strict)
         addr = validation.normalize_address(address, strict=strict)
         blk = validation.block_id(block, strict=strict)
-        return self._w3.make_request("eth_getBalance", [addr, blk], formatter=to_int)
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
+        return self._w3.make_request(
+            "eth_getBalance", [addr, blk], formatter=to_int, freshness=freshness
+        )
 
     def get_storage_at(
         self, address: str | bytes, position: int | str, block: BlockId = "latest"
@@ -357,16 +398,19 @@ class Eth:
         addr = validation.normalize_address(address, strict=strict)
         pos = validation.quantity(position, strict=strict)
         blk = validation.block_id(block, strict=strict)
-        return self._w3.make_request("eth_getStorageAt", [addr, pos, blk])
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
+        return self._w3.make_request("eth_getStorageAt", [addr, pos, blk], freshness=freshness)
 
     def get_transaction_count(self, address: str | bytes, block: BlockId = "latest") -> int:
         strict = bool(self._w3.config.strict)
         addr = validation.normalize_address(address, strict=strict)
         blk = validation.block_id(block, strict=strict)
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
         return self._w3.make_request(
             "eth_getTransactionCount",
             [addr, blk],
             formatter=to_int,
+            freshness=freshness,
         )
 
     def get_block_transaction_count_by_hash(self, block_hash: str | bytes) -> int:
@@ -377,10 +421,12 @@ class Eth:
     def get_block_transaction_count_by_number(self, block: BlockId) -> int:
         strict = bool(self._w3.config.strict)
         blk = validation.block_id(block, strict=strict)
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
         return self._w3.make_request(
             "eth_getBlockTransactionCountByNumber",
             [blk],
             formatter=to_int,
+            freshness=freshness,
         )
 
     def get_uncle_count_by_block_hash(self, block_hash: str | bytes) -> int:
@@ -391,17 +437,20 @@ class Eth:
     def get_uncle_count_by_block_number(self, block: BlockId) -> int:
         strict = bool(self._w3.config.strict)
         blk = validation.block_id(block, strict=strict)
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
         return self._w3.make_request(
             "eth_getUncleCountByBlockNumber",
             [blk],
             formatter=to_int,
+            freshness=freshness,
         )
 
     def get_code(self, address: str | bytes, block: BlockId = "latest") -> str:
         strict = bool(self._w3.config.strict)
         addr = validation.normalize_address(address, strict=strict)
         blk = validation.block_id(block, strict=strict)
-        return self._w3.make_request("eth_getCode", [addr, blk])
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
+        return self._w3.make_request("eth_getCode", [addr, blk], freshness=freshness)
 
     # ----------------------------
     # signer / tx submission
@@ -536,7 +585,8 @@ class Eth:
             access_list=access_list,
         )
         blk = validation.block_id(block, strict=strict)
-        return self._w3.make_request("eth_call", [tx, blk])
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
+        return self._w3.make_request("eth_call", [tx, blk], freshness=freshness)
 
     def estimate_gas(
         self,
@@ -576,7 +626,10 @@ class Eth:
         params: list[Any] = [tx]
         if block is not None:
             params.append(validation.block_id(block, strict=strict))
-        return self._w3.make_request("eth_estimateGas", params, formatter=to_int)
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
+        return self._w3.make_request(
+            "eth_estimateGas", params, formatter=to_int, freshness=freshness
+        )
 
     # ----------------------------
     # structured getters
@@ -596,14 +649,23 @@ class Eth:
     ) -> dict[str, Any] | None:
         strict = bool(self._w3.config.strict)
         blk = validation.block_id(block, strict=strict)
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
         return self._w3.make_request(
-            "eth_getBlockByNumber", [blk, full_transactions], formatter=normalize_rpc_obj
+            "eth_getBlockByNumber",
+            [blk, full_transactions],
+            formatter=normalize_rpc_obj,
+            freshness=freshness,
         )
 
     def get_transaction_by_hash(self, tx_hash: str | bytes) -> dict[str, Any] | None:
         strict = bool(self._w3.config.strict)
         h = validation.hash32(tx_hash, name="tx_hash", strict=strict)
-        return self._w3.make_request("eth_getTransactionByHash", [h], formatter=normalize_rpc_obj)
+        return self._w3.make_request(
+            "eth_getTransactionByHash",
+            [h],
+            formatter=normalize_rpc_obj,
+            freshness=_fresh_negative_requires_latest,
+        )
 
     def get_transaction_by_block_hash_and_index(
         self, block_hash: str | bytes, index: int | str
@@ -621,14 +683,23 @@ class Eth:
         strict = bool(self._w3.config.strict)
         blk = validation.block_id(block, strict=strict)
         idx = validation.index(index, strict=strict)
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
         return self._w3.make_request(
-            "eth_getTransactionByBlockNumberAndIndex", [blk, idx], formatter=normalize_rpc_obj
+            "eth_getTransactionByBlockNumberAndIndex",
+            [blk, idx],
+            formatter=normalize_rpc_obj,
+            freshness=freshness,
         )
 
     def get_transaction_receipt(self, tx_hash: str | bytes) -> dict[str, Any] | None:
         strict = bool(self._w3.config.strict)
         h = validation.hash32(tx_hash, name="tx_hash", strict=strict)
-        return self._w3.make_request("eth_getTransactionReceipt", [h], formatter=normalize_rpc_obj)
+        return self._w3.make_request(
+            "eth_getTransactionReceipt",
+            [h],
+            formatter=normalize_rpc_obj,
+            freshness=_fresh_negative_requires_latest,
+        )
 
     def get_uncle_by_block_hash_and_index(
         self, block_hash: str | bytes, index: int | str
@@ -646,8 +717,12 @@ class Eth:
         strict = bool(self._w3.config.strict)
         blk = validation.block_id(block, strict=strict)
         idx = validation.index(index, strict=strict)
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
         return self._w3.make_request(
-            "eth_getUncleByBlockNumberAndIndex", [blk, idx], formatter=normalize_rpc_obj
+            "eth_getUncleByBlockNumberAndIndex",
+            [blk, idx],
+            formatter=normalize_rpc_obj,
+            freshness=freshness,
         )
 
     # ----------------------------
@@ -713,4 +788,11 @@ class Eth:
             topics=topics,
             block_hash=block_hash,
         )
-        return self._w3.make_request("eth_getLogs", [flt], formatter=normalize_rpc_obj)
+        # If to_block is omitted or "latest"/"pending", logs are latest-relative.
+        freshness = _fresh_latest if _is_latest_like_block(to_block) else None
+        return self._w3.make_request(
+            "eth_getLogs",
+            [flt],
+            formatter=normalize_rpc_obj,
+            freshness=freshness,
+        )

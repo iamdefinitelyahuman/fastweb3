@@ -24,7 +24,6 @@ from .utils import normalize_url
 class RetryPolicy:
     max_attempts: int = 3
     backoff_seconds: float = 0.05
-    retry_on_rpc_error: bool = False
 
 
 def _default_is_retryable_exc(exc: Exception) -> bool:
@@ -40,6 +39,13 @@ class _EndpointState:
     # Cooldown due to stale tip observation
     tip_cooldown_until: float = 0.0
 
+    # Last tip observed from this endpoint URL (LB backends may vary)
+    last_tip: int | None = None
+
+
+class _FreshnessUnmet(TransportError):
+    """Internal sentinel for 'response received, but endpoint tip is too stale for this call'."""
+
 
 class Provider:
     """
@@ -52,11 +58,20 @@ class Provider:
       candidates = internal_pool + pool_manager.best_urls(needed)
       where needed fills up to desired_pool_size (option B)
 
-    Freshness tracking (v1):
-      - Every request is executed as a batch: [eth_blockNumber, userCall]
-      - We track the best (highest) tip we've ever observed
-      - If an endpoint reports a tip lower than best, we temporarily demote it (cooldown)
+    Tip tracking:
+      - Every pooled request is executed as a batch: [eth_blockNumber, userCall]
+      - Track the best (highest) tip observed across any endpoint
+      - Endpoints that report a tip lower than best are temporarily demoted (cooldown)
+      - Track per-endpoint last_tip (for preferential retries)
+
+    Freshness enforcement (optional):
+      - request() accepts `freshness(response, required_tip, returned_tip) -> bool`
+      - required_tip is snapshotted at the start of each attempt (concurrency-safe)
+      - If freshness rejects, rotate endpoints preferring highest last_tip, backoff briefly, retry
     """
+
+    # Bound how long we spin waiting for an endpoint to satisfy strict freshness.
+    _FRESHNESS_WAIT_CAP_SECONDS: float = 5.0
 
     def __init__(
         self,
@@ -258,16 +273,15 @@ class Provider:
             st.error_cooldown_until = 0.0
 
     # ----------------------------
-    # freshness tracking / demotion (tips)
+    # tip tracking / demotion
     # ----------------------------
 
     def _tip_cooldown_seconds(self, lag_blocks: int) -> float:
         """
         Cooldown for endpoints that report a stale tip vs best known.
 
-        Keep this simple and bounded; it's just "temporary demotion", not a ban.
+        Simple, bounded "temporary demotion", not a ban.
         """
-        # Base 0.5s, +0.25s per block behind, capped at 30s.
         return min(30.0, 0.5 + 0.25 * max(0, int(lag_blocks)))
 
     def _update_tip_and_maybe_demote(self, ep: Endpoint, returned_tip: int) -> None:
@@ -278,9 +292,11 @@ class Provider:
                 st = _EndpointState()
                 self._state[ep] = st
 
+            st.last_tip = int(returned_tip)
+
             best = self._best_tip
             if best is None or returned_tip > best:
-                self._best_tip = returned_tip
+                self._best_tip = int(returned_tip)
                 return
 
             if returned_tip < best:
@@ -288,6 +304,18 @@ class Provider:
                 st.tip_cooldown_until = max(
                     st.tip_cooldown_until, now + self._tip_cooldown_seconds(lag)
                 )
+
+    def _best_tip_snapshot(self) -> int:
+        # Used as required_tip at attempt start (concurrency-safe monotonic guarantee).
+        with self._lock:
+            return int(self._best_tip or 0)
+
+    def _last_tip(self, ep: Endpoint) -> int:
+        with self._lock:
+            st = self._state.get(ep)
+            if st is None or st.last_tip is None:
+                return -1
+            return int(st.last_tip)
 
     # ----------------------------
     # eligibility
@@ -300,7 +328,7 @@ class Provider:
         """
         now = time.time()
         with self._lock:
-            eligible = []
+            eligible: list[Endpoint] = []
             for ep in eps:
                 st = self._state.get(ep, _EndpointState())
                 cooldown_until = max(st.error_cooldown_until, st.tip_cooldown_until)
@@ -381,47 +409,65 @@ class Provider:
         finally:
             self._tls.pinned = prev
 
-    def _make_request(
+    def _attempt(
         self,
         ep: Endpoint,
         method: str,
         params: list[Any] | tuple[Any, ...],
-        formatter: Formatter | None = None,
-    ) -> Any:
+        formatter: Formatter | None,
+        freshness: Callable[[Any, int, int], bool] | None,
+    ) -> tuple[Any | None, Exception | None]:
         """
-        Execute a JSON-RPC request against a single endpoint.
+        Attempt the call once on `ep`.
 
-        Behavior depends on whether pooling is enabled:
+        Returns: (value, exc)
+          - value is non-None on success
+          - exc is non-None on retryable failure or freshness rejection
+          - raises non-retryable errors, including RPCError (always bubbles)
 
-        - Primary-only mode (desired_pool_size == 0):
-            Performs a single RPC call via Endpoint.request(method, params, formatter).
-            No tip probing or stale-tip demotion is performed, since there are no alternative
-            endpoints to route to.
-
-        - Pooling enabled (desired_pool_size > 0):
-            Performs a 2-call batch via Endpoint.request_batch():
-                1) ("eth_blockNumber", (), to_int)
-                2) (method, params, formatter)
-
-            Uses the returned block number to:
-            - update the provider's best observed tip
-            - demote the endpoint (temporary cooldown) if it reports a tip lower than best
-
-        Note:
-        - The batch order is always [eth_blockNumber, userCall] so results unpack as (tip, result).
-        - Error success/failure state is handled by the caller via _mark_success/_mark_failure.
+        Notes:
+          - Freshness rejection returns _FreshnessUnmet (do NOT mark_failure).
+          - Transport failures (is_retryable_exc) mark_failure.
+          - required_tip is snapshotted at attempt start (concurrency-safe).
         """
-        if self.desired_pool_size == 0:
-            return ep.request(method, params, formatter)
+        required_tip = self._best_tip_snapshot()
 
-        tip, result = ep.request_batch(
-            ("eth_blockNumber", (), to_int),
-            (method, params, formatter),
-        )
+        try:
+            if self.desired_pool_size == 0:
+                # No tip probing in primary-only mode.
+                result = ep.request(method, params, formatter)
+                self._mark_success(ep)
+                return result, None
 
-        # tip is an int via to_int
-        self._update_tip_and_maybe_demote(ep, int(tip))
-        return result
+            tip, result = ep.request_batch(
+                ("eth_blockNumber", (), to_int),
+                (method, params, formatter),
+            )
+            returned_tip = int(tip)
+            self._update_tip_and_maybe_demote(ep, returned_tip)
+            self._mark_success(ep)
+
+            if freshness is None:
+                return result, None
+
+            if freshness(result, required_tip, returned_tip):
+                return result, None
+
+            return None, _FreshnessUnmet("Freshness unmet")
+
+        except RPCError:
+            # Always bubble RPCError immediately (per today's mission).
+            raise
+
+        except Exception as exc:
+            if self.is_retryable_exc(exc):
+                self._mark_failure(ep, exc)
+                return None, exc
+            raise
+
+    # ----------------------------
+    # request routing
+    # ----------------------------
 
     def request(
         self,
@@ -430,6 +476,7 @@ class Provider:
         *,
         route: str = "pool",
         formatter: Formatter | None = None,
+        freshness: Callable[[Any, int, int], bool] | None = None,
     ) -> Any:
         """
         Perform a JSON-RPC request routed either to the merged pool or to the primary.
@@ -437,61 +484,120 @@ class Provider:
         - route="pool": RR+retry across (internal_pool + pool_manager best URLs)
         - route="primary": primary-only (raises if primary unset)
 
-        Freshness tracking:
-          Every request batches eth_blockNumber alongside the user call.
+        Freshness enforcement (optional):
+          freshness(response, required_tip, returned_tip) -> bool
+
+        required_tip is a snapshot of provider best_tip at start of an attempt (concurrency-safe).
         """
         if route not in ("pool", "primary"):
             raise ValueError("route must be 'pool' or 'primary'")
 
+        policy = self.retry_policy_pool
+
         pinned = self._get_pinned()
         if pinned is not None:
-            return self._make_request(pinned, method, params, formatter)
+            # Can't rotate endpoints. If freshness rejects, wait/backoff and retry pinned.
+            deadline = time.time() + self._FRESHNESS_WAIT_CAP_SECONDS if freshness else 0.0
+            last_exc: Exception | None = None
+
+            while True:
+                value, exc = self._attempt(pinned, method, params, formatter, freshness)
+                if exc is None:
+                    return value
+
+                # Freshness unmet: wait and try again.
+                if isinstance(exc, _FreshnessUnmet) and time.time() < deadline:
+                    time.sleep(policy.backoff_seconds)
+                    continue
+
+                last_exc = exc
+                raise AllEndpointsFailed(last_exc) from last_exc
 
         if route == "primary":
             ep = self._get_primary()
-            try:
-                result = self._make_request(ep, method, params, formatter)
-                self._mark_success(ep)
-                return result
-            except Exception as exc:
-                if self.is_retryable_exc(exc):
-                    self._mark_failure(ep, exc)
-                raise AllEndpointsFailed(exc) from exc
+
+            # In desired_pool_size == 0 mode, freshness is effectively ignored (no returned tip).
+            deadline = time.time() + self._FRESHNESS_WAIT_CAP_SECONDS if freshness else 0.0
+            last_exc: Exception | None = None
+
+            while True:
+                value, exc = self._attempt(ep, method, params, formatter, freshness)
+                if exc is None:
+                    return value
+
+                if isinstance(exc, _FreshnessUnmet) and time.time() < deadline:
+                    time.sleep(policy.backoff_seconds)
+                    continue
+
+                last_exc = exc
+                raise AllEndpointsFailed(last_exc) from last_exc
 
         # route == "pool"
         candidates = self._pool_candidates()
         eps = self._eligible_endpoints(candidates)
 
-        policy = self.retry_policy_pool
-        attempts = min(max(1, policy.max_attempts), len(eps))
-        last_exc: Exception | None = None
-
         with self._lock:
             start = self._rr % len(eps)
             self._rr = (self._rr + 1) % (1 << 30)
 
-        for i in range(attempts):
-            ep = eps[(start + i) % len(eps)]
-            try:
-                result = self._make_request(ep, method, params, formatter)
-                self._mark_success(ep)
-                return result
+        rr_ep = eps[start]
+        max_exc_attempts = min(max(1, policy.max_attempts), len(eps))
 
-            except RPCError as exc:
+        # No freshness: preserve old behavior (bounded attempts across endpoints).
+        if freshness is None:
+            last_exc: Exception | None = None
+            exc_attempts = 0
+
+            for i in range(len(eps)):
+                if exc_attempts >= max_exc_attempts:
+                    break
+                ep = eps[(start + i) % len(eps)]
+                value, exc = self._attempt(ep, method, params, formatter, None)
+                if exc is None:
+                    return value
+
                 last_exc = exc
-                # RPCError is not a transport failure; do not mark_failure unless caller wants it.
-                if policy.retry_on_rpc_error and i < attempts - 1:
+                exc_attempts += 1
+                if i < len(eps) - 1:
                     time.sleep(policy.backoff_seconds)
-                    continue
-                raise
 
-            except Exception as exc:
+            raise AllEndpointsFailed(last_exc)
+
+        # Freshness requested: RR once, then prefer highest last_tip, repeat with backoff until cap.
+        deadline = time.time() + self._FRESHNESS_WAIT_CAP_SECONDS
+        last_exc: Exception | None = None
+
+        while True:
+            # Pass order: RR endpoint first, then the rest by last_tip desc.
+            sorted_by_last_tip = sorted(list(eps), key=self._last_tip, reverse=True)
+            ordered = [rr_ep] + [ep for ep in sorted_by_last_tip if ep is not rr_ep]
+
+            exc_attempts = 0
+
+            for ep in ordered:
+                value, exc = self._attempt(ep, method, params, formatter, freshness)
+                if exc is None:
+                    return value
+
                 last_exc = exc
-                if self.is_retryable_exc(exc):
-                    self._mark_failure(ep, exc)
-                    if i < attempts - 1:
-                        time.sleep(policy.backoff_seconds)
-                        continue
-                break
+                if isinstance(exc, _FreshnessUnmet):
+                    continue
 
-        raise AllEndpointsFailed(last_exc)
+                # Transport-ish retryable exception: count against budget for this pass.
+                exc_attempts += 1
+                if exc_attempts >= max_exc_attempts:
+                    break
+
+            if time.time() >= deadline:
+                raise AllEndpointsFailed(last_exc) from last_exc
+
+            # If the only failures were freshness-related, a short sleep is usually enough for
+            # clusters to converge. If we saw transport failures too, this still throttles retries.
+            # (No infinite tight loop.)
+            time.sleep(policy.backoff_seconds)
+
+            # Recompute eligibility each pass (cooldowns may expire; pool may still be same list).
+            eps = self._eligible_endpoints(candidates)
+            if not eps:
+                raise NoEndpoints("No endpoints available")
+            rr_ep = eps[start % len(eps)]
