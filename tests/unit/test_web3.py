@@ -32,6 +32,7 @@ class RecordingProvider(Provider):
         self._results = results or {}
         self._default = default
         self._called_event = threading.Event()
+        self._primary = None
 
     def request(
         self,
@@ -367,16 +368,28 @@ def test_sign_routes_primary_and_validates_data_hex():
     assert c.params == [a, "0x0102"]
 
 
-def test_send_raw_transaction_disallows_empty_and_defaults_to_pool_route():
+def test_send_raw_transaction_disallows_empty():
     p = RecordingProvider(results={"eth_sendRawTransaction": "0x" + "aa" * 32})
     w3 = mk_w3(p, strict=True)
 
     with pytest.raises(ValidationError):
         force(w3.eth.send_raw_transaction(b""))
 
-    out = force(w3.eth.send_raw_transaction(b"\x01\x02"))
-    assert isinstance(out, str)
 
+def test_send_raw_transaction_primary_vs_pool():
+    p = RecordingProvider(results={"eth_sendRawTransaction": "0x" + "aa" * 32})
+    w3 = mk_w3(p, strict=True)
+
+    # with primary set, call should be routed to primary
+    p._primary = True
+    w3.eth.send_raw_transaction(b"\x01\x02")
+    c = p.last_call()
+    assert c.method == "eth_sendRawTransaction"
+    assert c.route == "primary"
+
+    # when unset, should be routed to pool
+    p._primary = None
+    w3.eth.send_raw_transaction(b"\x01\x02")
     c = p.last_call()
     assert c.method == "eth_sendRawTransaction"
     assert c.route == "pool"
