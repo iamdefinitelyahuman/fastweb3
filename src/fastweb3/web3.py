@@ -543,7 +543,8 @@ class Eth:
     def send_raw_transaction(self, signed_tx: str | bytes) -> str:
         strict = bool(self._w3.config.strict)
         tx = validation.data_hex(signed_tx, name="signed_tx", strict=strict, allow_empty=False)
-        return self._w3.make_request("eth_sendRawTransaction", [tx])
+        route = "primary" if self._w3.provider.has_primary() else "pool"
+        return self._w3.make_request("eth_sendRawTransaction", [tx], route=route)
 
     # ----------------------------
     # call / estimate
