@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-import fastweb3.web3 as w3mod
+import fastweb3.web3.web3 as w3mod
 from fastweb3.errors import NoEndpoints
 
 

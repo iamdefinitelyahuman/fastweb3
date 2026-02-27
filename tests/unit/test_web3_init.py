@@ -1,6 +1,6 @@
 import pytest
 
-import fastweb3.web3 as web3_mod
+import fastweb3.web3.web3 as web3_mod
 from fastweb3.errors import NoEndpoints
 
 
