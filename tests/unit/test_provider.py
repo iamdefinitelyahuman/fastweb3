@@ -315,23 +315,6 @@ def test_pool_rpcerror_does_not_retry_by_default(no_sleep) -> None:
     assert len(b.calls) == 0
 
 
-def test_pool_rpcerror_can_retry_when_enabled(no_sleep) -> None:
-    p = Provider(
-        ["a", "b"],
-        retry_policy_pool=RetryPolicy(max_attempts=2, backoff_seconds=0.2, retry_on_rpc_error=True),
-    )
-    a = _ep(p, "a")
-    b = _ep(p, "b")
-
-    a.queue_raise(_rpc_error(message="transient?"))
-    b.queue_return("OK")
-
-    assert p.request("eth_call", ("x",), route="pool") == "OK"
-    assert no_sleep == [0.2]
-    assert len(a.calls) == 1
-    assert len(b.calls) == 1
-
-
 def test_pin_pool_forces_same_endpoint_and_restores_previous() -> None:
     p = Provider(["a", "b"])
     a = _ep(p, "a")

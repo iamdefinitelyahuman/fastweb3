@@ -40,6 +40,7 @@ class RecordingProvider(Provider):
         *,
         route: str = "pool",
         formatter=None,
+        freshness=None,
     ) -> Any:
         # Web3.make_request should always pass formatter=None into provider
         with self._lock:
