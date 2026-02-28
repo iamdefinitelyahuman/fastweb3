@@ -1,3 +1,4 @@
+# src/fastweb3/deferred.py
 import threading
 import traceback
 from typing import Any, Callable, Optional
@@ -10,8 +11,7 @@ _UNSET = object()
 class Handle:
     def __init__(
         self,
-        bg_func: Callable[["Handle"], None],
-        *,
+        bg_func: Optional[Callable[["Handle"], None]] = None,
         format_func: Optional[Callable[[Any], Any]] = None,
         ref_func: Optional[Callable[["Handle"], None]] = None,
     ) -> None:
@@ -48,15 +48,21 @@ class Handle:
         # Capture creation site (strip this __init__ frame)
         self._created_stack = traceback.format_stack()[:-1]
 
-        def execute_in_background() -> None:
-            try:
-                bg_func(self)
-            except BaseException as exc:
-                self.set_exc(exc)
-            finally:
-                self.event.set()
+        if bg_func is not None:
 
-        threading.Thread(target=execute_in_background, daemon=True).start()
+            def execute_in_background() -> None:
+                try:
+                    bg_func(self)
+                except BaseException as exc:
+                    self.set_exc(exc)
+                finally:
+                    self.event.set()
+
+            threading.Thread(target=execute_in_background, daemon=True).start()
+        else:
+            if ref_func is None:
+                raise ValueError("Must set one of bg_func, ref_func")
+            self.event.set()
 
     def set_exc(self, exc: BaseException) -> None:
         self._add_creation_note(exc)
