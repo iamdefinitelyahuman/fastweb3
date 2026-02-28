@@ -231,3 +231,37 @@ def test_get_value_waits_for_bg_event():
     release.set()
     t.join(timeout=1.0)
     assert got["v"] == "ok"
+
+
+def test_handle_requires_bg_or_ref():
+    # bg_func=None and ref_func=None should raise immediately
+    with pytest.raises(ValueError, match="Must set one of bg_func, ref_func"):
+        Handle(None)
+
+    with pytest.raises(ValueError, match="Must set one of bg_func, ref_func"):
+        Handle(bg_func=None, ref_func=None)
+
+
+def test_no_bg_sets_event_immediately_and_ref_resolves():
+    ref_calls = 0
+    ref_entered = threading.Event()
+
+    def ref(h: Handle) -> None:
+        nonlocal ref_calls
+        ref_calls += 1
+        ref_entered.set()
+        h.set_value("ok")
+
+    h = Handle(bg_func=None, ref_func=ref)
+
+    # New behavior: if there's no bg_func, event is set immediately
+    assert h.event.is_set()
+
+    # And get_value should not block; it will run ref once and resolve
+    assert h.get_value() == "ok"
+    assert ref_entered.wait(0.5)
+    assert ref_calls == 1
+
+    # Subsequent access should not re-run ref
+    assert h.get_value() == "ok"
+    assert ref_calls == 1
