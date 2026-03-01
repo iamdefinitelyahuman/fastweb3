@@ -271,7 +271,7 @@ def test_request_batch_requires_all_requested_ids_present() -> None:
         e.request_batch(("a", ()), ("b", ()))
 
 
-def test_request_batch_raises_rpcerror_on_any_error_item() -> None:
+def test_request_batch_returns_rpcerror_on_error_item() -> None:
     t = ScriptedTransport()
     t.queue_return(
         [
@@ -281,12 +281,13 @@ def test_request_batch_raises_rpcerror_on_any_error_item() -> None:
     )
 
     e = Endpoint("https://example.invalid", transport=t)
-    with pytest.raises(RPCError) as excinfo:
-        e.request_batch(("a", ()), ("b", ()))
+    results = e.request_batch(("a", ()), ("b", ()))
 
-    details = excinfo.value.details
-    assert details.code == 123
-    assert details.message == "bad"
+    assert len(results) == 2
+    assert results[0] == "ok"
+    assert isinstance(results[1], RPCError)
+    assert results[1].details.code == 123
+    assert results[1].details.message == "bad"
 
 
 def test_request_batch_raises_malformed_on_missing_result_when_no_error() -> None:
