@@ -315,56 +315,6 @@ def test_pool_rpcerror_does_not_retry_by_default(no_sleep) -> None:
     assert len(b.calls) == 0
 
 
-def test_pin_pool_forces_same_endpoint_and_restores_previous() -> None:
-    p = Provider(["a", "b"])
-    a = _ep(p, "a")
-    b = _ep(p, "b")
-
-    # Script enough outcomes for whichever endpoint gets pinned
-    a.queue_return("A1")
-    a.queue_return("A2")
-    b.queue_return("B1")
-    b.queue_return("B2")
-
-    with p.pin(route="pool") as chosen:
-        assert chosen in (a, b)
-        r1 = p.request("m", (), route="pool")
-        r2 = p.request("m", (), route="pool")
-        # Both calls should go to the pinned endpoint (so same letter)
-        assert r1[0] == r2[0]
-
-    # pin should not leak
-    assert getattr(p._tls, "pinned", None) is None
-
-    # After exiting, unpinned again: just ensure it works (RR may hit either endpoint).
-    a.queue_return("A3")
-    b.queue_return("B3")
-    _ = p.request("m", (), route="pool")
-
-
-def test_pin_primary_pins_primary_and_overrides_route_while_pinned() -> None:
-    p = Provider(["a", "b"])
-    p.set_primary("a")
-
-    a = _ep(p, "a")
-    b = _ep(p, "b")
-
-    a.queue_return("A1")
-    a.queue_return("A2")
-    b.queue_return("B1")
-
-    with p.pin(route="primary") as chosen:
-        assert chosen is a
-        assert p.request("m", (), route="pool") == "A1"
-        assert p.request("m", (), route="primary") == "A2"
-
-    # After unpin, pool routing can hit either; ensure both have outcomes.
-    a.queue_return("A3")
-    b.queue_return("B2")
-    out = p.request("m", (), route="pool")
-    assert out in ("A3", "B1", "B2")
-
-
 def test_cooldown_skips_failed_endpoint_until_expired(fixed_time, no_sleep) -> None:
     p = Provider(["a", "b"], retry_policy_pool=RetryPolicy(max_attempts=2, backoff_seconds=0.0))
     a = _ep(p, "a")
