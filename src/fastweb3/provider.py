@@ -3,9 +3,8 @@ from __future__ import annotations
 
 import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable
 
 from .endpoint import Endpoint, Formatter
 from .errors import (
@@ -83,7 +82,6 @@ class Provider:
         is_retryable_exc: Callable[[Exception], bool] = _default_is_retryable_exc,
     ) -> None:
         self._lock = threading.Lock()
-        self._tls = threading.local()
         self._rr = 0
 
         if pool_manager is None:
@@ -375,39 +373,8 @@ class Provider:
         return [self._get_or_create_endpoint(u) for u in merged]
 
     # ----------------------------
-    # pinning
+    # attempt
     # ----------------------------
-
-    def _get_pinned(self) -> Optional[Endpoint]:
-        return getattr(self._tls, "pinned", None)
-
-    @contextmanager
-    def pin(self, *, route: str = "pool") -> Iterator[Endpoint]:
-        """
-        Pin this thread to a single endpoint for deterministic routing.
-
-        route="pool": pins to the current RR choice from the merged pool candidates.
-        route="primary": pins to primary (raises if unset).
-        """
-        if route not in ("pool", "primary"):
-            raise ValueError("route must be 'pool' or 'primary'")
-
-        prev = self._get_pinned()
-
-        if route == "primary":
-            chosen = self._get_primary()
-        else:
-            eps = self._eligible_endpoints(self._pool_candidates())
-            with self._lock:
-                start = self._rr % len(eps)
-                self._rr = (self._rr + 1) % (1 << 30)
-            chosen = eps[start]
-
-        self._tls.pinned = chosen
-        try:
-            yield chosen
-        finally:
-            self._tls.pinned = prev
 
     def _attempt(
         self,
@@ -456,7 +423,7 @@ class Provider:
             return None, _FreshnessUnmet("Freshness unmet")
 
         except RPCError:
-            # Always bubble RPCError immediately (per today's mission).
+            # Always bubble RPCError immediately.
             raise
 
         except Exception as exc:
@@ -494,25 +461,6 @@ class Provider:
 
         policy = self.retry_policy_pool
 
-        pinned = self._get_pinned()
-        if pinned is not None:
-            # Can't rotate endpoints. If freshness rejects, wait/backoff and retry pinned.
-            deadline = time.time() + self._FRESHNESS_WAIT_CAP_SECONDS if freshness else 0.0
-            last_exc: Exception | None = None
-
-            while True:
-                value, exc = self._attempt(pinned, method, params, formatter, freshness)
-                if exc is None:
-                    return value
-
-                # Freshness unmet: wait and try again.
-                if isinstance(exc, _FreshnessUnmet) and time.time() < deadline:
-                    time.sleep(policy.backoff_seconds)
-                    continue
-
-                last_exc = exc
-                raise AllEndpointsFailed(last_exc) from last_exc
-
         if route == "primary":
             ep = self._get_primary()
 
@@ -543,7 +491,7 @@ class Provider:
         rr_ep = eps[start]
         max_exc_attempts = min(max(1, policy.max_attempts), len(eps))
 
-        # No freshness: preserve old behavior (bounded attempts across endpoints).
+        # No freshness: bounded attempts across endpoints.
         if freshness is None:
             last_exc: Exception | None = None
             exc_attempts = 0
@@ -591,12 +539,9 @@ class Provider:
             if time.time() >= deadline:
                 raise AllEndpointsFailed(last_exc) from last_exc
 
-            # If the only failures were freshness-related, a short sleep is usually enough for
-            # clusters to converge. If we saw transport failures too, this still throttles retries.
-            # (No infinite tight loop.)
             time.sleep(policy.backoff_seconds)
 
-            # Recompute eligibility each pass (cooldowns may expire; pool may still be same list).
+            # Recompute eligibility each pass.
             eps = self._eligible_endpoints(candidates)
             if not eps:
                 raise NoEndpoints("No endpoints available")
