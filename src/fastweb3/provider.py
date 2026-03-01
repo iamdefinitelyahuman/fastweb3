@@ -410,14 +410,17 @@ class Provider:
                 ("eth_blockNumber", (), to_int),
                 (method, params, formatter),
             )
-            returned_tip = int(tip)
-            self._update_tip_and_maybe_demote(ep, returned_tip)
+            for item in (result, tip):
+                if isinstance(item, RPCError):
+                    raise item
+
+            self._update_tip_and_maybe_demote(ep, tip)
             self._mark_success(ep)
 
             if freshness is None:
                 return result, None
 
-            if freshness(result, required_tip, returned_tip):
+            if freshness(result, required_tip, tip):
                 return result, None
 
             return None, _FreshnessUnmet("Freshness unmet")

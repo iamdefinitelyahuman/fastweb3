@@ -26,19 +26,26 @@ class Endpoint:
       - JSON-RPC envelope
       - response validation / error parsing
     Delegates wire I/O to Transport (HTTP / WSS / IPC).
+
+    Notes on batch semantics:
+      - request() raises RPCError for JSON-RPC "error" responses.
+      - request_batch() returns a list aligned to request order, where each element is either:
+          * the (optionally formatted) result value, or
+          * an RPCError instance for that specific call
+        Batch-level failures (transport, malformed response shape, missing/duplicate ids, etc.)
+        still raise immediately.
     """
 
     def __init__(
         self,
-        url: str,
+        target: str,
         *,
         transport: Optional[Transport] = None,
         config: EndpointConfig | None = None,
     ) -> None:
-        # keep name `url` for backwards compatibility, but it's really a "target"
-        self.url = url
+        self.target = target
         self.config = config or EndpointConfig()
-        self.transport = transport or make_transport(url)
+        self.transport = transport or make_transport(target)
         self._counter = itertools.count(1)
 
     def close(self) -> None:
@@ -98,7 +105,7 @@ class Endpoint:
         *calls: tuple[str, Sequence[Any]]
         | tuple[str, Sequence[Any], Formatter]
         | tuple[str, Sequence[Any], None],
-    ) -> list[Any]:
+    ) -> list[Any | RPCError]:
         """
         Execute a JSON-RPC batch request.
 
@@ -106,7 +113,14 @@ class Endpoint:
           - (method, params)
           - (method, params, formatter)
 
-        Formatters are applied positionally to the corresponding result.
+        Return value:
+          A list aligned to the call order. Each element is either:
+            - the (optionally formatted) result value, or
+            - an RPCError instance if that specific call returned a JSON-RPC error object.
+
+        Raises:
+          - TransportError for network/transport failures
+          - RPCMalformedResponse for invalid/malformed batch responses
         """
         if not calls:
             return []
@@ -171,10 +185,11 @@ class Endpoint:
             if _id not in by_id:
                 raise RPCMalformedResponse(f"Missing id {_id} in batch response")
 
-        out: list[Any] = []
+        out: list[Any | RPCError] = []
         for i, _id in enumerate(ids):
             item = by_id[_id]
 
+            # Per-call JSON-RPC error: return RPCError instance in-position.
             if item.get("error") is not None:
                 err = item["error"]
                 if isinstance(err, dict):
@@ -185,7 +200,9 @@ class Endpoint:
                     )
                 else:
                     details = RPCErrorDetails(code=None, message=str(err), data=None)
-                raise RPCError(details)
+
+                out.append(RPCError(details))
+                continue
 
             if "result" not in item:
                 raise RPCMalformedResponse(f"Missing result in batch item: {item!r}")
