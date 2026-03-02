@@ -1,3 +1,4 @@
+# tests/unit/test_provider.py
 from __future__ import annotations
 
 from collections import deque
@@ -41,8 +42,8 @@ class FakeEndpoint:
       - .request_calls to assert when primary-only mode uses request()
     """
 
-    def __init__(self, url: str, *args: Any, **kwargs: Any) -> None:
-        self.url = url
+    def __init__(self, target: str, *args: Any, **kwargs: Any) -> None:
+        self.target = target
         self.closed = False
 
         # User-call history (attempted), for backwards-compatible assertions
@@ -68,7 +69,7 @@ class FakeEndpoint:
         self.request_calls.append((str(method), list(params), formatter))
 
         if not self._outcomes:
-            raise AssertionError(f"No scripted outcomes for endpoint {self.url}")
+            raise AssertionError(f"No scripted outcomes for endpoint {self.target}")
         o = self._outcomes.popleft()
         if o.exc is not None:
             raise o.exc
@@ -112,7 +113,7 @@ class FakeEndpoint:
         self.calls.append((str(method), list(params)))
 
         if not self._outcomes:
-            raise AssertionError(f"No scripted outcomes for endpoint {self.url}")
+            raise AssertionError(f"No scripted outcomes for endpoint {self.target}")
         o = self._outcomes.popleft()
         if o.exc is not None:
             raise o.exc
@@ -136,7 +137,7 @@ class FakePoolManager:
     """
     Minimal PoolManager test double.
 
-    best_urls(n, await_first) returns up to n URLs from an internal list.
+    best_urls(n, await_first) returns up to n targets from an internal list.
     Records calls as tuples: (n, await_first).
     """
 
@@ -163,8 +164,8 @@ def _patch_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _patch_normalize(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Ensure Provider uses the real normalize_url by default (includes env expansion).
-    monkeypatch.setattr(provider_mod, "normalize_url", utils_mod.normalize_url)
+    # Ensure Provider uses the real normalize_target by default (includes env expansion).
+    monkeypatch.setattr(provider_mod, "normalize_target", utils_mod.normalize_target)
 
 
 @pytest.fixture
@@ -189,10 +190,10 @@ def fixed_time(monkeypatch: pytest.MonkeyPatch):
     return now
 
 
-def _ep(p: Provider, url: str) -> FakeEndpoint:
-    # Helper: grab cached endpoint by URL.
-    nu = provider_mod.normalize_url(url)
-    return p._eps_by_url[nu]  # type: ignore[attr-defined]
+def _ep(p: Provider, target: str) -> FakeEndpoint:
+    # Helper: grab cached endpoint by normalized target.
+    nt = provider_mod.normalize_target(target)
+    return p._eps_by_target[nt]  # type: ignore[attr-defined]
 
 
 def test_no_endpoints_pool_route_raises() -> None:
@@ -336,31 +337,31 @@ def test_cooldown_skips_failed_endpoint_until_expired(fixed_time, no_sleep) -> N
     assert b in eligible2
 
 
-def test_add_url_dedups_normalized_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(provider_mod, "normalize_url", lambda u: u.strip().lower())
+def test_add_endpoint_dedups_normalized_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(provider_mod, "normalize_target", lambda u: u.strip().lower())
 
     p = Provider([])
-    p.add_url("HTTP://EXAMPLE.INVALID ")
-    p.add_url("http://example.invalid")
+    p.add_endpoint("HTTP://EXAMPLE.INVALID ")
+    p.add_endpoint("http://example.invalid")
     assert p.endpoint_count() == 1
-    assert p.urls() == ["http://example.invalid"]
+    assert p.endpoints() == ["http://example.invalid"]
 
 
-def test_remove_url_removes_from_internal_pool_but_does_not_close_endpoint(
+def test_remove_endpoint_removes_from_internal_pool_but_does_not_close_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(provider_mod, "normalize_url", lambda u: u.strip().lower())
+    monkeypatch.setattr(provider_mod, "normalize_target", lambda u: u.strip().lower())
 
     p = Provider(["http://example.invalid", "http://other.invalid"])
-    target = p._eps_by_url["http://example.invalid"]  # type: ignore[attr-defined]
-    assert target.closed is False
+    ep = p._eps_by_target["http://example.invalid"]  # type: ignore[attr-defined]
+    assert ep.closed is False
 
-    p.remove_url(" HTTP://EXAMPLE.INVALID ")
-    assert target.closed is False  # remove_url does not close cached endpoints
-    assert p.urls() == ["http://other.invalid"]
+    p.remove_endpoint(" HTTP://EXAMPLE.INVALID ")
+    assert ep.closed is False  # remove_endpoint does not close cached endpoints
+    assert p.endpoints() == ["http://other.invalid"]
 
     p.close()
-    assert target.closed is True
+    assert ep.closed is True
 
 
 def test_poolmanager_await_first_false_when_internal_present() -> None:
@@ -388,7 +389,6 @@ def test_poolmanager_await_first_false_when_primary_present_and_internal_empty()
     p1 = _ep(p, "p1")
     p1.queue_return("P1")
 
-    # Manager might be asked (depending on desired_pool_size) but must be await_first False
     m1 = p._get_or_create_endpoint("m1")  # type: ignore[attr-defined]
     m1.queue_return("M1")
 
@@ -408,25 +408,25 @@ def test_poolmanager_await_first_true_when_no_internal_and_no_primary() -> None:
     assert pm.calls == [(1, True)]
 
 
-def test_provider_add_url_expands_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_provider_add_endpoint_expands_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RPC_HOST", "node.local")
     p = Provider([])
-    p.add_url("https://$RPC_HOST/rpc")
-    assert p.urls() == ["https://node.local/rpc"]
+    p.add_endpoint("https://$RPC_HOST/rpc")
+    assert p.endpoints() == ["https://node.local/rpc"]
 
 
 def test_provider_set_primary_expands_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RPC_HOST", "node.local")
     p = Provider([])
     p.set_primary("https://$RPC_HOST/rpc/")
-    assert p.primary_url() == "https://node.local/rpc"
+    assert p.primary_endpoint() == "https://node.local/rpc"
 
 
-def test_provider_add_url_missing_env_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_provider_add_endpoint_missing_env_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("RPC_MISSING", raising=False)
     p = Provider([])
     with pytest.raises(ValueError, match="RPC_MISSING.*not set|not.*set"):
-        p.add_url("https://example.com/$RPC_MISSING")
+        p.add_endpoint("https://example.com/$RPC_MISSING")
 
 
 def test_provider_batches_eth_blocknumber_before_user_call() -> None:
@@ -444,31 +444,25 @@ def test_provider_batches_eth_blocknumber_before_user_call() -> None:
 
     assert batch[1][0] == "eth_chainId"
     assert list(batch[1][1]) == []
-    # third element is formatter_or_none
     assert len(batch[1]) == 3
 
 
 def test_provider_tracks_best_tip_and_demotes_stale_endpoint(fixed_time) -> None:
-    # Use fixed time so we can reason about cooldown windows deterministically.
     p = Provider(["a", "b"], retry_policy_pool=RetryPolicy(max_attempts=1, backoff_seconds=0.0))
     a = _ep(p, "a")
     b = _ep(p, "b")
 
-    # First call via a sets best_tip=200
     a.queue_return("A", tip_hex="0xc8")  # 200
     assert p.request("m", (), route="pool") == "A"
 
-    # Now b reports tip=150 while best=200 -> should get tip demoted
     b.queue_return("B", tip_hex="0x96")  # 150
     assert p.request("m", (), route="pool") == "B"
 
-    # b should now be ineligible (tip cooldown) while a is eligible
     candidates = p._pool_candidates()  # type: ignore[attr-defined]
     eligible = p._eligible_endpoints(candidates)  # type: ignore[attr-defined]
     assert a in eligible
     assert b not in eligible
 
-    # After cooldown passes, b becomes eligible again
     fixed_time["t"] += 10_000.0
     eligible2 = p._eligible_endpoints(candidates)  # type: ignore[attr-defined]
     assert a in eligible2
@@ -489,13 +483,10 @@ def test_primary_only_mode_skips_batching_for_primary_route() -> None:
     assert len(p1.batch_calls) == 0
     assert p1.calls == [("eth_chainId", [])]
 
-    # No tip probing => best tip should remain unset
     assert getattr(p, "_best_tip") is None  # type: ignore[attr-defined]
 
 
 def test_primary_only_mode_pool_route_falls_back_to_primary_and_skips_batching() -> None:
-    # Pool is empty, but primary exists => _pool_candidates falls back to primary.
-    # In primary-only mode, _make_request should still use request() (no batching).
     p = Provider([])
     p.set_primary("p1")
 

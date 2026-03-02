@@ -13,7 +13,7 @@ from fastweb3.errors import AllEndpointsFailed, RPCError, RPCErrorDetails, Trans
 
 class _StubPoolManager:
     def best_urls(self, needed: int, await_first: bool) -> list[str]:
-        # Provider will merge internal URLs + these.
+        # Provider will merge internal endpoints + these.
         return []
 
 
@@ -27,14 +27,14 @@ class FakeEndpoint:
     """
     Minimal Endpoint test double for Provider.request_batch tests.
 
-    - Has .url
+    - Has .target
     - .request_batch() pops scripted outcomes
     - records .batch_calls for assertions
     - .close() is a no-op
     """
 
-    def __init__(self, url: str, *args: Any, **kwargs: Any) -> None:
-        self.url = url
+    def __init__(self, target: str, *args: Any, **kwargs: Any) -> None:
+        self.target = target
         self.closed = False
         self.batch_calls: list[list[tuple[Any, ...]]] = []
         self._outcomes: Deque[_Outcome] = deque()
@@ -55,7 +55,7 @@ class FakeEndpoint:
         self.closed = True
 
     def __repr__(self) -> str:
-        return f"FakeEndpoint({self.url})"
+        return f"FakeEndpoint({self.target})"
 
 
 def _rpc_err(code: int = -32000, message: str = "boom") -> RPCError:
@@ -65,8 +65,8 @@ def _rpc_err(code: int = -32000, message: str = "boom") -> RPCError:
 def test_provider_request_batch_primary_no_tip_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
 
-    # No internal URLs; pool_manager None => desired_pool_size ends up 0
-    p = provider_mod.Provider(internal_urls=None, pool_manager=None)
+    # No internal endpoints; pool_manager None => desired_pool_size ends up 0
+    p = provider_mod.Provider(internal_endpoints=None, pool_manager=None)
 
     p.set_primary("http://a")
     ep = p._get_or_create_endpoint("http://a")
@@ -98,13 +98,13 @@ def test_provider_request_batch_primary_no_tip_probe(monkeypatch: pytest.MonkeyP
     ]
 
 
-def test_provider_request_batch_primary_with_tip_probe_when_internal_urls_present(
+def test_provider_request_batch_primary_with_tip_probe_when_internal_endpoints_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
 
-    # internal_urls forces desired_pool_size >= 1
-    p = provider_mod.Provider(internal_urls=["http://a"], pool_manager=None)
+    # internal_endpoints forces desired_pool_size >= 1
+    p = provider_mod.Provider(internal_endpoints=["http://a"], pool_manager=None)
     p.set_primary("http://a")
     ep = p._get_or_create_endpoint("http://a")
     assert isinstance(ep, FakeEndpoint)
@@ -121,7 +121,7 @@ def test_provider_request_batch_primary_with_tip_probe_when_internal_urls_presen
 
 def test_provider_request_batch_primary_requires_primary(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
-    p = provider_mod.Provider(internal_urls=["http://a"], pool_manager=None)
+    p = provider_mod.Provider(internal_endpoints=["http://a"], pool_manager=None)
 
     with pytest.raises(provider_mod.NoPrimaryEndpoint):
         p.request_batch([("net_version", (), None, None)], route="primary")
@@ -131,7 +131,7 @@ def test_provider_request_batch_pool_includes_tip_probe(monkeypatch: pytest.Monk
     monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
 
     p = provider_mod.Provider(
-        internal_urls=["http://a"],
+        internal_endpoints=["http://a"],
         pool_manager=_StubPoolManager(),
         desired_pool_size=1,
     )
@@ -155,7 +155,6 @@ def test_provider_request_batch_pool_includes_tip_probe(monkeypatch: pytest.Monk
     # First call in the batch should be the provider-added tip probe
     batch = ep.batch_calls[0]
     assert batch[0][0] == "eth_blockNumber"
-    # Provider passes to_int as formatter for tip
     assert batch[0][2] is provider_mod.to_int
     assert batch[1] == ("foo", (1,), None)
     assert batch[2] == ("bar", (), None)
@@ -167,7 +166,7 @@ def test_provider_request_batch_pool_rpc_errors_returned_in_position(
     monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
 
     p = provider_mod.Provider(
-        internal_urls=["http://a"],
+        internal_endpoints=["http://a"],
         pool_manager=_StubPoolManager(),
         desired_pool_size=1,
     )
@@ -195,7 +194,7 @@ def test_provider_request_batch_freshness_rejects_entire_batch_and_retries(
     monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
 
     p = provider_mod.Provider(
-        internal_urls=["http://a", "http://b"],
+        internal_endpoints=["http://a", "http://b"],
         pool_manager=_StubPoolManager(),
         desired_pool_size=2,
         retry_policy_pool=provider_mod.RetryPolicy(max_attempts=2, backoff_seconds=0.0),
@@ -206,7 +205,6 @@ def test_provider_request_batch_freshness_rejects_entire_batch_and_retries(
     assert isinstance(a, FakeEndpoint)
     assert isinstance(b, FakeEndpoint)
 
-    # Endpoint A returns tip too low for freshness -> should force retry whole batch on B
     a.script(_Outcome(value=[100, "a1", "a2"]))
     b.script(_Outcome(value=[250, "b1", "b2"]))
 
@@ -232,7 +230,7 @@ def test_provider_request_batch_tip_probe_rpcerror_rotates_endpoint(
     monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
 
     p = provider_mod.Provider(
-        internal_urls=["http://a", "http://b"],
+        internal_endpoints=["http://a", "http://b"],
         pool_manager=_StubPoolManager(),
         desired_pool_size=2,
         retry_policy_pool=provider_mod.RetryPolicy(max_attempts=2, backoff_seconds=0.0),
@@ -243,9 +241,7 @@ def test_provider_request_batch_tip_probe_rpcerror_rotates_endpoint(
     assert isinstance(a, FakeEndpoint)
     assert isinstance(b, FakeEndpoint)
 
-    # A: tip probe fails (internal), Provider should treat as attempt failure and rotate
     a.script(_Outcome(value=[_rpc_err(message="tip failed"), "x"]))
-    # B: ok
     b.script(_Outcome(value=[200, "ok"]))
 
     out = p.request_batch([("m", (), None, None)], route="pool")
@@ -261,7 +257,7 @@ def test_provider_request_batch_transport_errors_raise_allendpointsfailed(
     monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
 
     p = provider_mod.Provider(
-        internal_urls=["http://a", "http://b"],
+        internal_endpoints=["http://a", "http://b"],
         pool_manager=_StubPoolManager(),
         desired_pool_size=2,
         retry_policy_pool=provider_mod.RetryPolicy(max_attempts=2, backoff_seconds=0.0),
@@ -278,6 +274,5 @@ def test_provider_request_batch_transport_errors_raise_allendpointsfailed(
     with pytest.raises(AllEndpointsFailed):
         p.request_batch([("m", (), None, None)], route="pool")
 
-    # Should have tried both (bounded by max_attempts==2 and len(eps)==2)
     assert len(a.batch_calls) == 1
     assert len(b.batch_calls) == 1
