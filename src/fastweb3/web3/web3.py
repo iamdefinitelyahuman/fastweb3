@@ -1,9 +1,13 @@
+# src/fastweb3/web3.py
 from __future__ import annotations
 
 import threading
 import weakref
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
+
+from lazy_object_proxy import Proxy
 
 from ..deferred import Handle, deferred_response
 from ..endpoint import Endpoint
@@ -13,7 +17,7 @@ from ..env import (
     resolve_primary_endpoint,
     should_use_pool,
 )
-from ..errors import NoEndpoints
+from ..errors import NoEndpoints, RPCError
 from ..formatters import to_int
 from ..provider import Provider, RetryPolicy
 from ..rpc_pool import acquire_pool_manager, release_pool_manager
@@ -64,6 +68,161 @@ def _get_default_primary_chain_id_once() -> Optional[int]:
 
         _DEFAULT_PRIMARY_CHAIN_ID_SET = True
         return _DEFAULT_PRIMARY_CHAIN_ID
+
+
+_NEVER_BATCH_METHODS: set[str] = {
+    # side-effecting / timing-sensitive
+    "eth_sendRawTransaction",
+    "eth_sendTransaction",
+    # filter lifecycle (server-side state)
+    "eth_newFilter",
+    "eth_newBlockFilter",
+    "eth_newPendingTransactionFilter",
+    "eth_uninstallFilter",
+    "eth_getFilterChanges",
+    "eth_getFilterLogs",
+    # signing (often wallet-backed)
+    "eth_sign",
+    "eth_signTransaction",
+    "eth_signTypedData",
+    "eth_signTypedData_v3",
+    "eth_signTypedData_v4",
+    "personal_sign",
+}
+
+
+@dataclass
+class _Queued:
+    method: str
+    params: list[Any]
+    route: str
+    formatter: Any
+    freshness: FreshnessFn | None
+    handle: Handle
+
+
+@dataclass
+class _BatchState:
+    depth: int = 0
+    flushing: bool = False
+    queue: list[_Queued] | None = None
+    methods_stack: list[set[str] | None] | None = None
+    batch_id: int = 0
+
+    def __post_init__(self) -> None:
+        if self.queue is None:
+            self.queue = []
+        if self.methods_stack is None:
+            self.methods_stack = []
+
+
+_TLS = threading.local()
+_BATCH_ID_LOCK = threading.Lock()
+_BATCH_ID_NEXT = 1
+
+
+def _next_batch_id() -> int:
+    global _BATCH_ID_NEXT
+    with _BATCH_ID_LOCK:
+        bid = _BATCH_ID_NEXT
+        _BATCH_ID_NEXT += 1
+        return bid
+
+
+def _tls_state() -> _BatchState:
+    st = getattr(_TLS, "batch_state", None)
+    if st is None:
+        st = _BatchState()
+        setattr(_TLS, "batch_state", st)
+    return st
+
+
+class _BatchContext:
+    def __init__(self, w3: "Web3", batch_id: int) -> None:
+        self._w3 = w3
+        self._batch_id = batch_id
+
+    def _state(self) -> _BatchState:
+        st = _tls_state()
+        if st.depth <= 0 or st.batch_id != self._batch_id:
+            raise RuntimeError("Batch context is no longer active in this thread")
+        return st
+
+    def flush(self) -> None:
+        self._w3._flush_batch(raise_on_error=True)
+
+    def pending_count(self) -> int:
+        return len(self._state().queue or [])
+
+    def pending_methods(self) -> dict[str, int]:
+        c: Counter[str] = Counter()
+        for q in self._state().queue or []:
+            c[q.method] += 1
+        return dict(c)
+
+    def pending_preview(self, n: int = 10) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for q in (self._state().queue or [])[: max(0, int(n))]:
+            out.append(
+                {
+                    "method": q.method,
+                    "route": q.route,
+                    "params_len": len(q.params),
+                }
+            )
+        return out
+
+    def describe(self) -> str:
+        st = self._state()
+        return (
+            f"BatchContext(depth={st.depth}, pending={len(st.queue or [])}, "
+            f"flushing={st.flushing}, methods={self.pending_methods()})"
+        )
+
+
+class _BatchManager:
+    def __init__(self, w3: "Web3", methods: set[str] | None) -> None:
+        self._w3 = w3
+        self._methods = methods
+
+    def __enter__(self) -> _BatchContext:
+        st = _tls_state()
+
+        # Nesting boundary: flush current queue before entering deeper scope.
+        if st.depth > 0 and (st.queue or []):
+            self._w3._flush_batch(raise_on_error=True)
+
+        st.depth += 1
+        if st.depth == 1:
+            st.batch_id = _next_batch_id()
+
+        # Push active methods filter (None => batch all eligible methods)
+        st.methods_stack.append(self._methods)
+
+        return _BatchContext(self._w3, st.batch_id)
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        st = _tls_state()
+        raise_on_error = exc_type is None
+
+        try:
+            # Nesting boundary: flush on leaving the scope.
+            if st.depth > 0 and (st.queue or []):
+                self._w3._flush_batch(raise_on_error=raise_on_error)
+        finally:
+            if st.methods_stack:
+                st.methods_stack.pop()
+
+            st.depth = max(0, st.depth - 1)
+            if st.depth == 0:
+                if st.queue is not None:
+                    st.queue.clear()
+                if st.methods_stack is not None:
+                    st.methods_stack.clear()
+                st.flushing = False
+                st.batch_id = 0
+
+        return False
 
 
 class Web3:
@@ -180,6 +339,85 @@ class Web3:
             fin()
         self.provider.close()
 
+    def _active_methods_filter(self) -> set[str] | None:
+        st = _tls_state()
+        if st.methods_stack is None or not st.methods_stack:
+            return None
+        return st.methods_stack[-1]
+
+    def _should_batch(self, method: str) -> bool:
+        if method in _NEVER_BATCH_METHODS:
+            return False
+        filt = self._active_methods_filter()
+        if filt is None:
+            return True
+        return method in filt
+
+    def _enqueue_batch(
+        self,
+        method: str,
+        params: list[Any],
+        *,
+        route: str,
+        formatter,
+        freshness: FreshnessFn | None,
+        handle: Handle,
+    ) -> None:
+        st = _tls_state()
+        assert st.queue is not None
+        st.queue.append(
+            _Queued(
+                method=method,
+                params=params,
+                route=route,
+                formatter=formatter,
+                freshness=freshness,
+                handle=handle,
+            )
+        )
+
+    def _flush_batch(self, *, raise_on_error: bool) -> None:
+        st = _tls_state()
+        if st.flushing:
+            return
+        if st.queue is None or not st.queue:
+            return
+
+        st.flushing = True
+        try:
+            queue = list(st.queue)
+            st.queue.clear()
+
+            i = 0
+            first_rpc_err: RPCError | None = None
+
+            # Preserve order while allowing mixed routes by flushing contiguous segments.
+            while i < len(queue):
+                route = queue[i].route
+                j = i
+                while j < len(queue) and queue[j].route == route:
+                    j += 1
+                chunk = queue[i:j]
+
+                calls = [(q.method, q.params, q.formatter, q.freshness) for q in chunk]
+                out = self.provider.request_batch(calls, route=route)
+
+                for q, item in zip(chunk, out):
+                    if isinstance(item, RPCError):
+                        if first_rpc_err is None:
+                            first_rpc_err = item
+                        q.handle.set_exc(item)
+                    else:
+                        q.handle.set_value(item)
+
+                i = j
+
+            if first_rpc_err is not None and raise_on_error:
+                raise first_rpc_err
+
+        finally:
+            st.flushing = False
+
     def make_request(
         self,
         method: str,
@@ -199,6 +437,22 @@ class Web3:
         freshness: optional freshness policy:
             freshness(response, required_tip, returned_tip) -> bool
         """
+        st = _tls_state()
+        if st.depth > 0 and not st.flushing and self._should_batch(method):
+
+            def ref_func(_: Handle) -> None:
+                self._flush_batch(raise_on_error=True)
+
+            h = Handle(bg_func=None, format_func=formatter, ref_func=ref_func)
+            self._enqueue_batch(
+                method,
+                params,
+                route=route,
+                formatter=None,
+                freshness=freshness,
+                handle=h,
+            )
+            return Proxy(h.get_value)
 
         def bg_func(h: Handle) -> None:
             raw = self.provider.request(
@@ -212,5 +466,5 @@ class Web3:
 
         return deferred_response(bg_func, format_func=formatter, ref_func=None)
 
-    def batch(self):
-        raise NotImplementedError("Batching not implemented yet")
+    def batch_requests(self, methods: set[str] | None = None) -> _BatchManager:
+        return _BatchManager(self, methods)
