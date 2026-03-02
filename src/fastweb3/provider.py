@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from .endpoint import Endpoint, Formatter
 from .errors import (
@@ -23,6 +23,14 @@ from .utils import normalize_url
 class RetryPolicy:
     max_attempts: int = 3
     backoff_seconds: float = 0.05
+
+
+@dataclass(frozen=True)
+class _BatchCall:
+    method: str
+    params: list[Any] | tuple[Any, ...]
+    formatter: Formatter | None = None
+    freshness: Callable[[Any, int, int], bool] | None = None
 
 
 def _default_is_retryable_exc(exc: Exception) -> bool:
@@ -148,7 +156,7 @@ class Provider:
 
     def primary_url(self) -> str | None:
         with self._lock:
-            return self._primary.url if self._primary is not None else None
+            return self._primary.url if self._primary is not None else None  # type: ignore[attr-defined]
 
     def has_primary(self) -> bool:
         with self._lock:
@@ -373,7 +381,7 @@ class Provider:
         return [self._get_or_create_endpoint(u) for u in merged]
 
     # ----------------------------
-    # attempt
+    # attempt (single call)
     # ----------------------------
 
     def _attempt(
@@ -436,7 +444,91 @@ class Provider:
             raise
 
     # ----------------------------
-    # request routing
+    # attempt (batch)
+    # ----------------------------
+
+    def _attempt_batch(
+        self,
+        ep: Endpoint,
+        calls: list[_BatchCall],
+    ) -> tuple[list[Any | RPCError] | None, Exception | None]:
+        """
+        Attempt the batch once on `ep`.
+
+        Returns: (values, exc)
+          - values is a list aligned to `calls` (RPCError in-position) on success
+          - exc is non-None on retryable failure or freshness rejection
+          - raises non-retryable exceptions
+
+        Semantics:
+          - TransportError (and other retryable exceptions) are returned as exc and mark_failure.
+          - Internal tip probe RPCError is treated as an attempt failure (rotate).
+          - Per-call RPCError results are returned in-position (not raised).
+          - If any per-call freshness rejects, the entire batch is rejected and retried.
+        """
+        if not calls:
+            return [], None
+
+        # If any call requests freshness, we need a tip probe attempt.
+        wants_freshness = any(c.freshness is not None for c in calls)
+
+        required_tip = self._best_tip_snapshot()
+
+        try:
+            if self.desired_pool_size == 0:
+                # Primary-only mode: no tip probing, thus freshness is effectively ignored.
+                resp = ep.request_batch(
+                    *[(c.method, c.params, c.formatter) for c in calls]  # type: ignore[arg-type]
+                )
+                self._mark_success(ep)
+                # resp already has RPCError in-position
+                return resp, None
+
+            # Pool mode: prepend tip probe.
+            resp_all = ep.request_batch(
+                ("eth_blockNumber", (), to_int),
+                *[(c.method, c.params, c.formatter) for c in calls],  # type: ignore[arg-type]
+            )
+
+            if not resp_all:
+                # Should not happen (we always include tip probe + at least one call),
+                # but treat as a retryable-ish failure to be safe.
+                raise TransportError("Empty batch response")
+
+            tip_item = resp_all[0]
+            user_out = resp_all[1:]
+
+            # Tip probe must succeed for freshness/tip tracking.
+            if isinstance(tip_item, RPCError):
+                # Treat as an attempt failure (rotate endpoints). Mark as failure for cooldown.
+                self._mark_failure(ep, tip_item)
+                return None, tip_item
+
+            tip = int(tip_item)
+            self._update_tip_and_maybe_demote(ep, tip)
+            self._mark_success(ep)
+
+            # Freshness enforcement: if any freshness function rejects, reject whole batch.
+            if wants_freshness:
+                for i, call in enumerate(calls):
+                    if call.freshness is None:
+                        continue
+                    item = user_out[i]
+                    if isinstance(item, RPCError):
+                        continue
+                    if not call.freshness(item, required_tip, tip):
+                        return None, _FreshnessUnmet("Freshness unmet")
+
+            return user_out, None
+
+        except Exception as exc:
+            if self.is_retryable_exc(exc):
+                self._mark_failure(ep, exc)
+                return None, exc
+            raise
+
+    # ----------------------------
+    # request routing (single)
     # ----------------------------
 
     def request(
@@ -545,6 +637,164 @@ class Provider:
             time.sleep(policy.backoff_seconds)
 
             # Recompute eligibility each pass.
+            eps = self._eligible_endpoints(candidates)
+            if not eps:
+                raise NoEndpoints("No endpoints available")
+            rr_ep = eps[start % len(eps)]
+
+    # ----------------------------
+    # request routing (batch)
+    # ----------------------------
+
+    def request_batch(
+        self,
+        calls: list[
+            tuple[str, Sequence[Any]]
+            | tuple[str, Sequence[Any], Formatter | None]
+            | tuple[str, Sequence[Any], Formatter | None, Callable[[Any, int, int], bool] | None]
+        ],
+        *,
+        route: str = "pool",
+    ) -> list[Any | RPCError]:
+        """
+        Perform a JSON-RPC batch request routed either to the merged pool or to the primary.
+
+        Each call tuple is:
+          (method, params, formatter=None, freshness=None)
+
+        Return value:
+          List aligned to the call order, each element is either:
+            - the (optionally formatted) result value, or
+            - an RPCError instance if that specific call returned a JSON-RPC error object.
+
+        Raises:
+          - TransportError (and other retryable/non-retryable exceptions) via routing logic:
+              * primary route wraps failure in AllEndpointsFailed
+              * pool route may raise AllEndpointsFailed / NoEndpoints
+          - RPCMalformedResponse bubbles from Endpoint.request_batch (batch-level malformed shapes)
+        """
+        if route not in ("pool", "primary"):
+            raise ValueError("route must be 'pool' or 'primary'")
+
+        if not calls:
+            return []
+
+        parsed: list[_BatchCall] = []
+        for call in calls:
+            if not isinstance(call, tuple):
+                raise TypeError(f"Batch call must be a tuple, got: {type(call).__name__}")
+
+            if len(call) == 2:
+                method, params = call  # type: ignore[misc]
+                fmt = None
+                fresh = None
+            elif len(call) == 3:
+                method, params, fmt = call  # type: ignore[misc]
+                fresh = None
+            elif len(call) == 4:
+                method, params, fmt, fresh = call  # type: ignore[misc]
+            else:
+                raise TypeError(
+                    "Batch call must be (method, params), (method, params, formatter), "
+                    "or (method, params, formatter, freshness)"
+                )
+
+            # Normalize params to list/tuple (Endpoint will list() it anyway)
+            if not isinstance(params, (list, tuple)):
+                raise TypeError("params must be a list or tuple")
+
+            parsed.append(
+                _BatchCall(
+                    method=method,
+                    params=params,
+                    formatter=fmt,
+                    freshness=fresh,
+                )
+            )
+
+        policy = self.retry_policy_pool
+        wants_freshness = any(c.freshness is not None for c in parsed)
+
+        if route == "primary":
+            ep = self._get_primary()
+
+            # In desired_pool_size == 0 mode, freshness is effectively ignored (no returned tip).
+            deadline = time.time() + self._FRESHNESS_WAIT_CAP_SECONDS if wants_freshness else 0.0
+            last_exc: Exception | None = None
+
+            while True:
+                values, exc = self._attempt_batch(ep, parsed)
+                if exc is None:
+                    # values is non-None here
+                    return list(values or [])
+
+                if isinstance(exc, _FreshnessUnmet) and time.time() < deadline:
+                    time.sleep(policy.backoff_seconds)
+                    continue
+
+                last_exc = exc
+                raise AllEndpointsFailed(last_exc) from last_exc
+
+        # route == "pool"
+        candidates = self._pool_candidates()
+        eps = self._eligible_endpoints(candidates)
+
+        with self._lock:
+            start = self._rr % len(eps)
+            self._rr = (self._rr + 1) % (1 << 30)
+
+        rr_ep = eps[start]
+        max_exc_attempts = min(max(1, policy.max_attempts), len(eps))
+
+        # No freshness: bounded attempts across endpoints.
+        if not wants_freshness:
+            last_exc: Exception | None = None
+            exc_attempts = 0
+
+            for i in range(len(eps)):
+                if exc_attempts >= max_exc_attempts:
+                    break
+                ep = eps[(start + i) % len(eps)]
+                values, exc = self._attempt_batch(ep, parsed)
+                if exc is None:
+                    return list(values or [])
+
+                last_exc = exc
+                exc_attempts += 1
+                if i < len(eps) - 1:
+                    time.sleep(policy.backoff_seconds)
+
+            raise AllEndpointsFailed(last_exc)
+
+        # Freshness requested: RR once, then prefer highest last_tip, repeat with backoff until cap.
+        deadline = time.time() + self._FRESHNESS_WAIT_CAP_SECONDS
+        last_exc: Exception | None = None
+
+        while True:
+            sorted_by_last_tip = sorted(list(eps), key=self._last_tip, reverse=True)
+            ordered = [rr_ep] + [ep for ep in sorted_by_last_tip if ep is not rr_ep]
+
+            exc_attempts = 0
+
+            for ep in ordered:
+                values, exc = self._attempt_batch(ep, parsed)
+                if exc is None:
+                    return list(values or [])
+
+                last_exc = exc
+                if isinstance(exc, _FreshnessUnmet):
+                    continue
+
+                # Count non-freshness failures against this pass' budget
+                exc_attempts += 1
+                if exc_attempts >= max_exc_attempts:
+                    break
+
+            if time.time() >= deadline:
+                raise AllEndpointsFailed(last_exc) from last_exc
+
+            time.sleep(policy.backoff_seconds)
+
             eps = self._eligible_endpoints(candidates)
             if not eps:
                 raise NoEndpoints("No endpoints available")
