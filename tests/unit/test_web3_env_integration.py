@@ -19,9 +19,7 @@ class _ProviderInit:
 
 
 class FakeProvider:
-    """
-    Spy Provider that records ctor args + set_primary calls.
-    """
+    """Spy Provider that records ctor args + set_primary calls."""
 
     def __init__(
         self,
@@ -55,9 +53,7 @@ class FakeProvider:
 
 
 class FakeEndpoint:
-    """
-    Spy Endpoint used only for _get_default_primary_chain_id_once probe.
-    """
+    """Spy Endpoint used only for _get_default_primary_chain_id_once probe."""
 
     def __init__(self, url: str) -> None:
         self.url = url
@@ -84,8 +80,9 @@ def test_explicit_primary_endpoint_overrides_env_primary(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(w3mod, "Provider", FakeProvider)
 
-    # pool manager wiring irrelevant; keep it simple and avoid probe
-    monkeypatch.setattr(w3mod, "get_pool_manager", lambda *a, **k: object())
+    # pool manager wiring irrelevant; avoid pool acquisition
+    monkeypatch.setattr(w3mod, "acquire_pool_manager", lambda *a, **k: object())
+    monkeypatch.setattr(w3mod, "release_pool_manager", lambda *a, **k: None)
 
     w3 = w3mod.Web3(1, primary_endpoint="http://explicit-primary")
 
@@ -94,7 +91,7 @@ def test_explicit_primary_endpoint_overrides_env_primary(monkeypatch: pytest.Mon
     assert w3.provider.primary_set == ["http://explicit-primary"]
 
 
-def test_pool_mode_off_never_calls_get_pool_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pool_mode_off_never_calls_acquire_pool_manager(monkeypatch: pytest.MonkeyPatch) -> None:
     _reset_default_primary_chain_id_cache()
 
     monkeypatch.setenv("FASTWEB3_POOL_MODE", "off")
@@ -107,9 +104,10 @@ def test_pool_mode_off_never_calls_get_pool_manager(monkeypatch: pytest.MonkeyPa
 
     def _boom(*args: Any, **kwargs: Any) -> Any:
         called["n"] += 1
-        raise AssertionError("get_pool_manager should not be called when POOL_MODE=off")
+        raise AssertionError("acquire_pool_manager should not be called when POOL_MODE=off")
 
-    monkeypatch.setattr(w3mod, "get_pool_manager", _boom)
+    monkeypatch.setattr(w3mod, "acquire_pool_manager", _boom)
+    monkeypatch.setattr(w3mod, "release_pool_manager", lambda *a, **k: None)
 
     w3 = w3mod.Web3(1)
 
@@ -118,7 +116,7 @@ def test_pool_mode_off_never_calls_get_pool_manager(monkeypatch: pytest.MonkeyPa
     assert w3.provider.init.pool_manager is None
 
 
-def test_pool_mode_default_calls_get_pool_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pool_mode_default_calls_acquire_pool_manager(monkeypatch: pytest.MonkeyPatch) -> None:
     _reset_default_primary_chain_id_cache()
 
     monkeypatch.setenv("FASTWEB3_POOL_MODE", "default")
@@ -130,12 +128,13 @@ def test_pool_mode_default_calls_get_pool_manager(monkeypatch: pytest.MonkeyPatc
     sentinel = object()
     seen: dict[str, Any] = {}
 
-    def _get_pool_manager(chain_id: int, **kwargs: Any) -> Any:
+    def _acquire_pool_manager(chain_id: int, **kwargs: Any) -> Any:
         seen["chain_id"] = chain_id
         seen["kwargs"] = kwargs
         return sentinel
 
-    monkeypatch.setattr(w3mod, "get_pool_manager", _get_pool_manager)
+    monkeypatch.setattr(w3mod, "acquire_pool_manager", _acquire_pool_manager)
+    monkeypatch.setattr(w3mod, "release_pool_manager", lambda *a, **k: None)
 
     w3 = w3mod.Web3(10, target_pool=7, max_lag_blocks=9, probe_timeout_s=0.7, probe_workers=11)
 
@@ -165,10 +164,12 @@ def test_split_per_chain_primary_disables_pool_for_that_chain(
     def _boom(*args: Any, **kwargs: Any) -> Any:
         called["n"] += 1
         raise AssertionError(
-            "get_pool_manager should not be called for chain with per-chain primary in split mode"
+            "acquire_pool_manager should not be called for chain"
+            " with per-chain primary in split mode"
         )
 
-    monkeypatch.setattr(w3mod, "get_pool_manager", _boom)
+    monkeypatch.setattr(w3mod, "acquire_pool_manager", _boom)
+    monkeypatch.setattr(w3mod, "release_pool_manager", lambda *a, **k: None)
 
     w3 = w3mod.Web3(10)
 
@@ -191,7 +192,8 @@ def test_split_per_chain_primary_still_uses_pool_on_other_chains(
     monkeypatch.setattr(w3mod, "Provider", FakeProvider)
 
     sentinel = object()
-    monkeypatch.setattr(w3mod, "get_pool_manager", lambda *a, **k: sentinel)
+    monkeypatch.setattr(w3mod, "acquire_pool_manager", lambda *a, **k: sentinel)
+    monkeypatch.setattr(w3mod, "release_pool_manager", lambda *a, **k: None)
 
     w3 = w3mod.Web3(8453)
 
@@ -229,10 +231,11 @@ def test_split_global_primary_disables_pool_only_on_that_primary_chain(
     def _boom(*args: Any, **kwargs: Any) -> Any:
         called["n"] += 1
         raise AssertionError(
-            "get_pool_manager should not be called on the global-primary chain in split mode"
+            "acquire_pool_manager should not be called on the global-primary chain in split mode"
         )
 
-    monkeypatch.setattr(w3mod, "get_pool_manager", _boom)
+    monkeypatch.setattr(w3mod, "acquire_pool_manager", _boom)
+    monkeypatch.setattr(w3mod, "release_pool_manager", lambda *a, **k: None)
 
     w3_chain1 = w3mod.Web3(1)
     assert isinstance(w3_chain1.provider, FakeProvider)
@@ -242,7 +245,7 @@ def test_split_global_primary_disables_pool_only_on_that_primary_chain(
 
     # On another chain, pool should still be used, and global primary should NOT be applied
     sentinel = object()
-    monkeypatch.setattr(w3mod, "get_pool_manager", lambda *a, **k: sentinel)
+    monkeypatch.setattr(w3mod, "acquire_pool_manager", lambda *a, **k: sentinel)
 
     w3_chain10 = w3mod.Web3(10)
     assert isinstance(w3_chain10.provider, FakeProvider)
@@ -296,9 +299,9 @@ def test_explicit_provider_bypasses_env_and_pool_manager(monkeypatch: pytest.Mon
     )
     monkeypatch.setattr(
         w3mod,
-        "get_pool_manager",
+        "acquire_pool_manager",
         lambda *a, **k: (_ for _ in ()).throw(
-            AssertionError("get_pool_manager should not be called")
+            AssertionError("acquire_pool_manager should not be called")
         ),
     )
 

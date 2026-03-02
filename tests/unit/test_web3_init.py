@@ -1,3 +1,6 @@
+# tests/unit/test_web3_init.py
+from __future__ import annotations
+
 import pytest
 
 import fastweb3.web3.web3 as web3_mod
@@ -9,14 +12,12 @@ class FakePoolManager:
         self.chain_id = int(chain_id)
         self.kwargs = dict(kwargs)
 
-    def best_urls(self, n: int) -> list[str]:
+    def best_urls(self, n: int, await_first: bool = False) -> list[str]:
         return []
 
 
 class DummyProvider:
-    """
-    Stand-in for Provider that captures constructor args and primary setting.
-    """
+    """Stand-in for Provider that captures constructor args and primary setting."""
 
     def __init__(
         self,
@@ -68,18 +69,22 @@ class DummyProvider:
 
 @pytest.fixture
 def patch_init_wiring(monkeypatch):
-    created = {"pool_mgr_calls": [], "provider_insts": []}
+    created = {"pool_mgr_calls": [], "provider_insts": [], "release_calls": []}
 
-    def fake_get_pool_manager(chain_id: int, **kwargs):
+    def fake_acquire_pool_manager(chain_id: int, **kwargs):
         created["pool_mgr_calls"].append((int(chain_id), dict(kwargs)))
         return FakePoolManager(chain_id, **kwargs)
+
+    def fake_release_pool_manager(chain_id: int) -> None:
+        created["release_calls"].append(int(chain_id))
 
     def fake_provider_ctor(*args, **kwargs):
         p = DummyProvider(*args, **kwargs)
         created["provider_insts"].append(p)
         return p
 
-    monkeypatch.setattr(web3_mod, "get_pool_manager", fake_get_pool_manager)
+    monkeypatch.setattr(web3_mod, "acquire_pool_manager", fake_acquire_pool_manager)
+    monkeypatch.setattr(web3_mod, "release_pool_manager", fake_release_pool_manager)
     monkeypatch.setattr(web3_mod, "Provider", fake_provider_ctor)
 
     return created
@@ -179,3 +184,18 @@ def test_init_chain_id_plus_endpoints_plus_primary_hybrid(patch_init_wiring):
 def test_init_no_chain_no_endpoints_no_primary_raises(patch_init_wiring):
     with pytest.raises(NoEndpoints):
         web3_mod.Web3()
+
+
+def test_close_triggers_release_for_determinism(patch_init_wiring):
+    created = patch_init_wiring
+
+    w3 = web3_mod.Web3(1)
+    assert created["release_calls"] == []
+
+    # close() should run the weakref.finalize callback once
+    w3.close()
+    assert created["release_calls"] == [1]
+
+    # double-close should not double-release
+    w3.close()
+    assert created["release_calls"] == [1]

@@ -59,43 +59,55 @@ def _batch_ok(chain_id: int, head_hex: str = "0x10"):
     ]
 
 
-class FakeThread:
-    """Prevents PoolManager background thread from starting in tests."""
-
-    def __init__(self, target=None, daemon=None):
-        self.target = target
-        self.daemon = daemon
-        self.started = False
-
-    def start(self):
-        self.started = True
-        # Intentionally do not run the target.
-
-
 def pr(url: str, rtt: float, head: int) -> rpc_pool.ProbeResult:
     return rpc_pool.ProbeResult(url=url, rtt_ms=rtt, head=head)
 
 
 @pytest.fixture(autouse=True)
-def reset_shared_pool_manager_registry():
+def reset_shared_pool_registry():
+    """Ensure each test starts with a clean global registry + no running scheduler thread."""
+    # Best-effort stop scheduler if running
+    try:
+        t = getattr(rpc_pool, "_sched_thread", None)
+        stop = getattr(rpc_pool, "_sched_stop", None)
+        if stop is not None:
+            stop.set()
+        if t is not None and getattr(t, "is_alive", lambda: False)():
+            if threading.current_thread() is not t:
+                t.join(timeout=0.2)
+    except Exception:
+        pass
+
     with rpc_pool._pool_lock:
         rpc_pool._pool_by_chain.clear()
+        rpc_pool._pool_refcount.clear()
+        rpc_pool._sched_thread = None
+        rpc_pool._sched_stop.clear()
+
     yield
+
+    # Clean again (in case tests left anything behind)
+    try:
+        t = getattr(rpc_pool, "_sched_thread", None)
+        stop = getattr(rpc_pool, "_sched_stop", None)
+        if stop is not None:
+            stop.set()
+        if t is not None and getattr(t, "is_alive", lambda: False)():
+            if threading.current_thread() is not t:
+                t.join(timeout=0.2)
+    except Exception:
+        pass
+
     with rpc_pool._pool_lock:
         rpc_pool._pool_by_chain.clear()
-
-
-@pytest.fixture
-def no_pool_thread(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(rpc_pool.threading, "Thread", FakeThread)
+        rpc_pool._pool_refcount.clear()
+        rpc_pool._sched_thread = None
+        rpc_pool._sched_stop.clear()
 
 
 @pytest.fixture
 def fake_make_transport(monkeypatch: pytest.MonkeyPatch):
-    """
-    Make rpc_pool use FakeTransport regardless of scheme (http/https/ws/wss),
-    and ignore any config kwargs.
-    """
+    """Make rpc_pool use FakeTransport regardless of scheme, and ignore config kwargs."""
 
     def _fake_make_transport(url: str, **kwargs: Any) -> FakeTransport:
         return FakeTransport(url)
@@ -223,6 +235,12 @@ def test_probe_urls_streaming_filters_and_dedups_http_only(
 ):
     monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: False)
     monkeypatch.setattr(rpc_pool, "normalize_url", lambda u: u.strip().rstrip("/"))
+    monkeypatch.setattr(rpc_pool, "normalize_target", lambda u: u)
+    monkeypatch.setattr(
+        rpc_pool,
+        "is_url_target",
+        lambda u: u.startswith(("http://", "https://", "ws://", "wss://")),
+    )
 
     urls = [
         "https://ok/",
@@ -258,6 +276,12 @@ def test_probe_urls_streaming_includes_wss_when_supported(
 ):
     monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: True)
     monkeypatch.setattr(rpc_pool, "normalize_url", lambda u: u.strip().rstrip("/"))
+    monkeypatch.setattr(rpc_pool, "normalize_target", lambda u: u)
+    monkeypatch.setattr(
+        rpc_pool,
+        "is_url_target",
+        lambda u: u.startswith(("http://", "https://", "ws://", "wss://")),
+    )
 
     urls = ["wss://ok/", "https://ok"]
 
@@ -284,6 +308,12 @@ def test_probe_urls_streaming_ignores_bad_responses(
 ):
     monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: False)
     monkeypatch.setattr(rpc_pool, "normalize_url", lambda u: u)
+    monkeypatch.setattr(rpc_pool, "normalize_target", lambda u: u)
+    monkeypatch.setattr(
+        rpc_pool,
+        "is_url_target",
+        lambda u: u.startswith(("http://", "https://", "ws://", "wss://")),
+    )
 
     FakeTransport.behavior = {
         "https://ok": _batch_ok(chain_id=1, head_hex="0x10"),
@@ -308,97 +338,122 @@ def test_probe_urls_streaming_ignores_bad_responses(
 def test_probe_urls_streaming_empty_candidates_returns_no_items(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: False)
     monkeypatch.setattr(rpc_pool, "normalize_url", lambda u: u)
+    monkeypatch.setattr(rpc_pool, "normalize_target", lambda u: u)
+    monkeypatch.setattr(
+        rpc_pool,
+        "is_url_target",
+        lambda u: u.startswith(("http://", "https://", "ws://", "wss://")),
+    )
     urls = ["ws://x", "wss://y", "https://x/${KEY}"]
     assert list(rpc_pool.probe_urls_streaming(urls, expected_chain_id=1, deadline_s=0.05)) == []
 
 
-def test_get_pool_manager_returns_shared_instance(no_pool_thread):
-    pm1 = rpc_pool.get_pool_manager(1)
-    pm2 = rpc_pool.get_pool_manager(1)
-    pm3 = rpc_pool.get_pool_manager(2)
+def test_acquire_pool_manager_returns_shared_instance_and_refcounts(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    called = {"ensure": 0, "stop": 0}
+
+    def _ensure() -> None:
+        called["ensure"] += 1
+
+    def _stop() -> None:
+        called["stop"] += 1
+
+    monkeypatch.setattr(rpc_pool, "_ensure_scheduler_running", _ensure)
+    monkeypatch.setattr(rpc_pool, "_stop_scheduler_if_idle", _stop)
+
+    pm1 = rpc_pool.acquire_pool_manager(1)
+    pm2 = rpc_pool.acquire_pool_manager(1)
+    pm3 = rpc_pool.acquire_pool_manager(2)
+
     assert pm1 is pm2
     assert pm1 is not pm3
 
+    with rpc_pool._pool_lock:
+        assert rpc_pool._pool_refcount[1] == 2
+        assert rpc_pool._pool_refcount[2] == 1
 
-def test_poolmanager_fill_until_target_pool(no_pool_thread):
+    assert called["ensure"] == 3
+
+    rpc_pool.release_pool_manager(1)
+    with rpc_pool._pool_lock:
+        assert rpc_pool._pool_refcount[1] == 1
+
+    # Fully release => scheduler eligible to stop
+    rpc_pool.release_pool_manager(1)
+    rpc_pool.release_pool_manager(2)
+    assert called["stop"] >= 1
+
+
+def test_poolmanager_fill_until_target_pool():
     pm = rpc_pool.PoolManager(1, target_pool=2)
-    state = rpc_pool._MaintainerState()
 
-    pm._handle_probe_result(state=state, pr=pr("https://a", 100, 10), now=0.0)
-    pm._handle_probe_result(state=state, pr=pr("https://b", 90, 11), now=0.0)
+    pm._handle_probe_result(pr=pr("https://a", 100, 10), now=0.0)
+    pm._handle_probe_result(pr=pr("https://b", 90, 11), now=0.0)
 
     assert pm.best_urls(10, await_first=False) == ["https://b", "https://a"]
 
 
-def test_poolmanager_replace_worst_when_significantly_better(no_pool_thread):
+def test_poolmanager_replace_worst_when_significantly_better():
     pm = rpc_pool.PoolManager(1, target_pool=2)
-    state = rpc_pool._MaintainerState()
 
-    pm._handle_probe_result(state=state, pr=pr("https://slow", 200, 10), now=0.0)
-    pm._handle_probe_result(state=state, pr=pr("https://fast", 80, 10), now=0.0)
+    pm._handle_probe_result(pr=pr("https://slow", 200, 10), now=0.0)
+    pm._handle_probe_result(pr=pr("https://fast", 80, 10), now=0.0)
     assert set(pm.best_urls(10, await_first=False)) == {"https://slow", "https://fast"}
 
-    pm._handle_probe_result(state=state, pr=pr("https://new", 50, 10), now=0.0)
+    pm._handle_probe_result(pr=pr("https://new", 50, 10), now=0.0)
 
     urls = pm.best_urls(10, await_first=False)
     assert "https://new" in urls
     assert "https://slow" not in urls
 
 
-def test_poolmanager_replace_cooldown_blocks_replacement(no_pool_thread):
+def test_poolmanager_replace_cooldown_blocks_replacement():
     pm = rpc_pool.PoolManager(1, target_pool=2)
-    state = rpc_pool._MaintainerState(next_replace_ts=100.0)
+    pm._state.next_replace_ts = 100.0
 
-    pm._handle_probe_result(state=state, pr=pr("https://slow", 200, 10), now=0.0)
-    pm._handle_probe_result(state=state, pr=pr("https://fast", 80, 10), now=0.0)
+    pm._handle_probe_result(pr=pr("https://slow", 200, 10), now=0.0)
+    pm._handle_probe_result(pr=pr("https://fast", 80, 10), now=0.0)
 
-    pm._handle_probe_result(state=state, pr=pr("https://new", 50, 10), now=0.0)
+    pm._handle_probe_result(pr=pr("https://new", 50, 10), now=0.0)
 
     urls = pm.best_urls(10, await_first=False)
     assert "https://slow" in urls
     assert "https://new" not in urls
 
 
-def test_poolmanager_eviction_cooldown_blocks_readd(no_pool_thread):
+def test_poolmanager_eviction_cooldown_blocks_readd():
     pm = rpc_pool.PoolManager(1, target_pool=2)
-    state = rpc_pool._MaintainerState()
 
-    # Put url on eviction cooldown
     pm._cooldown_until["https://a"] = 100.0
-
-    pm._handle_probe_result(state=state, pr=pr("https://a", 50, 10), now=0.0)
+    pm._handle_probe_result(pr=pr("https://a", 50, 10), now=0.0)
 
     assert pm.best_urls(10, await_first=False) == []
 
 
-def test_poolmanager_health_check_eviction_on_lag(monkeypatch: pytest.MonkeyPatch, no_pool_thread):
+def test_poolmanager_health_check_eviction_on_lag(monkeypatch: pytest.MonkeyPatch):
     pm = rpc_pool.PoolManager(1, target_pool=2, max_lag_blocks=5)
-    state = rpc_pool._MaintainerState()
 
-    pm._handle_probe_result(state=state, pr=pr("https://a", 100, 100), now=0.0)
+    pm._handle_probe_result(pr=pr("https://a", 100, 100), now=0.0)
     assert pm.best_urls(10, await_first=False) == ["https://a"]
 
-    pm._best_head = 100
+    pm._state.best_head = 100
 
     def fake_probe_one(url: str, **kwargs):
         return pr(url, 100, 80)  # lagging by 20
 
     monkeypatch.setattr(rpc_pool, "_probe_one", fake_probe_one)
 
-    # Force health check to run now
-    state.next_health_ts = -1.0
-    pm._health_check(state=state, meta=rpc_pool.ChainMeta(1, "X", ["https://a"]), now=0.0)
+    pm._state.next_health_ts = -1.0
+    pm._health_check(now=0.0)
 
     assert pm.best_urls(10, await_first=False) == []
 
 
-def test_poolmanager_health_check_eviction_on_failure(
-    monkeypatch: pytest.MonkeyPatch, no_pool_thread
-):
+def test_poolmanager_health_check_eviction_on_failure(monkeypatch: pytest.MonkeyPatch):
     pm = rpc_pool.PoolManager(1, target_pool=2)
-    state = rpc_pool._MaintainerState()
 
-    pm._handle_probe_result(state=state, pr=pr("https://a", 100, 10), now=0.0)
+    pm._handle_probe_result(pr=pr("https://a", 100, 10), now=0.0)
     assert pm.best_urls(10, await_first=False) == ["https://a"]
 
     def fake_probe_one(url: str, **kwargs):
@@ -406,18 +461,18 @@ def test_poolmanager_health_check_eviction_on_failure(
 
     monkeypatch.setattr(rpc_pool, "_probe_one", fake_probe_one)
 
-    state.next_health_ts = -1.0
-    pm._health_check(state=state, meta=rpc_pool.ChainMeta(1, "X", ["https://a"]), now=0.0)
+    pm._state.next_health_ts = -1.0
+    pm._health_check(now=0.0)
 
     assert pm.best_urls(10, await_first=False) == []
 
 
-def test_poolmanager_best_urls_empty_returns_immediately_when_not_awaiting(no_pool_thread):
+def test_poolmanager_best_urls_empty_returns_immediately_when_not_awaiting():
     pm = rpc_pool.PoolManager(1, target_pool=2)
     assert pm.best_urls(5, await_first=False) == []
 
 
-def test_poolmanager_best_urls_blocks_when_awaiting_until_ready_then_returns(no_pool_thread):
+def test_poolmanager_best_urls_blocks_when_awaiting_until_ready_then_returns():
     pm = rpc_pool.PoolManager(1, target_pool=2)
 
     result: dict[str, object] = {}
