@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
@@ -15,7 +16,7 @@ from ..env import (
 from ..errors import NoEndpoints
 from ..formatters import to_int
 from ..provider import Provider, RetryPolicy
-from ..rpc_pool import get_pool_manager
+from ..rpc_pool import acquire_pool_manager, release_pool_manager
 from .eth import Eth
 
 _DEFAULT_PRIMARY_CHAIN_ID_LOCK = threading.Lock()
@@ -93,6 +94,8 @@ class Web3:
     ) -> None:
         self.config = config or Web3Config()
         self._chain_id = int(chain_id) if chain_id is not None else None
+        self._pool_chain_id: Optional[int] = None
+        self._pool_finalizer: weakref.finalize | None = None
 
         if provider is not None:
             self.provider = provider
@@ -116,13 +119,16 @@ class Web3:
                     int(chain_id),
                     default_primary_chain_id=env_default_primary_chain_id,
                 ):
-                    pool_manager = get_pool_manager(
+                    pool_manager = acquire_pool_manager(
                         int(chain_id),
                         target_pool=target_pool,
                         max_lag_blocks=max_lag_blocks,
                         probe_timeout_s=probe_timeout_s,
                         probe_workers=probe_workers,
                     )
+            if pool_manager is not None and chain_id is not None:
+                self._pool_chain_id = int(chain_id)
+                self._pool_finalizer = weakref.finalize(self, release_pool_manager, int(chain_id))
 
             # Allow env default primary-only mode when no chain_id/endpoints/primary provided
             env_default_primary = None
@@ -169,6 +175,9 @@ class Web3:
         self.eth = Eth(self)
 
     def close(self) -> None:
+        fin = self._pool_finalizer
+        if fin is not None and fin.alive:
+            fin()
         self.provider.close()
 
     def make_request(

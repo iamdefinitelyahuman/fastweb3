@@ -176,14 +176,9 @@ def probe_urls_streaming(
 
     for u in urls:
         try:
-            # Always do safe target normalization first.
             nt = normalize_target(u)
-
-            # Only probe URL-based endpoints.
             if not is_url_target(nt):
                 continue
-
-            # Ensure URL canonicalization for probe dedupe.
             nu = normalize_url(nt)
         except Exception:
             continue
@@ -289,31 +284,16 @@ def probe_urls_streaming(
 @dataclass
 class _MaintainerState:
     best_head: int | None = None
-    rtt_by_url: dict[str, float] | None = None
-    cooldown_until: dict[str, float] | None = None
     next_health_ts: float = 0.0
     next_replace_ts: float = 0.0
-
-    def __post_init__(self) -> None:
-        if self.rtt_by_url is None:
-            self.rtt_by_url = {}
-        if self.cooldown_until is None:
-            self.cooldown_until = {}
 
 
 class PoolManager:
     """
-    Shared per-chain RPC pool intelligence.
+    Per-chain pool intelligence.
 
-    - Maintains an *active* best-first list of URLs for a given chain_id.
-    - Only active URLs are returned to callers.
-    - If best_urls(n) is called before any active URL exists, it blocks until
-      the pool becomes non-empty at least once.
-
-    Notes:
-      - Active membership and ordering is managed by a background maintainer thread.
-      - The pool manager returns URLs only; each Provider maintains its own Endpoint objects
-        and cooldown state.
+    This object does not own threads. A single global scheduler thread calls
+    `maintain()` periodically for every acquired pool manager.
     """
 
     def __init__(
@@ -324,6 +304,7 @@ class PoolManager:
         max_lag_blocks: int = 8,
         probe_timeout_s: float = 1.5,
         probe_workers: int = 32,
+        chains_registry: ChainsRegistry | None = None,
     ) -> None:
         self.chain_id = int(chain_id)
         self.target_pool = int(target_pool)
@@ -331,28 +312,23 @@ class PoolManager:
         self.probe_timeout_s = float(probe_timeout_s)
         self.probe_workers = int(probe_workers)
 
+        self._reg = chains_registry or ChainsRegistry()
+        self._meta: ChainMeta | None = None
+
         self._lock = threading.Lock()
         self._ready = threading.Event()  # latched once pool becomes non-empty
 
-        # Active set best-first, plus quick membership.
         self._active: list[str] = []
         self._active_set: set[str] = set()
 
-        # Perf/health data for scoring.
-        self._best_head: int | None = None
         self._rtt_by_url: dict[str, float] = {}
         self._cooldown_until: dict[str, float] = {}
+        self._state = _MaintainerState(next_health_ts=time.time() + POOL_HEALTH_INTERVAL_S)
 
-        # Start the maintainer thread immediately.
-        threading.Thread(target=self._maintain, daemon=True).start()
+        # Scheduler-driven: run an epoch immediately.
+        self._next_epoch_ts: float = 0.0
 
     def best_urls(self, n: int, await_first: bool) -> list[str]:
-        """
-        Return up to n URLs from the active set, best-first.
-
-        If the active set is empty, block until the pool becomes non-empty
-        at least once.
-        """
         if n <= 0:
             return []
 
@@ -360,17 +336,39 @@ class PoolManager:
             if self._active:
                 return list(self._active[:n])
 
-        # No active URLs yet: block until at least one is available.
         if await_first:
             self._ready.wait()
 
         with self._lock:
             return list(self._active[:n])
 
-    # --- internal maintainer ---
+    def maintain(self, *, now: float | None = None) -> None:
+        t = time.time() if now is None else float(now)
+
+        if self._meta is None:
+            self._meta = self._reg.get(self.chain_id)
+
+        self._health_check(now=t)
+
+        if t < self._next_epoch_ts:
+            return
+
+        for pr in probe_urls_streaming(
+            self._meta.rpc,
+            expected_chain_id=self.chain_id,
+            timeout_s=self.probe_timeout_s,
+            max_workers=self.probe_workers,
+        ):
+            now2 = time.time()
+            self._health_check(now=now2)
+            self._handle_probe_result(pr=pr, now=now2)
+
+        self._ready.set()
+        self._next_epoch_ts = time.time() + POOL_EPOCH_SLEEP_S
+
+    # --- internals ---
 
     def _promote_active(self, url: str) -> None:
-        """Ensure url is in active set (best-first ordering handled elsewhere)."""
         with self._lock:
             if url in self._active_set:
                 return
@@ -390,18 +388,19 @@ class PoolManager:
                 pass
 
     def _sort_active_by_rtt(self) -> None:
-        # best-first = lowest RTT
         with self._lock:
             self._active.sort(key=lambda u: self._rtt_by_url.get(u, float("inf")))
 
-    def _health_check(self, *, state: _MaintainerState, meta: ChainMeta, now: float) -> None:
-        if now < state.next_health_ts:
+    def _health_check(self, *, now: float) -> None:
+        st = self._state
+        if now < st.next_health_ts:
             return
-        state.next_health_ts = now + POOL_HEALTH_INTERVAL_S
+        st.next_health_ts = now + POOL_HEALTH_INTERVAL_S
 
-        # Snapshot active list to probe without holding lock during network I/O.
         with self._lock:
             active = list(self._active)
+
+        best_head = st.best_head
 
         for u in active:
             if self._cooldown_until.get(u, 0.0) > now:
@@ -413,51 +412,45 @@ class PoolManager:
                     timeout_s=min(1.0, self.probe_timeout_s),
                 )
                 self._rtt_by_url[u] = pr.rtt_ms
-                self._best_head = (
-                    pr.head if self._best_head is None else max(self._best_head, pr.head)
-                )
+                best_head = pr.head if best_head is None else max(best_head, pr.head)
 
-                if (
-                    self._best_head is not None
-                    and (self._best_head - pr.head) > self.max_lag_blocks
-                ):
+                if best_head is not None and (best_head - pr.head) > self.max_lag_blocks:
                     self._remove_active(u)
                     self._cooldown_until[u] = now + POOL_EVICTION_COOLDOWN_S
             except Exception:
                 self._remove_active(u)
                 self._cooldown_until[u] = now + POOL_EVICTION_COOLDOWN_S
 
+        st.best_head = best_head
         self._sort_active_by_rtt()
 
-    def _handle_probe_result(self, *, state: _MaintainerState, pr: ProbeResult, now: float) -> None:
+    def _handle_probe_result(self, *, pr: ProbeResult, now: float) -> None:
         if self._cooldown_until.get(pr.url, 0.0) > now:
             return
 
-        self._best_head = pr.head if self._best_head is None else max(self._best_head, pr.head)
+        st = self._state
+        st.best_head = pr.head if st.best_head is None else max(st.best_head, pr.head)
 
-        if self._best_head is not None and (self._best_head - pr.head) > self.max_lag_blocks:
+        if st.best_head is not None and (st.best_head - pr.head) > self.max_lag_blocks:
             return
 
         self._rtt_by_url[pr.url] = pr.rtt_ms
 
         with self._lock:
             active_count = len(self._active)
-            active_set = set(self._active_set)
+            is_active = pr.url in self._active_set
             active_urls = list(self._active)
 
-        if pr.url in active_set:
-            # Update RTT and re-sort
+        if is_active:
             self._sort_active_by_rtt()
             return
 
-        # If we have room, just promote.
         if active_count < self.target_pool:
             self._promote_active(pr.url)
             self._sort_active_by_rtt()
             return
 
-        # Replace worst active if significantly better and not too soon.
-        if now < state.next_replace_ts:
+        if now < st.next_replace_ts:
             return
 
         def rtt(u: str) -> float:
@@ -475,41 +468,61 @@ class PoolManager:
             self._promote_active(pr.url)
             self._sort_active_by_rtt()
 
-            state.next_replace_ts = now + POOL_REPLACE_COOLDOWN_S
-
-    def _maintain(self) -> None:
-        reg = ChainsRegistry()
-        meta = reg.get(self.chain_id)
-
-        state = _MaintainerState(next_health_ts=time.time() + POOL_HEALTH_INTERVAL_S)
-
-        while True:
-            for pr in probe_urls_streaming(
-                meta.rpc,
-                expected_chain_id=self.chain_id,
-                timeout_s=self.probe_timeout_s,
-                max_workers=self.probe_workers,
-            ):
-                now = time.time()
-                self._health_check(state=state, meta=meta, now=now)
-                self._handle_probe_result(state=state, pr=pr, now=now)
-
-            self._ready.set()
-
-            sleep_end = time.time() + POOL_EPOCH_SLEEP_S
-            while time.time() < sleep_end:
-                now = time.time()
-                self._health_check(state=state, meta=meta, now=now)
-                time.sleep(5)
+            st.next_replace_ts = now + POOL_REPLACE_COOLDOWN_S
 
 
-# --- singleton manager registry ---
+# --- global scheduler + registry ---
 
 _pool_lock = threading.Lock()
 _pool_by_chain: dict[int, PoolManager] = {}
+_pool_refcount: dict[int, int] = {}
+
+_sched_thread: threading.Thread | None = None
+_sched_stop = threading.Event()
 
 
-def get_pool_manager(
+def _scheduler_loop() -> None:
+    while not _sched_stop.is_set():
+        with _pool_lock:
+            managers = list(_pool_by_chain.values())
+
+        now = time.time()
+        for pm in managers:
+            try:
+                pm.maintain(now=now)
+            except Exception:
+                continue
+
+        _sched_stop.wait(timeout=5.0)
+
+
+def _ensure_scheduler_running() -> None:
+    global _sched_thread
+    if _sched_thread is not None and _sched_thread.is_alive():
+        return
+    _sched_stop.clear()
+    _sched_thread = threading.Thread(target=_scheduler_loop, daemon=True)
+    _sched_thread.start()
+
+
+def _stop_scheduler_if_idle() -> None:
+    global _sched_thread
+    with _pool_lock:
+        any_active = any(v > 0 for v in _pool_refcount.values())
+    if any_active:
+        return
+
+    t = _sched_thread
+    if t is None:
+        return
+
+    _sched_stop.set()
+    if threading.current_thread() is not t:
+        t.join(timeout=1.0)
+    _sched_thread = None
+
+
+def acquire_pool_manager(
     chain_id: int,
     *,
     target_pool: int = 6,
@@ -517,21 +530,30 @@ def get_pool_manager(
     probe_timeout_s: float = 1.5,
     probe_workers: int = 32,
 ) -> PoolManager:
-    """
-    Get (or create) a shared PoolManager for chain_id.
-    Starts the background maintainer once per chain.
-    """
     cid = int(chain_id)
     with _pool_lock:
         pm = _pool_by_chain.get(cid)
-        if pm is not None:
-            return pm
-        pm = PoolManager(
-            cid,
-            target_pool=target_pool,
-            max_lag_blocks=max_lag_blocks,
-            probe_timeout_s=probe_timeout_s,
-            probe_workers=probe_workers,
-        )
-        _pool_by_chain[cid] = pm
+        if pm is None:
+            pm = PoolManager(
+                cid,
+                target_pool=target_pool,
+                max_lag_blocks=max_lag_blocks,
+                probe_timeout_s=probe_timeout_s,
+                probe_workers=probe_workers,
+            )
+            _pool_by_chain[cid] = pm
+
+        _pool_refcount[cid] = _pool_refcount.get(cid, 0) + 1
+        _ensure_scheduler_running()
         return pm
+
+
+def release_pool_manager(chain_id: int) -> None:
+    cid = int(chain_id)
+    with _pool_lock:
+        cur = _pool_refcount.get(cid, 0)
+        if cur <= 0:
+            return
+        _pool_refcount[cid] = cur - 1
+
+    _stop_scheduler_if_idle()
