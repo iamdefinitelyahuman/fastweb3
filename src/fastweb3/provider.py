@@ -16,7 +16,7 @@ from .errors import (
 )
 from .formatters import to_int
 from .rpc_pool import PoolManager
-from .utils import normalize_url
+from .utils import normalize_target
 
 
 @dataclass(frozen=True)
@@ -46,7 +46,7 @@ class _EndpointState:
     # Cooldown due to stale tip observation
     tip_cooldown_until: float = 0.0
 
-    # Last tip observed from this endpoint URL (LB backends may vary)
+    # Last tip observed from this endpoint target (LB backends may vary)
     last_tip: int | None = None
 
 
@@ -63,7 +63,7 @@ class Provider:
 
     Pool routing:
       candidates = internal_pool + pool_manager.best_urls(needed)
-      where needed fills up to desired_pool_size (option B)
+      where needed fills up to desired_pool_size
 
     Tip tracking:
       - Every pooled request is executed as a batch: [eth_blockNumber, userCall]
@@ -77,12 +77,11 @@ class Provider:
       - If freshness rejects, rotate endpoints preferring highest last_tip, backoff briefly, retry
     """
 
-    # Bound how long we spin waiting for an endpoint to satisfy strict freshness.
     _FRESHNESS_WAIT_CAP_SECONDS: float = 5.0
 
     def __init__(
         self,
-        internal_urls: list[str] | None = None,
+        internal_endpoints: Sequence[str] | None = None,
         *,
         pool_manager: PoolManager | None = None,
         desired_pool_size: int = 6,
@@ -95,7 +94,7 @@ class Provider:
         if pool_manager is None:
             desired_pool_size = 0
         self.desired_pool_size = max(
-            len(internal_urls or []),
+            len(list(internal_endpoints or [])),
             max(0, int(desired_pool_size)),
         )
 
@@ -103,12 +102,12 @@ class Provider:
         self.retry_policy_pool = retry_policy_pool or RetryPolicy(max_attempts=3)
         self.is_retryable_exc = is_retryable_exc
 
-        # Internal pool URLs (normalized, insertion-ordered) + membership set.
-        self._internal_urls: list[str] = []
+        # Internal pool endpoint targets (normalized, insertion-ordered) + membership set.
+        self._internal_targets: list[str] = []
         self._internal_seen: set[str] = set()
 
-        # Endpoint cache for any URL we might touch (internal or manager).
-        self._eps_by_url: dict[str, Endpoint] = {}
+        # Endpoint cache for any target we might touch (internal or manager).
+        self._eps_by_target: dict[str, Endpoint] = {}
         self._state: dict[Endpoint, _EndpointState] = {}
 
         # Primary is a specific Endpoint instance (stable identity), or None.
@@ -117,21 +116,21 @@ class Provider:
         # Best (highest) chain tip we've observed across any endpoint.
         self._best_tip: int | None = None
 
-        for u in internal_urls or []:
-            self.add_url(u, priority=False)
+        for t in list(internal_endpoints or []):
+            self.add_endpoint(t, priority=False)
 
     # ----------------------------
     # endpoint cache helpers
     # ----------------------------
 
-    def _get_or_create_endpoint(self, url: str) -> Endpoint:
-        nu = normalize_url(url)
+    def _get_or_create_endpoint(self, target: str) -> Endpoint:
+        nt = normalize_target(target)
         with self._lock:
-            ep = self._eps_by_url.get(nu)
+            ep = self._eps_by_target.get(nt)
             if ep is not None:
                 return ep
-            ep = Endpoint(nu)
-            self._eps_by_url[nu] = ep
+            ep = Endpoint(nt)
+            self._eps_by_target[nt] = ep
             self._state[ep] = _EndpointState()
             return ep
 
@@ -139,14 +138,13 @@ class Provider:
     # primary management
     # ----------------------------
 
-    def set_primary(self, url: str) -> None:
+    def set_primary(self, target: str) -> None:
         """
-        Set the primary endpoint to `url`.
+        Set the primary endpoint to `target`.
 
-        Note: this does NOT add the URL to the internal pool.
-        (Web3 can choose to do that in primary-only mode.)
+        Note: this does NOT add the target to the internal pool.
         """
-        ep = self._get_or_create_endpoint(url)
+        ep = self._get_or_create_endpoint(target)
         with self._lock:
             self._primary = ep
 
@@ -154,9 +152,9 @@ class Provider:
         with self._lock:
             self._primary = None
 
-    def primary_url(self) -> str | None:
+    def primary_endpoint(self) -> str | None:
         with self._lock:
-            return self._primary.url if self._primary is not None else None  # type: ignore[attr-defined]
+            return self._primary.target if self._primary is not None else None
 
     def has_primary(self) -> bool:
         with self._lock:
@@ -172,65 +170,63 @@ class Provider:
     # internal pool management
     # ----------------------------
 
-    def add_url(self, url: str, *, priority: bool = False) -> None:
+    def add_endpoint(self, target: str, *, priority: bool = False) -> None:
         """
-        Add a URL to the internal pool (per-instance, permanent).
-        Deduped by normalized URL.
+        Add an endpoint target to the internal pool (per-instance, permanent).
+        Deduped by normalized target.
         """
-        nu = normalize_url(url)
+        nt = normalize_target(target)
         with self._lock:
-            if nu in self._internal_seen:
+            if nt in self._internal_seen:
                 return
-            self._internal_seen.add(nu)
+            self._internal_seen.add(nt)
             if priority:
-                self._internal_urls.insert(0, nu)
+                self._internal_targets.insert(0, nt)
             else:
-                self._internal_urls.append(nu)
+                self._internal_targets.append(nt)
 
-        # Ensure Endpoint exists in cache (outside lock is fine but keep simple)
-        self._get_or_create_endpoint(nu)
+        self._get_or_create_endpoint(nt)
 
-    def remove_url(self, url: str) -> None:
+    def remove_endpoint(self, target: str) -> None:
         """
-        Remove a URL from the internal pool. No-op if missing.
+        Remove an endpoint target from the internal pool. No-op if missing.
 
         Does not delete the Endpoint from cache (it may be referenced by primary or manager).
-        If the removed URL is the primary, primary is cleared.
+        If the removed target is the primary, primary is cleared.
         """
-        nu = normalize_url(url)
+        nt = normalize_target(target)
         with self._lock:
-            if nu not in self._internal_seen:
+            if nt not in self._internal_seen:
                 return
-            self._internal_seen.remove(nu)
+            self._internal_seen.remove(nt)
             try:
-                self._internal_urls.remove(nu)
+                self._internal_targets.remove(nt)
             except ValueError:
                 pass
 
-            # If primary points at this endpoint, clear it.
-            ep = self._eps_by_url.get(nu)
+            ep = self._eps_by_target.get(nt)
             if ep is not None and self._primary is ep:
                 self._primary = None
 
-    def urls(self) -> list[str]:
-        """Return internal pool URLs (snapshot)."""
+    def endpoints(self) -> list[str]:
+        """Return internal pool endpoint targets (snapshot)."""
         with self._lock:
-            return list(self._internal_urls)
+            return list(self._internal_targets)
 
     def endpoint_count(self) -> int:
         """Count of internal pool endpoints (not including manager candidates)."""
         with self._lock:
-            return len(self._internal_urls)
+            return len(self._internal_targets)
 
     def close(self) -> None:
         """
         Close all cached Endpoint transports (internal + manager + primary).
         """
         with self._lock:
-            eps = list(self._eps_by_url.values())
-            self._eps_by_url.clear()
+            eps = list(self._eps_by_target.values())
+            self._eps_by_target.clear()
             self._state.clear()
-            self._internal_urls.clear()
+            self._internal_targets.clear()
             self._internal_seen.clear()
             self._primary = None
             self._best_tip = None
@@ -243,12 +239,6 @@ class Provider:
     # ----------------------------
 
     def _cooldown_seconds(self, exc: Exception, failures: int) -> float:
-        """
-        Decide how long to avoid an endpoint after a failure.
-
-        - Transport errors get exponential-ish backoff (capped).
-        - HTTP 429 gets a longer cooldown (also capped).
-        """
         base = 0.25 * (2 ** min(max(failures, 1) - 1, 6))
         base_cap = 30.0
 
@@ -269,7 +259,6 @@ class Provider:
             st.error_cooldown_until = now + self._cooldown_seconds(exc, st.failures)
 
     def _mark_success(self, ep: Endpoint) -> None:
-        # Reset *error* failures/cooldown. Do NOT clear tip demotion.
         with self._lock:
             st = self._state.get(ep)
             if st is None:
@@ -283,11 +272,6 @@ class Provider:
     # ----------------------------
 
     def _tip_cooldown_seconds(self, lag_blocks: int) -> float:
-        """
-        Cooldown for endpoints that report a stale tip vs best known.
-
-        Simple, bounded "temporary demotion", not a ban.
-        """
         return min(30.0, 0.5 + 0.25 * max(0, int(lag_blocks)))
 
     def _update_tip_and_maybe_demote(self, ep: Endpoint, returned_tip: int) -> None:
@@ -312,7 +296,6 @@ class Provider:
                 )
 
     def _best_tip_snapshot(self) -> int:
-        # Used as required_tip at attempt start (concurrency-safe monotonic guarantee).
         with self._lock:
             return int(self._best_tip or 0)
 
@@ -328,10 +311,6 @@ class Provider:
     # ----------------------------
 
     def _eligible_endpoints(self, eps: list[Endpoint]) -> list[Endpoint]:
-        """
-        Filter endpoints that are not currently in cooldown.
-        If all are in cooldown, return the full list (try anyway).
-        """
         now = time.time()
         with self._lock:
             eligible: list[Endpoint] = []
@@ -354,31 +333,30 @@ class Provider:
         Deduped and ordered (internal first, then manager).
         """
         with self._lock:
-            internal = list(self._internal_urls)
+            internal = list(self._internal_targets)
 
         needed = max(0, self.desired_pool_size - len(internal))
-        manager_urls: list[str] = []
+        manager_targets: list[str] = []
         if needed > 0 and self.pool_manager is not None:
             await_first = not (internal or self._primary)
-            manager_urls = self.pool_manager.best_urls(needed, await_first)
+            manager_targets = self.pool_manager.best_urls(needed, await_first)
 
-        # Dedup preserve order by normalized URL
         seen: set[str] = set()
         merged: list[str] = []
 
-        for u in internal + manager_urls:
-            nu = normalize_url(u)
-            if nu in seen:
+        for t in internal + manager_targets:
+            nt = normalize_target(t)
+            if nt in seen:
                 continue
-            seen.add(nu)
-            merged.append(nu)
+            seen.add(nt)
+            merged.append(nt)
 
         if not merged:
             if self._primary is not None:
                 return [self._primary]
             raise NoEndpoints("No endpoints available")
 
-        return [self._get_or_create_endpoint(u) for u in merged]
+        return [self._get_or_create_endpoint(t) for t in merged]
 
     # ----------------------------
     # attempt (single call)
@@ -392,24 +370,10 @@ class Provider:
         formatter: Formatter | None,
         freshness: Callable[[Any, int, int], bool] | None,
     ) -> tuple[Any | None, Exception | None]:
-        """
-        Attempt the call once on `ep`.
-
-        Returns: (value, exc)
-          - value is non-None on success
-          - exc is non-None on retryable failure or freshness rejection
-          - raises non-retryable errors, including RPCError (always bubbles)
-
-        Notes:
-          - Freshness rejection returns _FreshnessUnmet (do NOT mark_failure).
-          - Transport failures (is_retryable_exc) mark_failure.
-          - required_tip is snapshotted at attempt start (concurrency-safe).
-        """
         required_tip = self._best_tip_snapshot()
 
         try:
             if self.desired_pool_size == 0:
-                # No tip probing in primary-only mode.
                 result = ep.request(method, params, formatter)
                 self._mark_success(ep)
                 return result, None
@@ -434,7 +398,6 @@ class Provider:
             return None, _FreshnessUnmet("Freshness unmet")
 
         except RPCError:
-            # Always bubble RPCError immediately.
             raise
 
         except Exception as exc:
@@ -452,55 +415,30 @@ class Provider:
         ep: Endpoint,
         calls: list[_BatchCall],
     ) -> tuple[list[Any | RPCError] | None, Exception | None]:
-        """
-        Attempt the batch once on `ep`.
-
-        Returns: (values, exc)
-          - values is a list aligned to `calls` (RPCError in-position) on success
-          - exc is non-None on retryable failure or freshness rejection
-          - raises non-retryable exceptions
-
-        Semantics:
-          - TransportError (and other retryable exceptions) are returned as exc and mark_failure.
-          - Internal tip probe RPCError is treated as an attempt failure (rotate).
-          - Per-call RPCError results are returned in-position (not raised).
-          - If any per-call freshness rejects, the entire batch is rejected and retried.
-        """
         if not calls:
             return [], None
 
-        # If any call requests freshness, we need a tip probe attempt.
         wants_freshness = any(c.freshness is not None for c in calls)
-
         required_tip = self._best_tip_snapshot()
 
         try:
             if self.desired_pool_size == 0:
-                # Primary-only mode: no tip probing, thus freshness is effectively ignored.
-                resp = ep.request_batch(
-                    *[(c.method, c.params, c.formatter) for c in calls]  # type: ignore[arg-type]
-                )
+                resp = ep.request_batch(*[(c.method, c.params, c.formatter) for c in calls])  # type: ignore[arg-type]
                 self._mark_success(ep)
-                # resp already has RPCError in-position
                 return resp, None
 
-            # Pool mode: prepend tip probe.
             resp_all = ep.request_batch(
                 ("eth_blockNumber", (), to_int),
                 *[(c.method, c.params, c.formatter) for c in calls],  # type: ignore[arg-type]
             )
 
             if not resp_all:
-                # Should not happen (we always include tip probe + at least one call),
-                # but treat as a retryable-ish failure to be safe.
                 raise TransportError("Empty batch response")
 
             tip_item = resp_all[0]
             user_out = resp_all[1:]
 
-            # Tip probe must succeed for freshness/tip tracking.
             if isinstance(tip_item, RPCError):
-                # Treat as an attempt failure (rotate endpoints). Mark as failure for cooldown.
                 self._mark_failure(ep, tip_item)
                 return None, tip_item
 
@@ -508,7 +446,6 @@ class Provider:
             self._update_tip_and_maybe_demote(ep, tip)
             self._mark_success(ep)
 
-            # Freshness enforcement: if any freshness function rejects, reject whole batch.
             if wants_freshness:
                 for i, call in enumerate(calls):
                     if call.freshness is None:
@@ -540,17 +477,6 @@ class Provider:
         formatter: Formatter | None = None,
         freshness: Callable[[Any, int, int], bool] | None = None,
     ) -> Any:
-        """
-        Perform a JSON-RPC request routed either to the merged pool or to the primary.
-
-        - route="pool": RR+retry across (internal_pool + pool_manager best URLs)
-        - route="primary": primary-only (raises if primary unset)
-
-        Freshness enforcement (optional):
-          freshness(response, required_tip, returned_tip) -> bool
-
-        required_tip is a snapshot of provider best_tip at start of an attempt (concurrency-safe).
-        """
         if route not in ("pool", "primary"):
             raise ValueError("route must be 'pool' or 'primary'")
 
@@ -558,8 +484,6 @@ class Provider:
 
         if route == "primary":
             ep = self._get_primary()
-
-            # In desired_pool_size == 0 mode, freshness is effectively ignored (no returned tip).
             deadline = time.time() + self._FRESHNESS_WAIT_CAP_SECONDS if freshness else 0.0
             last_exc: Exception | None = None
 
@@ -575,7 +499,6 @@ class Provider:
                 last_exc = exc
                 raise AllEndpointsFailed(last_exc) from last_exc
 
-        # route == "pool"
         candidates = self._pool_candidates()
         eps = self._eligible_endpoints(candidates)
 
@@ -586,7 +509,6 @@ class Provider:
         rr_ep = eps[start]
         max_exc_attempts = min(max(1, policy.max_attempts), len(eps))
 
-        # No freshness: bounded attempts across endpoints.
         if freshness is None:
             last_exc: Exception | None = None
             exc_attempts = 0
@@ -606,12 +528,10 @@ class Provider:
 
             raise AllEndpointsFailed(last_exc)
 
-        # Freshness requested: RR once, then prefer highest last_tip, repeat with backoff until cap.
         deadline = time.time() + self._FRESHNESS_WAIT_CAP_SECONDS
         last_exc: Exception | None = None
 
         while True:
-            # Pass order: RR endpoint first, then the rest by last_tip desc.
             sorted_by_last_tip = sorted(list(eps), key=self._last_tip, reverse=True)
             ordered = [rr_ep] + [ep for ep in sorted_by_last_tip if ep is not rr_ep]
 
@@ -626,7 +546,6 @@ class Provider:
                 if isinstance(exc, _FreshnessUnmet):
                     continue
 
-                # Transport-ish retryable exception: count against budget for this pass.
                 exc_attempts += 1
                 if exc_attempts >= max_exc_attempts:
                     break
@@ -636,7 +555,6 @@ class Provider:
 
             time.sleep(policy.backoff_seconds)
 
-            # Recompute eligibility each pass.
             eps = self._eligible_endpoints(candidates)
             if not eps:
                 raise NoEndpoints("No endpoints available")
@@ -656,23 +574,6 @@ class Provider:
         *,
         route: str = "pool",
     ) -> list[Any | RPCError]:
-        """
-        Perform a JSON-RPC batch request routed either to the merged pool or to the primary.
-
-        Each call tuple is:
-          (method, params, formatter=None, freshness=None)
-
-        Return value:
-          List aligned to the call order, each element is either:
-            - the (optionally formatted) result value, or
-            - an RPCError instance if that specific call returned a JSON-RPC error object.
-
-        Raises:
-          - TransportError (and other retryable/non-retryable exceptions) via routing logic:
-              * primary route wraps failure in AllEndpointsFailed
-              * pool route may raise AllEndpointsFailed / NoEndpoints
-          - RPCMalformedResponse bubbles from Endpoint.request_batch (batch-level malformed shapes)
-        """
         if route not in ("pool", "primary"):
             raise ValueError("route must be 'pool' or 'primary'")
 
@@ -699,7 +600,6 @@ class Provider:
                     "or (method, params, formatter, freshness)"
                 )
 
-            # Normalize params to list/tuple (Endpoint will list() it anyway)
             if not isinstance(params, (list, tuple)):
                 raise TypeError("params must be a list or tuple")
 
@@ -717,15 +617,12 @@ class Provider:
 
         if route == "primary":
             ep = self._get_primary()
-
-            # In desired_pool_size == 0 mode, freshness is effectively ignored (no returned tip).
             deadline = time.time() + self._FRESHNESS_WAIT_CAP_SECONDS if wants_freshness else 0.0
             last_exc: Exception | None = None
 
             while True:
                 values, exc = self._attempt_batch(ep, parsed)
                 if exc is None:
-                    # values is non-None here
                     return list(values or [])
 
                 if isinstance(exc, _FreshnessUnmet) and time.time() < deadline:
@@ -735,7 +632,6 @@ class Provider:
                 last_exc = exc
                 raise AllEndpointsFailed(last_exc) from last_exc
 
-        # route == "pool"
         candidates = self._pool_candidates()
         eps = self._eligible_endpoints(candidates)
 
@@ -746,7 +642,6 @@ class Provider:
         rr_ep = eps[start]
         max_exc_attempts = min(max(1, policy.max_attempts), len(eps))
 
-        # No freshness: bounded attempts across endpoints.
         if not wants_freshness:
             last_exc: Exception | None = None
             exc_attempts = 0
@@ -766,7 +661,6 @@ class Provider:
 
             raise AllEndpointsFailed(last_exc)
 
-        # Freshness requested: RR once, then prefer highest last_tip, repeat with backoff until cap.
         deadline = time.time() + self._FRESHNESS_WAIT_CAP_SECONDS
         last_exc: Exception | None = None
 
@@ -785,7 +679,6 @@ class Provider:
                 if isinstance(exc, _FreshnessUnmet):
                     continue
 
-                # Count non-freshness failures against this pass' budget
                 exc_attempts += 1
                 if exc_attempts >= max_exc_attempts:
                     break

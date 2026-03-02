@@ -11,14 +11,13 @@ from typing import Iterator
 import httpx
 
 from .transport import HTTPTransportConfig, WSSTransportConfig, make_transport
-from .utils import normalize_url
+from .utils import is_url_target, normalize_target, normalize_url
 
 CHAINS_URL = (
     "https://raw.githubusercontent.com/ethereum-lists/chains/master/_data/chains/"
     "eip155-{chain_id}.json"
 )
 
-# --- pool tuning ---
 POOL_EPOCH_SLEEP_S = 15 * 60
 POOL_HEALTH_INTERVAL_S = 60.0
 POOL_IMPROVE_FRACTION = 0.20
@@ -171,22 +170,24 @@ def probe_urls_streaming(
 ) -> Iterator[ProbeResult]:
     """
     Probe candidate RPC URLs and stream back successes as they arrive.
-
-    Contract (strict):
-      - endpoint must accept JSON-RPC batch payload (array) and return an array
-      - must answer eth_chainId == expected_chain_id
-      - must answer eth_blockNumber (parsed as int)
-      - records RTT
     """
-    # Dedup + normalize upfront so we don't waste probe workers.
     seen: set[str] = set()
     candidates: list[str] = []
 
     for u in urls:
         try:
-            nu = normalize_url(u)
+            # Always do safe target normalization first.
+            nt = normalize_target(u)
+
+            # Only probe URL-based endpoints.
+            if not is_url_target(nt):
+                continue
+
+            # Ensure URL canonicalization for probe dedupe.
+            nu = normalize_url(nt)
         except Exception:
             continue
+
         if not _is_probeable(nu):
             continue
         if nu in seen:

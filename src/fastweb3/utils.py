@@ -1,3 +1,4 @@
+# src/fastweb3/utils.py
 import os
 import re
 from urllib.parse import urlsplit, urlunsplit
@@ -23,10 +24,35 @@ def _expand_env_vars(s: str) -> str:
     return _ENV_VAR_RE.sub(repl, s)
 
 
+def is_url_target(target: str) -> bool:
+    """
+    Return True if `target` is an HTTP(S)/WS(S) URL-like endpoint target.
+    This is a deliberately simple prefix check to avoid mis-parsing IPC paths.
+    """
+    t = target.strip().lower()
+    return t.startswith(("http://", "https://", "ws://", "wss://"))
+
+
+def normalize_target(target: str) -> str:
+    """
+    Normalize an endpoint *target* for deduplication.
+
+    - expand env vars ($FOO / ${FOO})
+    - strip whitespace
+    - if the target is a URL (http/https/ws/wss), apply normalize_url()
+    - otherwise return the expanded/stripped target unchanged (IPC paths, etc.)
+    """
+    t = _expand_env_vars(target).strip()
+    if is_url_target(t):
+        return normalize_url(t)
+    return t
+
+
 def normalize_url(url: str) -> str:
     """
     Normalize URLs for deduplication.
 
+    URL-specific normalization:
     - expand env vars ($FOO / ${FOO})
     - strip whitespace
     - lowercase scheme + host

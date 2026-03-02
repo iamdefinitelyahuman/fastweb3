@@ -1,4 +1,3 @@
-# src/fastweb3/web3/web3.py
 from __future__ import annotations
 
 import threading
@@ -32,8 +31,6 @@ class Web3Config:
     strict: bool = True
     desired_pool_size: int = 6
     retry_policy_pool: RetryPolicy = RetryPolicy(max_attempts=3, backoff_seconds=0.05)
-    # later: batching/hedging/quorum knobs
-    # later: output formatting mode knobs (raw vs normalized)
 
 
 def _get_default_primary_chain_id_once() -> Optional[int]:
@@ -50,13 +47,13 @@ def _get_default_primary_chain_id_once() -> Optional[int]:
         if _DEFAULT_PRIMARY_CHAIN_ID_SET:
             return _DEFAULT_PRIMARY_CHAIN_ID
 
-        url = get_default_primary_endpoint()
-        if not url:
+        target = get_default_primary_endpoint()
+        if not target:
             _DEFAULT_PRIMARY_CHAIN_ID = None
             _DEFAULT_PRIMARY_CHAIN_ID_SET = True
             return None
 
-        ep = Endpoint(url)
+        ep = Endpoint(target)
         try:
             _DEFAULT_PRIMARY_CHAIN_ID = ep.request("eth_chainId", (), formatter=to_int)
         except Exception:
@@ -89,7 +86,6 @@ class Web3:
         primary_endpoint: Optional[str] = None,
         provider: Optional[Provider] = None,
         config: Optional[Web3Config] = None,
-        # pool manager tuning (only used when chain_id is provided)
         target_pool: int = 6,
         max_lag_blocks: int = 8,
         probe_timeout_s: float = 1.5,
@@ -100,9 +96,8 @@ class Web3:
 
         if provider is not None:
             self.provider = provider
-
         else:
-            internal_urls = list(endpoints or [])
+            internal_endpoints = list(endpoints or [])
 
             # If we're in env split mode, we need to know which chain the *global*
             # FASTWEB3_PRIMARY_ENDPOINT is on, so we can disable pool only there.
@@ -136,7 +131,7 @@ class Web3:
 
             if (
                 chain_id is None
-                and not internal_urls
+                and not internal_endpoints
                 and primary_endpoint is None
                 and env_default_primary is None
             ):
@@ -151,13 +146,12 @@ class Web3:
                 )
 
             self.provider = Provider(
-                internal_urls,
+                internal_endpoints,
                 pool_manager=pool_manager,
                 desired_pool_size=self.config.desired_pool_size,
                 retry_policy_pool=self.config.retry_policy_pool,
             )
 
-            # Apply env primary if caller didn't pass one explicitly
             if primary_endpoint is None:
                 if chain_id is not None:
                     env_primary_for_chain = resolve_primary_endpoint(
@@ -169,11 +163,9 @@ class Web3:
                 elif env_default_primary is not None:
                     self.provider.set_primary(env_default_primary)
 
-        # Explicit primary always wins (over provider/env)
         if primary_endpoint is not None:
             self.provider.set_primary(primary_endpoint)
 
-        # Namespaces
         self.eth = Eth(self)
 
     def close(self) -> None:
@@ -209,13 +201,7 @@ class Web3:
             )
             h.set_value(raw)
 
-        # ref_func unused for now (later: batching flush barrier)
         return deferred_response(bg_func, format_func=formatter, ref_func=None)
-
-    # ---- scaffolding for later batching ----
-
-    def pin(self, *, route: str = "pool"):
-        return self.provider.pin(route=route)
 
     def batch(self):
         raise NotImplementedError("Batching not implemented yet")
