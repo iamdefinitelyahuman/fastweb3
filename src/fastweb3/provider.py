@@ -15,6 +15,7 @@ from .errors import (
     TransportError,
 )
 from .formatters import to_int
+from .middleware import MiddlewareContext, ProviderMiddleware
 from .rpc_pool import PoolManager
 from .utils import normalize_target
 
@@ -91,6 +92,9 @@ class Provider:
         self._lock = threading.Lock()
         self._rr = 0
 
+        # Per-provider middleware stack.
+        self._middlewares: list[ProviderMiddleware] = []
+
         if pool_manager is None:
             desired_pool_size = 0
         self.desired_pool_size = max(
@@ -118,6 +122,66 @@ class Provider:
 
         for t in list(internal_endpoints or []):
             self.add_endpoint(t, priority=False)
+
+    # ----------------------------
+    # middleware
+    # ----------------------------
+
+    def add_middleware(self, mw: ProviderMiddleware, *, prepend: bool = False) -> None:
+        with self._lock:
+            if prepend:
+                self._middlewares.insert(0, mw)
+            else:
+                self._middlewares.append(mw)
+
+    def _run_middlewares_before(
+        self, ctx: MiddlewareContext, calls: list[_BatchCall]
+    ) -> list[_BatchCall]:
+        with self._lock:
+            mws = list(self._middlewares)
+        for mw in mws:
+            fn = getattr(mw, "before_request", None)
+            if fn is not None:
+                calls = fn(ctx, calls)
+        return calls
+
+    def _run_middlewares_after(
+        self,
+        ctx: MiddlewareContext,
+        calls: list[_BatchCall],
+        results: list[Any | RPCError],
+    ) -> list[Any | RPCError]:
+        with self._lock:
+            mws = list(self._middlewares)
+        for mw in reversed(mws):
+            fn = getattr(mw, "after_request", None)
+            if fn is not None:
+                results = fn(ctx, calls, results)
+        return results
+
+    def _run_middlewares_on_exception(
+        self,
+        ctx: MiddlewareContext,
+        calls: list[_BatchCall],
+        exc: Exception,
+    ) -> list[Any | RPCError] | Exception:
+        with self._lock:
+            mws = list(self._middlewares)
+        out: list[Any | RPCError] | Exception = exc
+        for mw in reversed(mws):
+            fn = getattr(mw, "on_exception", None)
+            if fn is None:
+                continue
+
+            # Only give the hook a chance if we're still in "exception mode".
+            if not isinstance(out, Exception):
+                break
+
+            try:
+                out = fn(ctx, calls, out)
+            except Exception as e:
+                out = e
+        return out
 
     # ----------------------------
     # endpoint cache helpers
@@ -465,30 +529,25 @@ class Provider:
             raise
 
     # ----------------------------
-    # request routing (single)
+    # core execution (single)
     # ----------------------------
 
-    def request(
-        self,
-        method: str,
-        params: list[Any] | tuple[Any, ...],
-        *,
-        route: str = "pool",
-        formatter: Formatter | None = None,
-        freshness: Callable[[Any, int, int], bool] | None = None,
-    ) -> Any:
-        if route not in ("pool", "primary"):
-            raise ValueError("route must be 'pool' or 'primary'")
-
+    def _execute_single(self, call: _BatchCall, *, route: str) -> Any:
         policy = self.retry_policy_pool
 
         if route == "primary":
             ep = self._get_primary()
-            deadline = time.time() + self._FRESHNESS_WAIT_CAP_SECONDS if freshness else 0.0
+            deadline = time.time() + self._FRESHNESS_WAIT_CAP_SECONDS if call.freshness else 0.0
             last_exc: Exception | None = None
 
             while True:
-                value, exc = self._attempt(ep, method, params, formatter, freshness)
+                value, exc = self._attempt(
+                    ep,
+                    call.method,
+                    call.params,
+                    call.formatter,
+                    call.freshness,
+                )
                 if exc is None:
                     return value
 
@@ -509,7 +568,7 @@ class Provider:
         rr_ep = eps[start]
         max_exc_attempts = min(max(1, policy.max_attempts), len(eps))
 
-        if freshness is None:
+        if call.freshness is None:
             last_exc: Exception | None = None
             exc_attempts = 0
 
@@ -517,7 +576,13 @@ class Provider:
                 if exc_attempts >= max_exc_attempts:
                     break
                 ep = eps[(start + i) % len(eps)]
-                value, exc = self._attempt(ep, method, params, formatter, None)
+                value, exc = self._attempt(
+                    ep,
+                    call.method,
+                    call.params,
+                    call.formatter,
+                    None,
+                )
                 if exc is None:
                     return value
 
@@ -538,7 +603,13 @@ class Provider:
             exc_attempts = 0
 
             for ep in ordered:
-                value, exc = self._attempt(ep, method, params, formatter, freshness)
+                value, exc = self._attempt(
+                    ep,
+                    call.method,
+                    call.params,
+                    call.formatter,
+                    call.freshness,
+                )
                 if exc is None:
                     return value
 
@@ -561,57 +632,10 @@ class Provider:
             rr_ep = eps[start % len(eps)]
 
     # ----------------------------
-    # request routing (batch)
+    # core execution (batch)
     # ----------------------------
 
-    def request_batch(
-        self,
-        calls: list[
-            tuple[str, Sequence[Any]]
-            | tuple[str, Sequence[Any], Formatter | None]
-            | tuple[str, Sequence[Any], Formatter | None, Callable[[Any, int, int], bool] | None]
-        ],
-        *,
-        route: str = "pool",
-    ) -> list[Any | RPCError]:
-        if route not in ("pool", "primary"):
-            raise ValueError("route must be 'pool' or 'primary'")
-
-        if not calls:
-            return []
-
-        parsed: list[_BatchCall] = []
-        for call in calls:
-            if not isinstance(call, tuple):
-                raise TypeError(f"Batch call must be a tuple, got: {type(call).__name__}")
-
-            if len(call) == 2:
-                method, params = call  # type: ignore[misc]
-                fmt = None
-                fresh = None
-            elif len(call) == 3:
-                method, params, fmt = call  # type: ignore[misc]
-                fresh = None
-            elif len(call) == 4:
-                method, params, fmt, fresh = call  # type: ignore[misc]
-            else:
-                raise TypeError(
-                    "Batch call must be (method, params), (method, params, formatter), "
-                    "or (method, params, formatter, freshness)"
-                )
-
-            if not isinstance(params, (list, tuple)):
-                raise TypeError("params must be a list or tuple")
-
-            parsed.append(
-                _BatchCall(
-                    method=method,
-                    params=params,
-                    formatter=fmt,
-                    freshness=fresh,
-                )
-            )
-
+    def _execute_batch(self, parsed: list[_BatchCall], *, route: str) -> list[Any | RPCError]:
         policy = self.retry_policy_pool
         wants_freshness = any(c.freshness is not None for c in parsed)
 
@@ -692,3 +716,115 @@ class Provider:
             if not eps:
                 raise NoEndpoints("No endpoints available")
             rr_ep = eps[start % len(eps)]
+
+    # ----------------------------
+    # request routing (single)
+    # ----------------------------
+
+    def request(
+        self,
+        method: str,
+        params: list[Any] | tuple[Any, ...],
+        *,
+        route: str = "pool",
+        formatter: Formatter | None = None,
+        freshness: Callable[[Any, int, int], bool] | None = None,
+    ) -> Any:
+        if route not in ("pool", "primary"):
+            raise ValueError("route must be 'pool' or 'primary'")
+
+        calls = [_BatchCall(method=method, params=params, formatter=formatter, freshness=freshness)]
+
+        ctx = MiddlewareContext(state={})
+        calls = self._run_middlewares_before(ctx, calls)
+
+        # For request(), middleware must keep this a single call.
+        if len(calls) != 1:
+            raise ValueError("Middleware transformed request() into a batch; use request_batch()")
+
+        try:
+            out = self._execute_single(calls[0], route=route)
+        except Exception as exc:
+            recovered = self._run_middlewares_on_exception(ctx, calls, exc)
+            if isinstance(recovered, Exception):
+                raise recovered
+            if not recovered:
+                raise TransportError("Empty batch response")
+            item = recovered[0]
+            if isinstance(item, RPCError):
+                raise item
+            out = item
+
+        results = self._run_middlewares_after(ctx, calls, [out])
+        if not results:
+            raise TransportError("Empty batch response")
+        item = results[0]
+        if isinstance(item, RPCError):
+            raise item
+        return item
+
+    # ----------------------------
+    # request routing (batch)
+    # ----------------------------
+
+    def request_batch(
+        self,
+        calls: list[
+            tuple[str, Sequence[Any]]
+            | tuple[str, Sequence[Any], Formatter | None]
+            | tuple[str, Sequence[Any], Formatter | None, Callable[[Any, int, int], bool] | None]
+        ],
+        *,
+        route: str = "pool",
+    ) -> list[Any | RPCError]:
+        if route not in ("pool", "primary"):
+            raise ValueError("route must be 'pool' or 'primary'")
+
+        if not calls:
+            return []
+
+        parsed: list[_BatchCall] = []
+        for call in calls:
+            if not isinstance(call, tuple):
+                raise TypeError(f"Batch call must be a tuple, got: {type(call).__name__}")
+
+            if len(call) == 2:
+                method, params = call  # type: ignore[misc]
+                fmt = None
+                fresh = None
+            elif len(call) == 3:
+                method, params, fmt = call  # type: ignore[misc]
+                fresh = None
+            elif len(call) == 4:
+                method, params, fmt, fresh = call  # type: ignore[misc]
+            else:
+                raise TypeError(
+                    "Batch call must be (method, params), (method, params, formatter), "
+                    "or (method, params, formatter, freshness)"
+                )
+
+            if not isinstance(params, (list, tuple)):
+                raise TypeError("params must be a list or tuple")
+
+            parsed.append(
+                _BatchCall(
+                    method=method,
+                    params=params,
+                    formatter=fmt,
+                    freshness=fresh,
+                )
+            )
+
+        ctx = MiddlewareContext(state={})
+        parsed = self._run_middlewares_before(ctx, parsed)
+
+        try:
+            out = self._execute_batch(parsed, route=route)
+        except Exception as exc:
+            recovered = self._run_middlewares_on_exception(ctx, parsed, exc)
+            if isinstance(recovered, Exception):
+                raise recovered
+            out = recovered
+
+        out = self._run_middlewares_after(ctx, parsed, list(out))
+        return list(out)
