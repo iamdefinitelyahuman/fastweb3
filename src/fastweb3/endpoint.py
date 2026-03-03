@@ -48,6 +48,34 @@ class Endpoint:
         self.transport = transport or make_transport(target)
         self._counter = itertools.count(1)
 
+    def _make_request(self, payload):
+        try:
+            return self.transport.send(payload)
+        except TransportError:
+            raise
+
+    def _validate_response(self, resp):
+        if not isinstance(resp, dict):
+            raise RPCMalformedResponse(
+                f"Response must be a JSON object, got: {type(resp).__name__}"
+            )
+        if resp.get("jsonrpc") != "2.0":
+            raise RPCMalformedResponse(f"Missing/invalid jsonrpc field: {resp!r}")
+        if "id" not in resp:
+            raise RPCMalformedResponse(f"Missing id field: {resp!r}")
+
+    def _build_rpc_error(self, resp):
+        err = resp["error"]
+        if isinstance(err, dict):
+            details = RPCErrorDetails(
+                code=err.get("code"),
+                message=err.get("message"),
+                data=err.get("data"),
+            )
+        else:
+            details = RPCErrorDetails(code=None, message=str(err), data=None)
+        return RPCError(details)
+
     def close(self) -> None:
         self.transport.close()
 
@@ -65,32 +93,11 @@ class Endpoint:
             "params": list(params),
         }
 
-        try:
-            resp = self.transport.send(payload)
-        except TransportError:
-            raise
+        resp = self._make_request(payload)
+        self._validate_response(resp)
 
-        if not isinstance(resp, dict):
-            raise RPCMalformedResponse(
-                f"Single response must be a JSON object, got: {type(resp).__name__}"
-            )
-
-        if resp.get("jsonrpc") != "2.0":
-            raise RPCMalformedResponse(f"Missing/invalid jsonrpc field: {resp!r}")
-        if "id" not in resp:
-            raise RPCMalformedResponse(f"Missing id field: {resp!r}")
-
-        if "error" in resp and resp["error"] is not None:
-            err = resp["error"]
-            if isinstance(err, dict):
-                details = RPCErrorDetails(
-                    code=err.get("code"),
-                    message=err.get("message"),
-                    data=err.get("data"),
-                )
-            else:
-                details = RPCErrorDetails(code=None, message=str(err), data=None)
-            raise RPCError(details)
+        if resp.get("error") is not None:
+            raise self._build_rpc_error(resp)
 
         if "result" not in resp:
             raise RPCMalformedResponse(f"Missing result field: {resp!r}")
@@ -156,22 +163,14 @@ class Endpoint:
                 }
             )
 
-        try:
-            resp = self.transport.send(payload)
-        except TransportError:
-            raise
+        resp = self._make_request(payload)
 
         if not isinstance(resp, list):
             raise RPCMalformedResponse(f"Batch response must be a list, got: {type(resp).__name__}")
 
         by_id: dict[int, dict[str, Any]] = {}
         for item in resp:
-            if not isinstance(item, dict):
-                raise RPCMalformedResponse(f"Batch item must be dict: {item!r}")
-            if item.get("jsonrpc") != "2.0":
-                raise RPCMalformedResponse(f"Invalid jsonrpc in batch item: {item!r}")
-            if "id" not in item:
-                raise RPCMalformedResponse(f"Missing id in batch item: {item!r}")
+            self._validate_response(item)
 
             _id = item["id"]
             if not isinstance(_id, int):
@@ -191,17 +190,8 @@ class Endpoint:
 
             # Per-call JSON-RPC error: return RPCError instance in-position.
             if item.get("error") is not None:
-                err = item["error"]
-                if isinstance(err, dict):
-                    details = RPCErrorDetails(
-                        code=err.get("code"),
-                        message=err.get("message"),
-                        data=err.get("data"),
-                    )
-                else:
-                    details = RPCErrorDetails(code=None, message=str(err), data=None)
-
-                out.append(RPCError(details))
+                err = self._build_rpc_error(item)
+                out.append(err)
                 continue
 
             if "result" not in item:
