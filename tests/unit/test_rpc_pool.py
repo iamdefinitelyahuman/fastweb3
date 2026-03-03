@@ -68,41 +68,56 @@ def reset_shared_pool_registry():
     """Ensure each test starts with a clean global registry + no running scheduler thread."""
     # Best-effort stop scheduler if running
     try:
-        t = getattr(rpc_pool, "_sched_thread", None)
-        stop = getattr(rpc_pool, "_sched_stop", None)
-        if stop is not None:
-            stop.set()
-        if t is not None and getattr(t, "is_alive", lambda: False)():
-            if threading.current_thread() is not t:
-                t.join(timeout=0.2)
+        sched = getattr(rpc_pool, "_scheduler", None)
+        if sched is not None:
+            try:
+                sched.stop()
+            except Exception:
+                pass
+
+            t = getattr(sched, "_thread", None)
+            if t is not None and getattr(t, "is_alive", lambda: False)():
+                if threading.current_thread() is not t:
+                    t.join(timeout=0.2)
     except Exception:
         pass
 
     with rpc_pool._pool_lock:
         rpc_pool._pool_by_chain.clear()
         rpc_pool._pool_refcount.clear()
-        rpc_pool._sched_thread = None
-        rpc_pool._sched_stop.clear()
+
+    # Reset scheduler object to a pristine instance (fresh event/thread state)
+    try:
+        rpc_pool._scheduler = rpc_pool._Scheduler()
+    except Exception:
+        pass
 
     yield
 
     # Clean again (in case tests left anything behind)
     try:
-        t = getattr(rpc_pool, "_sched_thread", None)
-        stop = getattr(rpc_pool, "_sched_stop", None)
-        if stop is not None:
-            stop.set()
-        if t is not None and getattr(t, "is_alive", lambda: False)():
-            if threading.current_thread() is not t:
-                t.join(timeout=0.2)
+        sched = getattr(rpc_pool, "_scheduler", None)
+        if sched is not None:
+            try:
+                sched.stop()
+            except Exception:
+                pass
+
+            t = getattr(sched, "_thread", None)
+            if t is not None and getattr(t, "is_alive", lambda: False)():
+                if threading.current_thread() is not t:
+                    t.join(timeout=0.2)
     except Exception:
         pass
 
     with rpc_pool._pool_lock:
         rpc_pool._pool_by_chain.clear()
         rpc_pool._pool_refcount.clear()
-        rpc_pool._sched_thread = None
-        rpc_pool._sched_stop.clear()
+
+    try:
+        rpc_pool._scheduler = rpc_pool._Scheduler()
+    except Exception:
+        pass
 
 
 @pytest.fixture
@@ -359,8 +374,8 @@ def test_acquire_pool_manager_returns_shared_instance_and_refcounts(
     def _stop() -> None:
         called["stop"] += 1
 
-    monkeypatch.setattr(rpc_pool, "_ensure_scheduler_running", _ensure)
-    monkeypatch.setattr(rpc_pool, "_stop_scheduler_if_idle", _stop)
+    monkeypatch.setattr(rpc_pool._scheduler, "ensure_running", _ensure)
+    monkeypatch.setattr(rpc_pool._scheduler, "stop_if_idle", _stop)
 
     pm1 = rpc_pool.acquire_pool_manager(1)
     pm2 = rpc_pool.acquire_pool_manager(1)
