@@ -192,7 +192,6 @@ def probe_urls_streaming(
 
     if not candidates:
         return
-        yield  # pragma: no cover
 
     if deadline_s is None:
         deadline_s = max(PROBE_DEADLINE_MIN_S, PROBE_DEADLINE_MULTIPLIER * float(timeout_s))
@@ -473,53 +472,52 @@ class PoolManager:
 
 # --- global scheduler + registry ---
 
+
+class _Scheduler:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self._thread = None
+
+    def ensure_running(self):
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive() and not self._event.is_set():
+                return
+            if self._thread is not None:
+                self._thread.join(timeout=1.0)
+            self._event = threading.Event()
+            self._thread = threading.Thread(target=self._loop, args=(self._event,), daemon=True)
+            self._thread.start()
+
+    def stop_if_idle(self):
+        with _pool_lock:
+            any_active = any(v > 0 for v in _pool_refcount.values())
+        if any_active:
+            return
+        with self._lock:
+            self._event.set()
+
+    def _loop(self, event):
+        while not event.is_set():
+            with _pool_lock:
+                managers = list(_pool_by_chain.values())
+
+            now = time.time()
+            for pm in managers:
+                if event.is_set():
+                    break
+                try:
+                    pm.maintain(now=now)
+                except Exception:
+                    continue
+
+            event.wait(timeout=60)
+
+
 _pool_lock = threading.Lock()
 _pool_by_chain: dict[int, PoolManager] = {}
 _pool_refcount: dict[int, int] = {}
-
-_sched_thread: threading.Thread | None = None
-_sched_stop = threading.Event()
-
-
-def _scheduler_loop() -> None:
-    while not _sched_stop.is_set():
-        with _pool_lock:
-            managers = list(_pool_by_chain.values())
-
-        now = time.time()
-        for pm in managers:
-            try:
-                pm.maintain(now=now)
-            except Exception:
-                continue
-
-        _sched_stop.wait(timeout=5.0)
-
-
-def _ensure_scheduler_running() -> None:
-    global _sched_thread
-    if _sched_thread is not None and _sched_thread.is_alive():
-        return
-    _sched_stop.clear()
-    _sched_thread = threading.Thread(target=_scheduler_loop, daemon=True)
-    _sched_thread.start()
-
-
-def _stop_scheduler_if_idle() -> None:
-    global _sched_thread
-    with _pool_lock:
-        any_active = any(v > 0 for v in _pool_refcount.values())
-    if any_active:
-        return
-
-    t = _sched_thread
-    if t is None:
-        return
-
-    _sched_stop.set()
-    if threading.current_thread() is not t:
-        t.join(timeout=1.0)
-    _sched_thread = None
+_scheduler = _Scheduler()
 
 
 def acquire_pool_manager(
@@ -544,7 +542,7 @@ def acquire_pool_manager(
             _pool_by_chain[cid] = pm
 
         _pool_refcount[cid] = _pool_refcount.get(cid, 0) + 1
-        _ensure_scheduler_running()
+        _scheduler.ensure_running()
         return pm
 
 
@@ -556,4 +554,4 @@ def release_pool_manager(chain_id: int) -> None:
             return
         _pool_refcount[cid] = cur - 1
 
-    _stop_scheduler_if_idle()
+    _scheduler.stop_if_idle()
