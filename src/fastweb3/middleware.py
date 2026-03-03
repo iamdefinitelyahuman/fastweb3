@@ -1,13 +1,14 @@
 # src/fastweb3/middleware.py
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from .errors import RPCError
 
 if TYPE_CHECKING:
-    from .provider import _BatchCall
+    from .provider import Provider, _BatchCall
 
 
 @dataclass
@@ -97,7 +98,6 @@ class ProviderMiddleware(Protocol):
               - an `Exception` (propagate)
           * if multiple middlewares implement `on_exception`, they are invoked in
             reverse attach order until one returns recovered results, or the chain ends.
-
     """
 
     def before_request(
@@ -117,3 +117,97 @@ class ProviderMiddleware(Protocol):
         calls: list["_BatchCall"],
         exc: Exception,
     ) -> list[Any | RPCError] | Exception: ...
+
+
+DefaultMiddlewareFactory = Callable[["Provider"], ProviderMiddleware | None]
+DefaultMiddlewareSpec = ProviderMiddleware | type[ProviderMiddleware] | DefaultMiddlewareFactory
+
+_default_lock = threading.Lock()
+_default_specs: list[DefaultMiddlewareSpec] = []
+
+
+def register_default_middleware(spec: DefaultMiddlewareSpec, *, prepend: bool = False) -> None:
+    """
+    @notice
+        Register a default middleware spec applied to newly-created Provider instances.
+
+    @dev
+        This is global process state.
+
+        `spec` forms:
+          - middleware instance:
+              register_default_middleware(MyMiddleware())
+              NOTE: the same instance will be attached to every Provider that is created.
+
+          - middleware class:
+              register_default_middleware(MyMiddleware)
+              A new instance will be created for each Provider.
+
+          - factory:
+              def factory(provider) -> ProviderMiddleware | None: ...
+              register_default_middleware(factory)
+              The factory runs once per Provider init. Return None to skip.
+
+        Ordering:
+          - Defaults are applied to each Provider in registration order.
+          - If prepend=True, the spec is inserted at the front of the defaults list.
+
+        This does not affect already-instantiated Providers.
+    """
+    with _default_lock:
+        if prepend:
+            _default_specs.insert(0, spec)
+        else:
+            _default_specs.append(spec)
+
+
+def clear_default_middlewares() -> None:
+    """Remove all registered default middleware specs."""
+    with _default_lock:
+        _default_specs.clear()
+
+
+def list_default_middlewares() -> list[DefaultMiddlewareSpec]:
+    """Return a snapshot of registered default middleware specs."""
+    with _default_lock:
+        return list(_default_specs)
+
+
+def _resolve_middleware(
+    spec: DefaultMiddlewareSpec, provider: "Provider"
+) -> ProviderMiddleware | None:
+    # Class -> instantiate per provider
+    if isinstance(spec, type):
+        return spec()  # type: ignore[call-arg]
+
+    # Instance -> reuse (caller responsibility if they want per-provider instances)
+    if not callable(spec):
+        return spec  # type: ignore[return-value]
+
+    # Callable -> treat as factory(provider) -> middleware|None
+    return spec(provider)  # type: ignore[misc]
+
+
+def _apply_default_middlewares(provider: "Provider") -> None:
+    """
+    @dev
+        Called by Provider.__init__ to attach global defaults to the new instance.
+
+        Two-pass behavior:
+          1) resolve all eligible middlewares without mutating provider._middlewares
+          2) add them in order
+
+        This avoids factories observing side effects from earlier additions during the same init.
+    """
+    with _default_lock:
+        specs = list(_default_specs)
+
+    resolved: list[ProviderMiddleware] = []
+    for spec in specs:
+        mw = _resolve_middleware(spec, provider)
+        if mw is None:
+            continue
+        resolved.append(mw)
+
+    for mw in resolved:
+        provider.add_middleware(mw)

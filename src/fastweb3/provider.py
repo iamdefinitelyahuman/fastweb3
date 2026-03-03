@@ -15,7 +15,7 @@ from .errors import (
     TransportError,
 )
 from .formatters import to_int
-from .middleware import MiddlewareContext, ProviderMiddleware
+from .middleware import MiddlewareContext, ProviderMiddleware, _apply_default_middlewares
 from .rpc_pool import PoolManager
 from .utils import normalize_target
 
@@ -122,6 +122,9 @@ class Provider:
 
         for t in list(internal_endpoints or []):
             self.add_endpoint(t, priority=False)
+
+        # Global default middlewares are copied onto this Provider instance once at init.
+        _apply_default_middlewares(self)
 
     # ----------------------------
     # middleware
