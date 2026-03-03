@@ -183,7 +183,7 @@ def test_request_raises_malformed_if_transport_returns_non_dict() -> None:
     t.queue_return([{"jsonrpc": "2.0", "id": 1, "result": "nope"}])  # list in single-call
 
     e = Endpoint("https://example.invalid", transport=t)
-    with pytest.raises(RPCMalformedResponse, match="Single response must be a JSON object"):
+    with pytest.raises(RPCMalformedResponse, match="Response must be a JSON object"):
         e.request("eth_chainId", ())
 
 
@@ -231,7 +231,7 @@ def test_request_batch_validates_items_and_ids() -> None:
     t = ScriptedTransport()
     t.queue_return([{"jsonrpc": "2.0", "id": 1, "result": "ok"}, "bad"])
     e = Endpoint("https://example.invalid", transport=t)
-    with pytest.raises(RPCMalformedResponse, match="Batch item must be dict"):
+    with pytest.raises(RPCMalformedResponse, match="Response must be a JSON object"):
         e.request_batch(("a", ()))
 
     # Missing id
