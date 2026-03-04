@@ -6,10 +6,11 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Any, Iterator
 
 import httpx
 
+from .formatters import to_int
 from .transport import HTTPTransportConfig, WSSTransportConfig, make_transport
 from .utils import is_url_target, normalize_target, normalize_url
 
@@ -94,16 +95,78 @@ def _is_probeable(url: str) -> bool:
     return False
 
 
-def _hex_to_int(x: object) -> int:
-    if not isinstance(x, str) or not x.startswith("0x"):
-        raise ValueError(f"Expected 0x-hex string, got {x!r}")
-    return int(x, 16)
-
-
 _PROBE_PAYLOAD = [
     {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []},
     {"jsonrpc": "2.0", "id": 2, "method": "eth_blockNumber", "params": []},
 ]
+
+
+def _make_probe_transport_configs(
+    *, timeout_s: float, max_connections: int, max_keepalive_connections: int
+) -> tuple[HTTPTransportConfig, WSSTransportConfig]:
+    http_cfg = HTTPTransportConfig(
+        timeout=timeout_s,
+        connect_timeout=timeout_s,
+        read_timeout=timeout_s,
+        write_timeout=timeout_s,
+        pool_timeout=timeout_s,
+        max_connections=max_connections,
+        max_keepalive_connections=max_keepalive_connections,
+        keepalive_expiry=10.0,
+    )
+    wss_cfg = WSSTransportConfig(
+        connect_timeout=timeout_s,
+        recv_timeout=timeout_s,
+    )
+    return http_cfg, wss_cfg
+
+
+def _parse_probe_response(resp: object, *, expected_chain_hex: str) -> int:
+    if not isinstance(resp, list):
+        raise ValueError(f"Probe response must be a list, got: {type(resp).__name__}")
+
+    by_id: dict[int, dict[str, Any]] = {}
+    for item in resp:
+        if not isinstance(item, dict):
+            raise ValueError(f"Probe batch item must be a dict, got: {type(item).__name__}")
+
+        _id = item.get("id")
+        if not isinstance(_id, int):
+            raise ValueError(f"Probe batch item id must be an int, got: {_id!r}")
+        if _id in by_id:
+            raise ValueError(f"Duplicate id in probe response: {_id}")
+        by_id[_id] = item
+
+    try:
+        chain_item = by_id[1]
+        head_item = by_id[2]
+    except KeyError as e:
+        raise ValueError(f"Missing expected probe response id: {e.args[0]}") from None
+
+    chain = chain_item.get("result")
+    if not isinstance(chain, str) or chain.lower() != expected_chain_hex:
+        raise ValueError(f"Unexpected chainId result: {chain!r} (expected {expected_chain_hex})")
+
+    head_hex = head_item.get("result")
+    return to_int(head_hex)
+
+
+def _probe_url(
+    url: str,
+    *,
+    expected_chain_hex: str,
+    http_cfg: HTTPTransportConfig,
+    wss_cfg: WSSTransportConfig,
+) -> ProbeResult:
+    t0 = time.perf_counter()
+    tr = make_transport(url, http=http_cfg, wss=wss_cfg)
+    try:
+        resp = tr.send(_PROBE_PAYLOAD)
+        head = _parse_probe_response(resp, expected_chain_hex=expected_chain_hex)
+        rtt_ms = (time.perf_counter() - t0) * 1000.0
+        return ProbeResult(url=url, rtt_ms=rtt_ms, head=head)
+    finally:
+        tr.close()
 
 
 def _probe_one(
@@ -114,50 +177,18 @@ def _probe_one(
 ) -> ProbeResult:
     expected_hex = hex(expected_chain_id).lower()
 
-    http_cfg = HTTPTransportConfig(
-        timeout=timeout_s,
-        connect_timeout=timeout_s,
-        read_timeout=timeout_s,
-        write_timeout=timeout_s,
-        pool_timeout=timeout_s,
+    http_cfg, wss_cfg = _make_probe_transport_configs(
+        timeout_s=timeout_s,
         max_connections=10,
         max_keepalive_connections=5,
-        keepalive_expiry=10.0,
-    )
-    wss_cfg = WSSTransportConfig(
-        connect_timeout=timeout_s,
-        recv_timeout=timeout_s,
     )
 
-    t0 = time.perf_counter()
-    tr = make_transport(url, http=http_cfg, wss=wss_cfg)
-    try:
-        resp = tr.send(_PROBE_PAYLOAD)
-
-        if not isinstance(resp, list) or not all(isinstance(x, dict) for x in resp):
-            raise RuntimeError("Non-batch response")
-
-        by_id: dict[int, dict] = {}
-        for item in resp:
-            _id = item.get("id")
-            if not isinstance(_id, int) or _id in by_id:
-                raise RuntimeError("Bad/duplicate id")
-            by_id[_id] = item
-
-        if 1 not in by_id or 2 not in by_id:
-            raise RuntimeError("Missing response ids")
-
-        chain = by_id[1].get("result")
-        if not isinstance(chain, str) or chain.lower() != expected_hex:
-            raise RuntimeError("Wrong chainId")
-
-        head_hex = by_id[2].get("result")
-        head = _hex_to_int(head_hex)
-
-        rtt_ms = (time.perf_counter() - t0) * 1000.0
-        return ProbeResult(url=url, rtt_ms=rtt_ms, head=head)
-    finally:
-        tr.close()
+    return _probe_url(
+        url,
+        expected_chain_hex=expected_hex,
+        http_cfg=http_cfg,
+        wss_cfg=wss_cfg,
+    )
 
 
 def probe_urls_streaming(
@@ -210,19 +241,10 @@ def probe_urls_streaming(
 
     expected_hex = hex(expected_chain_id).lower()
 
-    http_cfg = HTTPTransportConfig(
-        timeout=timeout_s,
-        connect_timeout=timeout_s,
-        read_timeout=timeout_s,
-        write_timeout=timeout_s,
-        pool_timeout=timeout_s,
+    http_cfg, wss_cfg = _make_probe_transport_configs(
+        timeout_s=timeout_s,
         max_connections=max(50, worker_count),
         max_keepalive_connections=min(20, worker_count),
-        keepalive_expiry=10.0,
-    )
-    wss_cfg = WSSTransportConfig(
-        connect_timeout=timeout_s,
-        recv_timeout=timeout_s,
     )
 
     def worker() -> None:
@@ -231,40 +253,17 @@ def probe_urls_streaming(
             if u is None:
                 return
 
-            t0 = time.perf_counter()
-            tr = make_transport(u, http=http_cfg, wss=wss_cfg)
             try:
-                resp = tr.send(_PROBE_PAYLOAD)
-
-                if not isinstance(resp, list) or not all(isinstance(x, dict) for x in resp):
-                    continue
-
-                by_id: dict[int, dict] = {}
-                ok = True
-
-                for item in resp:
-                    _id = item.get("id")
-                    if not isinstance(_id, int) or _id in by_id:
-                        ok = False
-                        break
-                    by_id[_id] = item
-
-                if not ok or 1 not in by_id or 2 not in by_id:
-                    continue
-
-                chain = by_id[1].get("result")
-                if not isinstance(chain, str) or chain.lower() != expected_hex:
-                    continue
-
-                head_hex = by_id[2].get("result")
-                head = _hex_to_int(head_hex)
-
-                rtt_ms = (time.perf_counter() - t0) * 1000.0
-                out_q.put(ProbeResult(url=u, rtt_ms=rtt_ms, head=head))
+                out_q.put(
+                    _probe_url(
+                        u,
+                        expected_chain_hex=expected_hex,
+                        http_cfg=http_cfg,
+                        wss_cfg=wss_cfg,
+                    )
+                )
             except Exception:
                 continue
-            finally:
-                tr.close()
 
     for _ in range(worker_count):
         threading.Thread(target=worker, daemon=True).start()
