@@ -1,6 +1,7 @@
 # src/fastweb3/provider.py
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -47,12 +48,29 @@ class _EndpointState:
     # Cooldown due to stale tip observation
     tip_cooldown_until: float = 0.0
 
+    # Cooldown due to being the "loser" in a hedged race
+    slow_cooldown_until: float = 0.0
+
     # Last tip observed from this endpoint target (LB backends may vary)
     last_tip: int | None = None
 
 
 class _FreshnessUnmet(TransportError):
     """Internal sentinel for 'response received, but endpoint tip is too stale for this call'."""
+
+
+@dataclass(frozen=True)
+class _AttemptOutcome:
+    value: Any | None
+    exc: Exception | None
+    returned_tip: int | None
+
+
+@dataclass(frozen=True)
+class _BatchAttemptOutcome:
+    values: list[Any | RPCError] | None
+    exc: Exception | None
+    returned_tip: int | None
 
 
 class Provider:
@@ -76,9 +94,17 @@ class Provider:
       - request() accepts `freshness(response, required_tip, returned_tip) -> bool`
       - required_tip is snapshotted at the start of each attempt (concurrency-safe)
       - If freshness rejects, rotate endpoints preferring highest last_tip, backoff briefly, retry
+
+    Hedging (pool route only):
+      - If `hedge_after_seconds` is set, fire attempt #1 immediately.
+      - If attempt #1 has not completed within `hedge_after_seconds`, fire attempt #2.
+      - Return whichever completes first.
+      - If attempt #2 wins, demote the loser endpoint.
+      - Only the winning attempt mutates Provider state.
     """
 
     _FRESHNESS_WAIT_CAP_SECONDS: float = 5.0
+    _HEDGE_MIN_DELAY_SECONDS: float = 0.05  # guardrail: below this hedges basically everything
 
     def __init__(
         self,
@@ -88,6 +114,8 @@ class Provider:
         desired_pool_size: int = 6,
         retry_policy_pool: RetryPolicy | None = None,
         is_retryable_exc: Callable[[Exception], bool] = _default_is_retryable_exc,
+        hedge_after_seconds: float | None = 0.2,
+        hedge_slow_cooldown_seconds: float = 10.0,
     ) -> None:
         self._lock = threading.Lock()
         self._rr = 0
@@ -105,6 +133,16 @@ class Provider:
         self.pool_manager = pool_manager
         self.retry_policy_pool = retry_policy_pool or RetryPolicy(max_attempts=3)
         self.is_retryable_exc = is_retryable_exc
+
+        if hedge_after_seconds is not None:
+            hedge_after_seconds = float(hedge_after_seconds)
+            if hedge_after_seconds < self._HEDGE_MIN_DELAY_SECONDS:
+                raise ValueError(
+                    f"hedge_after_seconds must be >= {self._HEDGE_MIN_DELAY_SECONDS} or None"
+                )
+
+        self.hedge_after_seconds = hedge_after_seconds
+        self.hedge_slow_cooldown_seconds = float(hedge_slow_cooldown_seconds)
 
         # Internal pool endpoint targets (normalized, insertion-ordered) + membership set.
         self._internal_targets: list[str] = []
@@ -334,6 +372,20 @@ class Provider:
             st.failures = 0
             st.error_cooldown_until = 0.0
 
+    def _mark_slow(self, ep: Endpoint) -> None:
+        if self.hedge_slow_cooldown_seconds <= 0:
+            return
+        now = time.time()
+        with self._lock:
+            st = self._state.get(ep)
+            if st is None:
+                st = _EndpointState()
+                self._state[ep] = st
+            st.slow_cooldown_until = max(
+                st.slow_cooldown_until,
+                now + self.hedge_slow_cooldown_seconds,
+            )
+
     # ----------------------------
     # tip tracking / demotion
     # ----------------------------
@@ -349,11 +401,11 @@ class Provider:
                 st = _EndpointState()
                 self._state[ep] = st
 
-            st.last_tip = int(returned_tip)
+            st.last_tip = returned_tip
 
             best = self._best_tip
             if best is None or returned_tip > best:
-                self._best_tip = int(returned_tip)
+                self._best_tip = returned_tip
                 return
 
             if returned_tip < best:
@@ -371,7 +423,7 @@ class Provider:
             st = self._state.get(ep)
             if st is None or st.last_tip is None:
                 return -1
-            return int(st.last_tip)
+            return st.last_tip
 
     # ----------------------------
     # eligibility
@@ -383,7 +435,9 @@ class Provider:
             eligible: list[Endpoint] = []
             for ep in eps:
                 st = self._state.get(ep, _EndpointState())
-                cooldown_until = max(st.error_cooldown_until, st.tip_cooldown_until)
+                cooldown_until = max(
+                    st.error_cooldown_until, st.tip_cooldown_until, st.slow_cooldown_until
+                )
                 if cooldown_until <= now:
                     eligible.append(ep)
 
@@ -509,7 +563,7 @@ class Provider:
                 self._mark_failure(ep, tip_item)
                 return None, tip_item
 
-            tip = int(tip_item)
+            tip = tip_item
             self._update_tip_and_maybe_demote(ep, tip)
             self._mark_success(ep)
 
@@ -523,13 +577,215 @@ class Provider:
                     if not call.freshness(item, required_tip, tip):
                         return None, _FreshnessUnmet("Freshness unmet")
 
-            return user_out, None
+            return list(user_out), None
 
         except Exception as exc:
             if self.is_retryable_exc(exc):
                 self._mark_failure(ep, exc)
                 return None, exc
             raise
+
+    # ----------------------------
+    # raw attempts (no Provider state mutation)
+    # ----------------------------
+
+    def _attempt_raw(
+        self,
+        ep: Endpoint,
+        method: str,
+        params: list[Any] | tuple[Any, ...],
+        formatter: Formatter | None,
+        freshness: Callable[[Any, int, int], bool] | None,
+    ) -> _AttemptOutcome:
+        required_tip = self._best_tip_snapshot()
+
+        try:
+            if self.desired_pool_size == 0:
+                result = ep.request(method, params, formatter)
+                return _AttemptOutcome(result, None, None)
+
+            tip, result = ep.request_batch(
+                ("eth_blockNumber", (), to_int),
+                (method, params, formatter),
+            )
+            for item in (result, tip):
+                if isinstance(item, RPCError):
+                    raise item
+
+            if freshness is None:
+                return _AttemptOutcome(result, None, tip)
+
+            if freshness(result, required_tip, tip):
+                return _AttemptOutcome(result, None, tip)
+
+            return _AttemptOutcome(None, _FreshnessUnmet("Freshness unmet"), tip)
+
+        except RPCError:
+            raise
+
+        except Exception as exc:
+            if self.is_retryable_exc(exc):
+                return _AttemptOutcome(None, exc, None)
+            raise
+
+    def _attempt_batch_raw(self, ep: Endpoint, calls: list[_BatchCall]) -> _BatchAttemptOutcome:
+        if not calls:
+            return _BatchAttemptOutcome([], None, None)
+
+        wants_freshness = any(c.freshness is not None for c in calls)
+        required_tip = self._best_tip_snapshot()
+
+        try:
+            if self.desired_pool_size == 0:
+                resp = ep.request_batch(*[(c.method, c.params, c.formatter) for c in calls])  # type: ignore[arg-type]
+                return _BatchAttemptOutcome(list(resp), None, None)
+
+            resp_all = ep.request_batch(
+                ("eth_blockNumber", (), to_int),
+                *[(c.method, c.params, c.formatter) for c in calls],  # type: ignore[arg-type]
+            )
+
+            if not resp_all:
+                raise TransportError("Empty batch response")
+
+            tip_item = resp_all[0]
+            user_out = list(resp_all[1:])
+
+            if isinstance(tip_item, RPCError):
+                return _BatchAttemptOutcome(None, tip_item, None)
+
+            tip = tip_item
+
+            if wants_freshness:
+                for i, call in enumerate(calls):
+                    if call.freshness is None:
+                        continue
+                    item = user_out[i]
+                    if isinstance(item, RPCError):
+                        continue
+                    if not call.freshness(item, required_tip, tip):
+                        return _BatchAttemptOutcome(None, _FreshnessUnmet("Freshness unmet"), tip)
+
+            return _BatchAttemptOutcome(user_out, None, tip)
+
+        except Exception as exc:
+            if self.is_retryable_exc(exc):
+                return _BatchAttemptOutcome(None, exc, None)
+            raise
+
+    def _apply_outcome_single(
+        self, ep: Endpoint, outcome: _AttemptOutcome
+    ) -> tuple[Any | None, Exception | None]:
+        if outcome.exc is None:
+            if outcome.returned_tip is not None:
+                self._update_tip_and_maybe_demote(ep, outcome.returned_tip)
+            self._mark_success(ep)
+            return outcome.value, None
+
+        if isinstance(outcome.exc, _FreshnessUnmet):
+            if outcome.returned_tip is not None:
+                self._update_tip_and_maybe_demote(ep, outcome.returned_tip)
+            self._mark_success(ep)
+            return None, outcome.exc
+
+        if isinstance(outcome.exc, RPCError):
+            raise outcome.exc
+
+        if self.is_retryable_exc(outcome.exc):
+            self._mark_failure(ep, outcome.exc)
+            return None, outcome.exc
+
+        raise outcome.exc
+
+    def _apply_outcome_batch(
+        self, ep: Endpoint, outcome: _BatchAttemptOutcome
+    ) -> tuple[list[Any | RPCError] | None, Exception | None]:
+        if outcome.exc is None:
+            if outcome.returned_tip is not None:
+                self._update_tip_and_maybe_demote(ep, outcome.returned_tip)
+            self._mark_success(ep)
+            return list(outcome.values or []), None
+
+        if isinstance(outcome.exc, _FreshnessUnmet):
+            if outcome.returned_tip is not None:
+                self._update_tip_and_maybe_demote(ep, outcome.returned_tip)
+            self._mark_success(ep)
+            return None, outcome.exc
+
+        # For batches, attempt-level RPCError (e.g. tip probe) is treated as a failure + retry.
+        if isinstance(outcome.exc, RPCError):
+            self._mark_failure(ep, outcome.exc)
+            return None, outcome.exc
+
+        if self.is_retryable_exc(outcome.exc):
+            self._mark_failure(ep, outcome.exc)
+            return None, outcome.exc
+
+        raise outcome.exc
+
+    # ----------------------------
+    # hedging helpers (pool route)
+    # ----------------------------
+
+    def _race_single(
+        self, ep1: Endpoint, ep2: Endpoint, call: _BatchCall
+    ) -> tuple[_AttemptOutcome, Endpoint, Endpoint | None, bool]:
+        q: queue.Queue[tuple[Endpoint, _AttemptOutcome]] = queue.Queue()
+        assert self.hedge_after_seconds is not None
+        hedge_after_s = self.hedge_after_seconds
+
+        def run(ep: Endpoint) -> None:
+            try:
+                out = self._attempt_raw(
+                    ep, call.method, call.params, call.formatter, call.freshness
+                )
+            except Exception as exc:
+                out = _AttemptOutcome(None, exc, None)
+            q.put((ep, out))
+
+        threading.Thread(target=run, args=(ep1,), daemon=True).start()
+
+        try:
+            winner_ep, out = q.get(timeout=hedge_after_s)
+            return out, winner_ep, None, False
+        except queue.Empty:
+            pass
+
+        threading.Thread(target=run, args=(ep2,), daemon=True).start()
+
+        winner_ep, out = q.get()
+        if winner_ep is ep2:
+            return out, ep2, ep1, True
+        return out, ep1, ep2, False
+
+    def _race_batch(
+        self, ep1: Endpoint, ep2: Endpoint, calls: list[_BatchCall]
+    ) -> tuple[_BatchAttemptOutcome, Endpoint, Endpoint | None, bool]:
+        q: queue.Queue[tuple[Endpoint, _BatchAttemptOutcome]] = queue.Queue()
+        assert self.hedge_after_seconds is not None
+        hedge_after_s = self.hedge_after_seconds
+
+        def run(ep: Endpoint) -> None:
+            try:
+                out = self._attempt_batch_raw(ep, calls)
+            except Exception as exc:
+                out = _BatchAttemptOutcome(None, exc, None)
+            q.put((ep, out))
+
+        threading.Thread(target=run, args=(ep1,), daemon=True).start()
+
+        try:
+            winner_ep, out = q.get(timeout=hedge_after_s)
+            return out, winner_ep, None, False
+        except queue.Empty:
+            pass
+
+        threading.Thread(target=run, args=(ep2,), daemon=True).start()
+
+        winner_ep, out = q.get()
+        if winner_ep is ep2:
+            return out, ep2, ep1, True
+        return out, ep1, ep2, False
 
     # ----------------------------
     # core execution (single)
@@ -574,10 +830,37 @@ class Provider:
         if call.freshness is None:
             last_exc: Exception | None = None
             exc_attempts = 0
+            skip_n = 0
+
+            if (
+                self.hedge_after_seconds is not None
+                and len(eps) >= 2
+                and exc_attempts < max_exc_attempts
+            ):
+                outcome, winner_ep, loser_ep, winner_was_second = self._race_single(
+                    eps[start], eps[(start + 1) % len(eps)], call
+                )
+
+                # If loser_ep is None, the second attempt was never started.
+                skip_n = 2 if loser_ep is not None else 1
+
+                value, exc = self._apply_outcome_single(winner_ep, outcome)
+                if exc is None:
+                    if winner_was_second and loser_ep is not None:
+                        self._mark_slow(loser_ep)
+                    return value
+
+                last_exc = exc
+                exc_attempts += 1
+                if len(eps) > skip_n:
+                    time.sleep(policy.backoff_seconds)
 
             for i in range(len(eps)):
                 if exc_attempts >= max_exc_attempts:
                     break
+                if i < skip_n:
+                    continue
+
                 ep = eps[(start + i) % len(eps)]
                 value, exc = self._attempt(
                     ep,
@@ -604,8 +887,33 @@ class Provider:
             ordered = [rr_ep] + [ep for ep in sorted_by_last_tip if ep is not rr_ep]
 
             exc_attempts = 0
+            skip_n = 0
+            hedged_eps: tuple[Endpoint, Endpoint] | None = None
 
-            for ep in ordered:
+            if self.hedge_after_seconds is not None and len(ordered) >= 2:
+                ep1, ep2 = ordered[0], ordered[1]
+                hedged_eps = (ep1, ep2)
+
+                outcome, winner_ep, loser_ep, winner_was_second = self._race_single(ep1, ep2, call)
+
+                skip_n = 2 if loser_ep is not None else 1
+
+                value, exc = self._apply_outcome_single(winner_ep, outcome)
+                if exc is None:
+                    if winner_was_second and loser_ep is not None:
+                        self._mark_slow(loser_ep)
+                    return value
+
+                last_exc = exc
+                if isinstance(exc, _FreshnessUnmet):
+                    pass
+                else:
+                    exc_attempts += 1
+
+            for idx, ep in enumerate(ordered):
+                if hedged_eps is not None and idx < skip_n and ep in hedged_eps:
+                    continue
+
                 value, exc = self._attempt(
                     ep,
                     call.method,
@@ -672,10 +980,36 @@ class Provider:
         if not wants_freshness:
             last_exc: Exception | None = None
             exc_attempts = 0
+            skip_n = 0
+
+            if (
+                self.hedge_after_seconds is not None
+                and len(eps) >= 2
+                and exc_attempts < max_exc_attempts
+            ):
+                outcome, winner_ep, loser_ep, winner_was_second = self._race_batch(
+                    eps[start], eps[(start + 1) % len(eps)], parsed
+                )
+
+                skip_n = 2 if loser_ep is not None else 1
+
+                values, exc = self._apply_outcome_batch(winner_ep, outcome)
+                if exc is None:
+                    if winner_was_second and loser_ep is not None:
+                        self._mark_slow(loser_ep)
+                    return list(values or [])
+
+                last_exc = exc
+                exc_attempts += 1
+                if len(eps) > skip_n:
+                    time.sleep(policy.backoff_seconds)
 
             for i in range(len(eps)):
                 if exc_attempts >= max_exc_attempts:
                     break
+                if i < skip_n:
+                    continue
+
                 ep = eps[(start + i) % len(eps)]
                 values, exc = self._attempt_batch(ep, parsed)
                 if exc is None:
@@ -696,8 +1030,33 @@ class Provider:
             ordered = [rr_ep] + [ep for ep in sorted_by_last_tip if ep is not rr_ep]
 
             exc_attempts = 0
+            skip_n = 0
+            hedged_eps: tuple[Endpoint, Endpoint] | None = None
 
-            for ep in ordered:
+            if self.hedge_after_seconds is not None and len(ordered) >= 2:
+                ep1, ep2 = ordered[0], ordered[1]
+                hedged_eps = (ep1, ep2)
+
+                outcome, winner_ep, loser_ep, winner_was_second = self._race_batch(ep1, ep2, parsed)
+
+                skip_n = 2 if loser_ep is not None else 1
+
+                values, exc = self._apply_outcome_batch(winner_ep, outcome)
+                if exc is None:
+                    if winner_was_second and loser_ep is not None:
+                        self._mark_slow(loser_ep)
+                    return list(values or [])
+
+                last_exc = exc
+                if isinstance(exc, _FreshnessUnmet):
+                    pass
+                else:
+                    exc_attempts += 1
+
+            for idx, ep in enumerate(ordered):
+                if hedged_eps is not None and idx < skip_n and ep in hedged_eps:
+                    continue
+
                 values, exc = self._attempt_batch(ep, parsed)
                 if exc is None:
                     return list(values or [])
