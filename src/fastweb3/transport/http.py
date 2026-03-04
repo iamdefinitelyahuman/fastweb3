@@ -1,3 +1,4 @@
+# src/fastweb3/transport/http.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -77,6 +78,9 @@ class HTTPTransport:
         except httpx.HTTPStatusError as exc:
             # Preserve status for cooldown logic (429 etc.)
             raise TransportError(str(exc), status_code=exc.response.status_code) from exc
+        except httpx.RequestError as exc:
+            # Connection / protocol / timeout errors (includes RemoteProtocolError)
+            raise TransportError(str(exc)) from exc
         data = resp.json()
         if not isinstance(data, (dict, list)):
             raise TypeError(f"Expected JSON object or array, got {type(data).__name__}")
