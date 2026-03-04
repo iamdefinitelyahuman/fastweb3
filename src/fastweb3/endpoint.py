@@ -5,7 +5,7 @@ import itertools
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 
-from .errors import RPCError, RPCErrorDetails, RPCMalformedResponse, TransportError
+from .errors import RPCError, RPCErrorDetails, RPCMalformedResponse
 from .transport import Transport, make_transport
 
 Formatter = Callable[[Any], Any]
@@ -48,11 +48,11 @@ class Endpoint:
         self.transport = transport or make_transport(target)
         self._counter = itertools.count(1)
 
+    def _build_payload(self, request_id: int, method: str, params: Sequence[Any]) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": request_id, "method": method, "params": list(params)}
+
     def _make_request(self, payload):
-        try:
-            return self.transport.send(payload)
-        except TransportError:
-            raise
+        return self.transport.send(payload)
 
     def _validate_response(self, resp):
         if not isinstance(resp, dict):
@@ -86,12 +86,7 @@ class Endpoint:
         formatter: Formatter | None = None,
     ) -> Any:
         request_id = next(self._counter)
-        payload: Mapping[str, Any] = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-            "params": list(params),
-        }
+        payload: Mapping[str, Any] = self._build_payload(request_id, method, params)
 
         resp = self._make_request(payload)
         self._validate_response(resp)
@@ -154,14 +149,7 @@ class Endpoint:
             request_id = next(self._counter)
             ids.append(request_id)
             formatters.append(fmt)
-            payload.append(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": method,
-                    "params": list(params),
-                }
-            )
+            payload.append(self._build_payload(request_id, method, params))
 
         resp = self._make_request(payload)
 
