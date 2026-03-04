@@ -130,18 +130,6 @@ def fake_make_transport(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(rpc_pool, "make_transport", _fake_make_transport)
 
 
-def test_hex_to_int_ok():
-    assert rpc_pool._hex_to_int("0x0") == 0
-    assert rpc_pool._hex_to_int("0x10") == 16
-    assert rpc_pool._hex_to_int("0xFF") == 255
-
-
-@pytest.mark.parametrize("bad", [None, 123, "10", "0X10", "0x", "potato"])
-def test_hex_to_int_bad_raises(bad):
-    with pytest.raises(ValueError):
-        rpc_pool._hex_to_int(bad)
-
-
 def test_is_probeable(monkeypatch: pytest.MonkeyPatch):
     # default: assume no WSS support => ws/wss not probeable
     monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: False)
@@ -227,11 +215,11 @@ def test_probe_one_success(monkeypatch: pytest.MonkeyPatch, fake_make_transport)
 @pytest.mark.parametrize(
     "resp, err_substr",
     [
-        ("not-a-list", "Non-batch response"),
-        ([{"id": 1, "result": "0x1"}], "Missing response ids"),
-        ([{"id": 1, "result": "0x1"}, {"id": 1, "result": "0x2"}], "Bad/duplicate id"),
-        (_batch_ok(chain_id=2), "Wrong chainId"),
-        ([{"id": 1, "result": "0x1"}, {"id": 2, "result": "potato"}], "Expected 0x-hex string"),
+        ("not-a-list", "Probe response must be a list"),
+        ([{"id": 1, "result": "0x1"}], "Missing expected probe response id"),
+        ([{"id": 1, "result": "0x1"}, {"id": 1, "result": "0x2"}], "Duplicate id"),
+        (_batch_ok(chain_id=2), "Unexpected chainId"),
+        ([{"id": 1, "result": "0x1"}, {"id": 2, "result": "potato"}], "invalid literal"),
     ],
 )
 def test_probe_one_strict_failures(

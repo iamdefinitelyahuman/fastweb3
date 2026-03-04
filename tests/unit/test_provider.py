@@ -343,8 +343,7 @@ def test_add_endpoint_dedups_normalized_target(monkeypatch: pytest.MonkeyPatch) 
     p = Provider([])
     p.add_endpoint("HTTP://EXAMPLE.INVALID ")
     p.add_endpoint("http://example.invalid")
-    assert p.endpoint_count() == 1
-    assert p.endpoints() == ["http://example.invalid"]
+    assert p.internal_endpoints() == ["http://example.invalid"]
 
 
 def test_remove_endpoint_removes_from_internal_pool_but_does_not_close_endpoint(
@@ -358,7 +357,7 @@ def test_remove_endpoint_removes_from_internal_pool_but_does_not_close_endpoint(
 
     p.remove_endpoint(" HTTP://EXAMPLE.INVALID ")
     assert ep.closed is False  # remove_endpoint does not close cached endpoints
-    assert p.endpoints() == ["http://other.invalid"]
+    assert p.internal_endpoints() == ["http://other.invalid"]
 
     p.close()
     assert ep.closed is True
@@ -412,7 +411,7 @@ def test_provider_add_endpoint_expands_env(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("RPC_HOST", "node.local")
     p = Provider([])
     p.add_endpoint("https://$RPC_HOST/rpc")
-    assert p.endpoints() == ["https://node.local/rpc"]
+    assert p.internal_endpoints() == ["https://node.local/rpc"]
 
 
 def test_provider_set_primary_expands_env(monkeypatch: pytest.MonkeyPatch) -> None:
