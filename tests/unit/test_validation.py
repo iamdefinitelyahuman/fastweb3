@@ -260,3 +260,12 @@ def test_validate_filter_object_strict_rejects_blockhash_with_from_to() -> None:
 def test_validate_filter_object_non_strict_noop() -> None:
     flt = {"blockHash": "nope", "fromBlock": "also nope"}
     validation.validate_filter_object(flt, strict=False)
+
+
+def test_hash32_non_strict_bytes_are_hexified() -> None:
+    assert validation.hash32(b"\x01\x02", name="h", strict=False) == "0x0102"
+
+
+def test_topics_none_returns_none_in_both_modes() -> None:
+    assert validation.topics(None, strict=True) is None
+    assert validation.topics(None, strict=False) is None
