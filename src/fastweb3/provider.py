@@ -211,106 +211,165 @@ class Provider:
         # Global default middlewares are copied onto this Provider instance once at init.
         _apply_default_middlewares(self)
 
-    # ----------------------------
-    # RPCError retry plumbing (no-op for now)
-    # ----------------------------
     def _decide_rpc_error_retry(
-        self,
-        *,
-        call: _BatchCall,
-        history: Sequence[_RPCErrorObservation],
-        returned_tip: int | None,
+        self, call: _BatchCall, history: Sequence[_RPCErrorObservation]
     ) -> _RPCErrorRetryDecision:
         """Return a retry decision for a single RPCError response.
 
-        Default is a no-op: accept the RPCError immediately.
-
-        Notes for future heuristics:
-          - `history` contains all observations so far for this call index, including
-            the most recent one (i.e. the current RPCError).
-          - `returned_tip` is the observed block height for the attempt (if any). For
-            partial retries within a batch, callers should pin retried calls to this
-            same block height to avoid mixed-block results.
+        `history` contains all observations so far for this call index, including the
+        most recent one (i.e. the current RPCError).
         """
-        _ = (call, history, returned_tip)
+
+        if not history:
+            return _RPCErrorRetryDecision()
+
+        current = history[-1]
+        code = current.code
+        norm = current.normalized_message
+        method = call.method
+
+        safe_read_methods = {
+            "eth_call",
+            "eth_getBalance",
+            "eth_getCode",
+            "eth_getStorageAt",
+            "eth_getTransactionCount",
+            "eth_getProof",
+            "eth_blockNumber",
+            "eth_getBlockByNumber",
+            "eth_getBlockTransactionCountByNumber",
+            "eth_getUncleCountByBlockNumber",
+            "eth_chainId",
+            "net_version",
+        }
+        if method not in safe_read_methods:
+            return _RPCErrorRetryDecision()
+
+        def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
+            return any(n in text for n in needles)
+
+        deterministic_needles = (
+            "execution reverted",
+            "revert",
+            "invalid argument",
+            "invalid params",
+            "invalid parameter",
+            "method not found",
+            "does not exist/is not available",
+            "unsupported method",
+            "insufficient funds",
+            "nonce too low",
+            "nonce too high",
+            "replacement transaction underpriced",
+            "transaction underpriced",
+            "already known",
+            "known transaction",
+            "intrinsic gas too low",
+            "max fee per gas less than block base fee",
+            "fee cap less than block base fee",
+            "gas required exceeds allowance",
+            "exceeds block gas limit",
+            "sender doesn't have enough funds",
+            "sender doesnt have enough funds",
+            "invalid sender",
+        )
+        if code in (-32601, -32602) or _contains_any(norm, deterministic_needles):
+            return _RPCErrorRetryDecision()
+
+        rate_limit_needles = (
+            "rate limit",
+            "too many requests",
+            "429",
+            "quota",
+            "throttle",
+            "throttled",
+        )
+        node_health_needles = (
+            "missing trie node",
+            "header not found",
+            "unknown block",
+            "block not found",
+            "state unavailable",
+            "state is not available",
+            "state not available",
+            "world state unavailable",
+            "missing state",
+            "pruned",
+            "historical state unavailable",
+        )
+        transient_needles = (
+            "internal error",
+            "server error",
+            "upstream",
+            "timeout",
+            "timed out",
+            "gateway timeout",
+            "bad gateway",
+            "service unavailable",
+            "temporarily unavailable",
+            "try again later",
+            "busy",
+            "overloaded",
+            "unavailable",
+            "connection reset",
+            "econnreset",
+            "socket hang up",
+            "500",
+            "502",
+            "503",
+            "504",
+        )
+
+        is_rate_limited = _contains_any(norm, rate_limit_needles)
+        is_node_health = _contains_any(norm, node_health_needles)
+        is_transient = _contains_any(norm, transient_needles) or code == -32603
+
+        current_fingerprint = (code, norm)
+        matching = [
+            obs for obs in history if (obs.code, obs.normalized_message) == current_fingerprint
+        ]
+        distinct_matching_endpoints = {obs.endpoint_url for obs in matching}
+        same_fingerprint_count = len(distinct_matching_endpoints)
+
+        # If multiple independent endpoints have already produced the same normalized
+        # error, it is increasingly likely that this is a "real" failure rather than
+        # a one-off node glitch. Be conservative about how quickly we stop for clearly
+        # shared/transient classes like rate limiting.
+        if is_rate_limited:
+            if same_fingerprint_count >= 3:
+                return _RPCErrorRetryDecision()
+            return _RPCErrorRetryDecision(retry=True, demote_current_endpoint=False)
+
+        if is_node_health:
+            if same_fingerprint_count >= 3:
+                return _RPCErrorRetryDecision()
+            return _RPCErrorRetryDecision(retry=True, demote_current_endpoint=True)
+
+        if is_transient:
+            if same_fingerprint_count >= 3:
+                return _RPCErrorRetryDecision()
+            return _RPCErrorRetryDecision(retry=True, demote_current_endpoint=False)
+
+        # Ambiguous fallback:
+        # - early on, err on the side of retrying
+        # - if we have seen the same normalized failure from 3 distinct endpoints,
+        #   stop and return it
+        if same_fingerprint_count >= 3:
+            return _RPCErrorRetryDecision()
+
+        if len(history) <= 3:
+            return _RPCErrorRetryDecision(retry=True, demote_current_endpoint=False)
+
+        # After several different ambiguous failures, give one final chance only if
+        # the errors are still varied. Once we've gathered enough evidence, prefer
+        # returning quickly over probing every remaining endpoint.
+        unique_fingerprints = {
+            (obs.code, obs.normalized_message, obs.endpoint_url) for obs in history
+        }
+        if len(unique_fingerprints) == len(history):
+            return _RPCErrorRetryDecision(retry=True, demote_current_endpoint=False)
+
         return _RPCErrorRetryDecision()
-
-    def _pin_calls_to_tip(self, calls: list[_BatchCall], tip: int) -> list[_BatchCall]:
-        """Return calls rewritten to target a specific block number.
-
-        When partially retrying a batch, we must ensure the retried subset targets the
-        same block as the original successful batch attempt; otherwise a moving tip
-        can yield internally inconsistent results across the batch.
-
-        This function rewrites only methods that accept a block tag/number. It will:
-          - Replace a block tag of "latest" with `hex(tip)`.
-          - Add a missing block parameter (where supported) as `hex(tip)`.
-
-        It intentionally does NOT rewrite calls that already target a specific block
-        number/hash, or special tags like "earliest" / "pending".
-        """
-        tip_hex = hex(tip)
-
-        def _pin_block_param(param: Any) -> Any:
-            # Only pin simple string tags. We intentionally do NOT support EIP-1898
-            # block objects here because they are rare in practice and callers using
-            # them are already explicitly pinning to a specific block context.
-            if isinstance(param, str):
-                return tip_hex if param == "latest" else param
-            return param
-
-        pinned: list[_BatchCall] = []
-
-        for call in calls:
-            method = call.method
-            params = list(call.params) if isinstance(call.params, tuple) else list(call.params)
-
-            # Methods where the block param is the 2nd argument (index 1)
-            if method in {
-                "eth_call",
-                "eth_getBalance",
-                "eth_getCode",
-                "eth_getTransactionCount",
-            }:
-                if len(params) < 2:
-                    params.append(tip_hex)
-                else:
-                    params[1] = _pin_block_param(params[1])
-
-            # Methods where the block param is the 3rd argument (index 2)
-            elif method in {"eth_getStorageAt"}:
-                if len(params) >= 3:
-                    params[2] = _pin_block_param(params[2])
-
-            elif method in {"eth_getProof"}:
-                if len(params) >= 3:
-                    params[2] = _pin_block_param(params[2])
-
-            # Methods where the block param is the 1st argument (index 0)
-            elif method in {
-                "eth_getBlockByNumber",
-                "eth_getBlockTransactionCountByNumber",
-                "eth_getUncleCountByBlockNumber",
-            }:
-                if len(params) >= 1:
-                    params[0] = _pin_block_param(params[0])
-
-            # eth_feeHistory: newestBlock is index 1
-            elif method in {"eth_feeHistory"}:
-                if len(params) >= 2:
-                    params[1] = _pin_block_param(params[1])
-
-            # Everything else: no change
-            pinned.append(
-                _BatchCall(
-                    method=call.method,
-                    params=params,
-                    formatter=call.formatter,
-                    freshness=call.freshness,
-                )
-            )
-
-        return pinned
 
     def _maybe_retry_rpc_errors_in_batch(
         self,
@@ -362,11 +421,7 @@ class Provider:
                 continue
 
             history = _observe(i, ep, item)
-            decision = self._decide_rpc_error_retry(
-                call=calls[i],
-                history=history,
-                returned_tip=returned_tip,
-            )
+            decision = self._decide_rpc_error_retry(calls[i], history)
             if decision.retry:
                 retry_indices.append(i)
                 demote_initial = demote_initial or decision.demote_current_endpoint
@@ -429,11 +484,7 @@ class Provider:
                     continue
 
                 history = _observe(idx, retry_ep, item)
-                decision = self._decide_rpc_error_retry(
-                    call=calls[idx],
-                    history=history,
-                    returned_tip=returned_tip,
-                )
+                decision = self._decide_rpc_error_retry(calls[idx], history)
                 if decision.retry:
                     new_remaining.append(idx)
                 demote_retry_ep = demote_retry_ep or decision.demote_current_endpoint
