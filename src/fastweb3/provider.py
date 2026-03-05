@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -87,6 +88,34 @@ class _RPCErrorRetryDecision:
 
     retry: bool = False
     demote_current_endpoint: bool = False
+
+
+@dataclass(frozen=True)
+class _RPCErrorObservation:
+    """Observation of an RPCError returned by an endpoint for a given call.
+
+    This is plumbing to allow retry heuristics to incorporate *history* across attempts.
+    """
+
+    endpoint_url: str
+    code: int | None
+    message: str
+    normalized_message: str
+
+
+def _normalize_rpc_error_message(message: str) -> str:
+    """Normalize an RPC error message for rough equality comparisons.
+
+    Intentionally generic (no provider-specific heuristics):
+      - lowercase
+      - collapse whitespace
+      - replace hex literals and long digit sequences
+    """
+    msg = (message or "").lower()
+    msg = re.sub(r"0x[0-9a-f]+", "0x", msg)
+    msg = re.sub(r"\b\d+\b", "#", msg)
+    msg = re.sub(r"\s+", " ", msg).strip()
+    return msg
 
 
 class Provider:
@@ -188,23 +217,22 @@ class Provider:
     def _decide_rpc_error_retry(
         self,
         *,
-        ep: Endpoint,
         call: _BatchCall,
-        err: RPCError,
+        history: Sequence[_RPCErrorObservation],
         returned_tip: int | None,
-        route: str,
     ) -> _RPCErrorRetryDecision:
         """Return a retry decision for a single RPCError response.
 
         Default is a no-op: accept the RPCError immediately.
 
         Notes for future heuristics:
-          - `route` indicates whether this came from the pool route or primary route.
+          - `history` contains all observations so far for this call index, including
+            the most recent one (i.e. the current RPCError).
           - `returned_tip` is the observed block height for the attempt (if any). For
             partial retries within a batch, callers should pin retried calls to this
             same block height to avoid mixed-block results.
         """
-        _ = (ep, call, err, returned_tip, route)
+        _ = (call, history, returned_tip)
         return _RPCErrorRetryDecision()
 
     def _pin_calls_to_tip(self, calls: list[_BatchCall], tip: int) -> list[_BatchCall]:
@@ -297,50 +325,63 @@ class Provider:
 
         This evaluates the retry decision *per individual RPCError item* in the batch.
         If any items are selected for retry, it will:
-          - optionally demote the endpoint that produced the RPCError(s)
-          - rerun only the selected calls on a different eligible endpoint
-          - merge the retried results back into the original `results` list
+          - optionally demote the endpoint that produced retry-selected RPCError(s)
+          - rerun only the selected calls on different eligible endpoints
+          - merge retried results back into the original `results` list
+
+        The retry decision callback receives *history* for each call index, so future
+        heuristics can stop early when the error pattern looks deterministic.
 
         If all retry attempts fail (transport-wise), the original `results` are returned.
         """
-        retry_indices: list[int] = []
-        demote = False
 
-        # Evaluate decision per-item (only for actual RPCError items)
+        # Heuristic retries only apply when routing through a pool of endpoints.
+        # For primary-route calls we never rotate endpoints, so return immediately.
+        if route == "primary":
+            return results
+        history_by_index: dict[int, list[_RPCErrorObservation]] = {}
+
+        def _observe(idx: int, obs_ep: Endpoint, err: RPCError) -> Sequence[_RPCErrorObservation]:
+            prev = history_by_index.get(idx, [])
+            obs = _RPCErrorObservation(
+                endpoint_url=getattr(obs_ep, "url", str(obs_ep)),
+                code=getattr(err, "code", None),
+                message=str(getattr(err, "message", err)),
+                normalized_message=_normalize_rpc_error_message(str(getattr(err, "message", err))),
+            )
+            history = [*prev, obs]
+            history_by_index[idx] = history
+            return history
+
+        # First-pass: evaluate decisions for the initial attempt's results.
+        retry_indices: list[int] = []
+        demote_initial = False
+
         for i, item in enumerate(results[: len(calls)]):
             if not isinstance(item, RPCError):
                 continue
 
+            history = _observe(i, ep, item)
             decision = self._decide_rpc_error_retry(
-                ep=ep,
                 call=calls[i],
-                err=item,
+                history=history,
                 returned_tip=returned_tip,
-                route=route,
             )
             if decision.retry:
                 retry_indices.append(i)
-                demote = demote or decision.demote_current_endpoint
+                demote_initial = demote_initial or decision.demote_current_endpoint
 
-        # Default behavior: accept everything as-is.
         if not retry_indices:
             return results
 
         # Optionally demote the producing endpoint before retrying elsewhere.
-        if demote:
-            # Treat this as an endpoint failure for cooldown purposes.
+        if demote_initial:
             self._mark_failure(ep, TransportError("RPCError selected for retry"))
 
-        # Build retry-only batch, pinned to the same tip if available.
-        retry_calls = [calls[i] for i in retry_indices]
-        if returned_tip is not None:
-            retry_calls = self._pin_calls_to_tip(retry_calls, returned_tip)
-
-        # Pick alternative endpoints (exclude the producing endpoint).
+        # Enumerate alternative endpoints (exclude the producing endpoint).
         try:
             candidates = self._pool_candidates()
         except Exception:
-            # If we can't even enumerate candidates, fall back to original results.
             return results
 
         eligible = [e for e in self._eligible_endpoints(candidates) if e is not ep]
@@ -350,19 +391,57 @@ class Provider:
         # Prefer endpoints with higher recently-observed tips.
         ordered = sorted(eligible, key=self._last_tip, reverse=True)
 
-        # Attempt the retry-only batch on alternative endpoints until one succeeds.
+        remaining = retry_indices
+
+        # Attempt on alternative endpoints until we've either resolved all retry-selected
+        # items or run out of endpoints.
         for retry_ep in ordered:
+            if not remaining:
+                break
+
+            retry_calls = [calls[i] for i in remaining]
+            if returned_tip is not None:
+                retry_calls = self._pin_calls_to_tip(retry_calls, returned_tip)
+
             values2, exc2, _ = self._attempt_batch(retry_ep, retry_calls)
             if exc2 is not None:
                 continue
 
             retried = list(values2 or [])
-            # Merge back in positional order corresponding to retry_indices
-            for j, idx in enumerate(retry_indices):
+
+            # Merge back into `results` using the positional correspondence to `remaining`.
+            for j, idx in enumerate(remaining):
                 if j >= len(retried):
                     break
                 results[idx] = retried[j]
-            return results
+
+            # Recompute which indices still want retry, using accumulated history.
+            new_remaining: list[int] = []
+            demote_retry_ep = False
+
+            for j, idx in enumerate(remaining):
+                if j >= len(retried):
+                    # If the response is malformed/short, keep the original item as-is.
+                    continue
+
+                item = results[idx]
+                if not isinstance(item, RPCError):
+                    continue
+
+                history = _observe(idx, retry_ep, item)
+                decision = self._decide_rpc_error_retry(
+                    call=calls[idx],
+                    history=history,
+                    returned_tip=returned_tip,
+                )
+                if decision.retry:
+                    new_remaining.append(idx)
+                demote_retry_ep = demote_retry_ep or decision.demote_current_endpoint
+
+            if demote_retry_ep:
+                self._mark_failure(retry_ep, TransportError("RPCError selected for retry"))
+
+            remaining = new_remaining
 
         return results
 
