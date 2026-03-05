@@ -73,6 +73,22 @@ class _BatchAttemptOutcome:
     returned_tip: int | None
 
 
+@dataclass(frozen=True)
+class _RPCErrorRetryDecision:
+    """Internal instruction for how to treat a single RPCError result.
+
+    Plumbing-only for now. The default decision is a no-op that keeps current
+    behavior: accept RPCError results immediately.
+
+    In the future, heuristics can request:
+      - retrying this call on a different endpoint
+      - demoting the endpoint that produced the RPCError before retrying
+    """
+
+    retry: bool = False
+    demote_current_endpoint: bool = False
+
+
 class Provider:
     """
     Routes requests across:
@@ -165,6 +181,190 @@ class Provider:
 
         # Global default middlewares are copied onto this Provider instance once at init.
         _apply_default_middlewares(self)
+
+    # ----------------------------
+    # RPCError retry plumbing (no-op for now)
+    # ----------------------------
+    def _decide_rpc_error_retry(
+        self,
+        *,
+        ep: Endpoint,
+        call: _BatchCall,
+        err: RPCError,
+        returned_tip: int | None,
+        route: str,
+    ) -> _RPCErrorRetryDecision:
+        """Return a retry decision for a single RPCError response.
+
+        Default is a no-op: accept the RPCError immediately.
+
+        Notes for future heuristics:
+          - `route` indicates whether this came from the pool route or primary route.
+          - `returned_tip` is the observed block height for the attempt (if any). For
+            partial retries within a batch, callers should pin retried calls to this
+            same block height to avoid mixed-block results.
+        """
+        _ = (ep, call, err, returned_tip, route)
+        return _RPCErrorRetryDecision()
+
+    def _pin_calls_to_tip(self, calls: list[_BatchCall], tip: int) -> list[_BatchCall]:
+        """Return calls rewritten to target a specific block number.
+
+        When partially retrying a batch, we must ensure the retried subset targets the
+        same block as the original successful batch attempt; otherwise a moving tip
+        can yield internally inconsistent results across the batch.
+
+        This function rewrites only methods that accept a block tag/number. It will:
+          - Replace a block tag of "latest" with `hex(tip)`.
+          - Add a missing block parameter (where supported) as `hex(tip)`.
+
+        It intentionally does NOT rewrite calls that already target a specific block
+        number/hash, or special tags like "earliest" / "pending".
+        """
+        tip_hex = hex(tip)
+
+        def _pin_block_param(param: Any) -> Any:
+            # Only pin simple string tags. We intentionally do NOT support EIP-1898
+            # block objects here because they are rare in practice and callers using
+            # them are already explicitly pinning to a specific block context.
+            if isinstance(param, str):
+                return tip_hex if param == "latest" else param
+            return param
+
+        pinned: list[_BatchCall] = []
+
+        for call in calls:
+            method = call.method
+            params = list(call.params) if isinstance(call.params, tuple) else list(call.params)
+
+            # Methods where the block param is the 2nd argument (index 1)
+            if method in {
+                "eth_call",
+                "eth_getBalance",
+                "eth_getCode",
+                "eth_getTransactionCount",
+            }:
+                if len(params) < 2:
+                    params.append(tip_hex)
+                else:
+                    params[1] = _pin_block_param(params[1])
+
+            # Methods where the block param is the 3rd argument (index 2)
+            elif method in {"eth_getStorageAt"}:
+                if len(params) >= 3:
+                    params[2] = _pin_block_param(params[2])
+
+            elif method in {"eth_getProof"}:
+                if len(params) >= 3:
+                    params[2] = _pin_block_param(params[2])
+
+            # Methods where the block param is the 1st argument (index 0)
+            elif method in {
+                "eth_getBlockByNumber",
+                "eth_getBlockTransactionCountByNumber",
+                "eth_getUncleCountByBlockNumber",
+            }:
+                if len(params) >= 1:
+                    params[0] = _pin_block_param(params[0])
+
+            # eth_feeHistory: newestBlock is index 1
+            elif method in {"eth_feeHistory"}:
+                if len(params) >= 2:
+                    params[1] = _pin_block_param(params[1])
+
+            # Everything else: no change
+            pinned.append(
+                _BatchCall(
+                    method=call.method,
+                    params=params,
+                    formatter=call.formatter,
+                    freshness=call.freshness,
+                )
+            )
+
+        return pinned
+
+    def _maybe_retry_rpc_errors_in_batch(
+        self,
+        *,
+        ep: Endpoint,
+        calls: list[_BatchCall],
+        results: list[Any | RPCError],
+        returned_tip: int | None,
+        route: str,
+    ) -> list[Any | RPCError]:
+        """Apply per-item RPCError retry heuristics to a batch result set.
+
+        This evaluates the retry decision *per individual RPCError item* in the batch.
+        If any items are selected for retry, it will:
+          - optionally demote the endpoint that produced the RPCError(s)
+          - rerun only the selected calls on a different eligible endpoint
+          - merge the retried results back into the original `results` list
+
+        If all retry attempts fail (transport-wise), the original `results` are returned.
+        """
+        retry_indices: list[int] = []
+        demote = False
+
+        # Evaluate decision per-item (only for actual RPCError items)
+        for i, item in enumerate(results[: len(calls)]):
+            if not isinstance(item, RPCError):
+                continue
+
+            decision = self._decide_rpc_error_retry(
+                ep=ep,
+                call=calls[i],
+                err=item,
+                returned_tip=returned_tip,
+                route=route,
+            )
+            if decision.retry:
+                retry_indices.append(i)
+                demote = demote or decision.demote_current_endpoint
+
+        # Default behavior: accept everything as-is.
+        if not retry_indices:
+            return results
+
+        # Optionally demote the producing endpoint before retrying elsewhere.
+        if demote:
+            # Treat this as an endpoint failure for cooldown purposes.
+            self._mark_failure(ep, TransportError("RPCError selected for retry"))
+
+        # Build retry-only batch, pinned to the same tip if available.
+        retry_calls = [calls[i] for i in retry_indices]
+        if returned_tip is not None:
+            retry_calls = self._pin_calls_to_tip(retry_calls, returned_tip)
+
+        # Pick alternative endpoints (exclude the producing endpoint).
+        try:
+            candidates = self._pool_candidates()
+        except Exception:
+            # If we can't even enumerate candidates, fall back to original results.
+            return results
+
+        eligible = [e for e in self._eligible_endpoints(candidates) if e is not ep]
+        if not eligible:
+            return results
+
+        # Prefer endpoints with higher recently-observed tips.
+        ordered = sorted(eligible, key=self._last_tip, reverse=True)
+
+        # Attempt the retry-only batch on alternative endpoints until one succeeds.
+        for retry_ep in ordered:
+            values2, exc2, _ = self._attempt_batch(retry_ep, retry_calls)
+            if exc2 is not None:
+                continue
+
+            retried = list(values2 or [])
+            # Merge back in positional order corresponding to retry_indices
+            for j, idx in enumerate(retry_indices):
+                if j >= len(retried):
+                    break
+                results[idx] = retried[j]
+            return results
+
+        return results
 
     # ----------------------------
     # middleware
@@ -469,13 +669,11 @@ class Provider:
         self,
         ep: Endpoint,
         calls: list[_BatchCall],
-    ) -> tuple[list[Any | RPCError] | None, Exception | None]:
+    ) -> tuple[list[Any | RPCError] | None, Exception | None, int | None]:
+        """Attempt a batch request and preserve the observed tip (if any)."""
         outcome = self._attempt_batch_raw(ep, calls)
-        return self._apply_outcome_batch(ep, outcome)
-
-    # ----------------------------
-    # raw attempts (no Provider state mutation)
-    # ----------------------------
+        values, exc = self._apply_outcome_batch(ep, outcome)
+        return values, exc, outcome.returned_tip
 
     def _attempt_raw(
         self,
@@ -850,9 +1048,16 @@ class Provider:
             last_exc: Exception | None = None
 
             while True:
-                values, exc = self._attempt_batch(ep, parsed)
+                values, exc, returned_tip = self._attempt_batch(ep, parsed)
                 if exc is None:
-                    return list(values or [])
+                    results = list(values or [])
+                    return self._maybe_retry_rpc_errors_in_batch(
+                        ep=ep,
+                        calls=parsed,
+                        results=results,
+                        returned_tip=returned_tip,
+                        route=route,
+                    )
 
                 if isinstance(exc, _FreshnessUnmet) and time.time() < deadline:
                     time.sleep(policy.backoff_seconds)
@@ -888,10 +1093,18 @@ class Provider:
                 skip_n = 2 if loser_ep is not None else 1
 
                 values, exc = self._apply_outcome_batch(winner_ep, outcome)
+                returned_tip = outcome.returned_tip
                 if exc is None:
                     if winner_was_second and loser_ep is not None:
                         self._mark_slow(loser_ep)
-                    return list(values or [])
+                    results = list(values or [])
+                    return self._maybe_retry_rpc_errors_in_batch(
+                        ep=winner_ep,
+                        calls=parsed,
+                        results=results,
+                        returned_tip=returned_tip,
+                        route=route,
+                    )
 
                 last_exc = exc
                 exc_attempts += 1
@@ -905,9 +1118,16 @@ class Provider:
                     continue
 
                 ep = eps[(start + i) % len(eps)]
-                values, exc = self._attempt_batch(ep, parsed)
+                values, exc, returned_tip = self._attempt_batch(ep, parsed)
                 if exc is None:
-                    return list(values or [])
+                    results = list(values or [])
+                    return self._maybe_retry_rpc_errors_in_batch(
+                        ep=ep,
+                        calls=parsed,
+                        results=results,
+                        returned_tip=returned_tip,
+                        route=route,
+                    )
 
                 last_exc = exc
                 exc_attempts += 1
@@ -936,10 +1156,18 @@ class Provider:
                 skip_n = 2 if loser_ep is not None else 1
 
                 values, exc = self._apply_outcome_batch(winner_ep, outcome)
+                returned_tip = outcome.returned_tip
                 if exc is None:
                     if winner_was_second and loser_ep is not None:
                         self._mark_slow(loser_ep)
-                    return list(values or [])
+                    results = list(values or [])
+                    return self._maybe_retry_rpc_errors_in_batch(
+                        ep=winner_ep,
+                        calls=parsed,
+                        results=results,
+                        returned_tip=returned_tip,
+                        route=route,
+                    )
 
                 last_exc = exc
                 if isinstance(exc, _FreshnessUnmet):
@@ -951,9 +1179,16 @@ class Provider:
                 if hedged_eps is not None and idx < skip_n and ep in hedged_eps:
                     continue
 
-                values, exc = self._attempt_batch(ep, parsed)
+                values, exc, returned_tip = self._attempt_batch(ep, parsed)
                 if exc is None:
-                    return list(values or [])
+                    results = list(values or [])
+                    return self._maybe_retry_rpc_errors_in_batch(
+                        ep=ep,
+                        calls=parsed,
+                        results=results,
+                        returned_tip=returned_tip,
+                        route=route,
+                    )
 
                 last_exc = exc
                 if isinstance(exc, _FreshnessUnmet):
