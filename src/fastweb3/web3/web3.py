@@ -1,4 +1,4 @@
-# src/fastweb3/web3.py
+# src/fastweb3/web3/web3.py
 """High-level Web3 client.
 
 Most users should interact with `Web3` (and its namespaces such as
@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import threading
 import weakref
-from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from lazy_object_proxy import Proxy
 
@@ -27,14 +26,12 @@ from ..errors import NoEndpoints, RPCError
 from ..formatters import to_int
 from ..provider import Provider, RetryPolicy
 from ..provider.pool import acquire_pool_manager, release_pool_manager
+from .batch import _NEVER_BATCH_METHODS, FreshnessFn, _BatchManager, _Queued, _tls_state
 from .eth import Eth
 
 _DEFAULT_PRIMARY_CHAIN_ID_LOCK = threading.Lock()
 _DEFAULT_PRIMARY_CHAIN_ID_SET = False
 _DEFAULT_PRIMARY_CHAIN_ID: Optional[int] = None
-
-
-FreshnessFn = Callable[[Any, int, int], bool]
 
 
 @dataclass(frozen=True)
@@ -85,175 +82,6 @@ def _get_default_primary_chain_id_once() -> Optional[int]:
 
         _DEFAULT_PRIMARY_CHAIN_ID_SET = True
         return _DEFAULT_PRIMARY_CHAIN_ID
-
-
-_NEVER_BATCH_METHODS: set[str] = {
-    # side-effecting / timing-sensitive
-    "eth_sendRawTransaction",
-    "eth_sendTransaction",
-    # filter lifecycle (server-side state)
-    "eth_newFilter",
-    "eth_newBlockFilter",
-    "eth_newPendingTransactionFilter",
-    "eth_uninstallFilter",
-    "eth_getFilterChanges",
-    "eth_getFilterLogs",
-    # signing (often wallet-backed)
-    "eth_sign",
-    "eth_signTransaction",
-    "eth_signTypedData",
-    "eth_signTypedData_v3",
-    "eth_signTypedData_v4",
-    "personal_sign",
-}
-
-
-@dataclass
-class _Queued:
-    method: str
-    params: list[Any]
-    route: str
-    formatter: Any
-    freshness: FreshnessFn | None
-    handle: Handle
-
-
-@dataclass
-class _BatchState:
-    depth: int = 0
-    flushing: bool = False
-    queue: list[_Queued] | None = None
-    methods_stack: list[set[str] | None] | None = None
-    batch_id: int = 0
-
-    def __post_init__(self) -> None:
-        if self.queue is None:
-            self.queue = []
-        if self.methods_stack is None:
-            self.methods_stack = []
-
-
-_TLS = threading.local()
-_BATCH_ID_LOCK = threading.Lock()
-_BATCH_ID_NEXT = 1
-
-
-def _next_batch_id() -> int:
-    global _BATCH_ID_NEXT
-    with _BATCH_ID_LOCK:
-        bid = _BATCH_ID_NEXT
-        _BATCH_ID_NEXT += 1
-        return bid
-
-
-def _tls_state() -> _BatchState:
-    st = getattr(_TLS, "batch_state", None)
-    if st is None:
-        st = _BatchState()
-        setattr(_TLS, "batch_state", st)
-    return st
-
-
-class _BatchContext:
-    """Introspection helpers for an active batch scope.
-
-    Instances of this class are returned from `Web3.batch_requests()`.
-    """
-
-    def __init__(self, w3: "Web3", batch_id: int) -> None:
-        self._w3 = w3
-        self._batch_id = batch_id
-
-    def _state(self) -> _BatchState:
-        st = _tls_state()
-        if st.depth <= 0 or st.batch_id != self._batch_id:
-            raise RuntimeError("Batch context is no longer active in this thread")
-        return st
-
-    def flush(self) -> None:
-        """Flush all currently queued calls.
-
-        Raises:
-            RPCError: If any queued call resulted in a JSON-RPC error.
-        """
-        self._w3._flush_batch(raise_on_error=True)
-
-    def pending_count(self) -> int:
-        """Return the number of queued calls that have not been flushed."""
-        return len(self._state().queue or [])
-
-    def pending_methods(self) -> dict[str, int]:
-        """Return a count of queued method names."""
-        c: Counter[str] = Counter()
-        for q in self._state().queue or []:
-            c[q.method] += 1
-        return dict(c)
-
-    def pending_preview(self, n: int = 10) -> list[dict[str, Any]]:
-        """Return a lightweight preview of the first ``n`` queued calls."""
-        out: list[dict[str, Any]] = []
-        for q in (self._state().queue or [])[: max(0, int(n))]:
-            out.append(
-                {
-                    "method": q.method,
-                    "route": q.route,
-                    "params_len": len(q.params),
-                }
-            )
-        return out
-
-    def describe(self) -> str:
-        """Return a human-friendly description of the current batch state."""
-        st = self._state()
-        return (
-            f"BatchContext(depth={st.depth}, pending={len(st.queue or [])}, "
-            f"flushing={st.flushing}, methods={self.pending_methods()})"
-        )
-
-
-class _BatchManager:
-    def __init__(self, w3: "Web3", methods: set[str] | None) -> None:
-        self._w3 = w3
-        self._methods = methods
-
-    def __enter__(self) -> _BatchContext:
-        st = _tls_state()
-
-        # Nesting boundary: flush current queue before entering deeper scope.
-        if st.depth > 0 and (st.queue or []):
-            self._w3._flush_batch(raise_on_error=True)
-
-        st.depth += 1
-        if st.depth == 1:
-            st.batch_id = _next_batch_id()
-
-        # Push active methods filter (None => batch all eligible methods)
-        st.methods_stack.append(self._methods)
-
-        return _BatchContext(self._w3, st.batch_id)
-
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        st = _tls_state()
-        raise_on_error = exc_type is None
-
-        try:
-            # Nesting boundary: flush on leaving the scope.
-            if st.depth > 0 and (st.queue or []):
-                self._w3._flush_batch(raise_on_error=raise_on_error)
-        finally:
-            if st.methods_stack:
-                st.methods_stack.pop()
-
-            st.depth = max(0, st.depth - 1)
-            if st.depth == 0:
-                if st.queue is not None:
-                    st.queue.clear()
-                if st.methods_stack is not None:
-                    st.methods_stack.clear()
-                st.flushing = False
-                st.batch_id = 0
-
-        return False
 
 
 class Web3:
