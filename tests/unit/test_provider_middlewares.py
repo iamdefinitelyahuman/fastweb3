@@ -4,9 +4,10 @@ from __future__ import annotations
 import pytest
 
 import fastweb3.middleware as mw_mod
-import fastweb3.provider as provider_mod
+import fastweb3.provider.endpoint_selection as es_mod
 from fastweb3.errors import TransportError
 from fastweb3.provider import Provider
+from fastweb3.provider.types import _BatchCall
 
 
 @pytest.fixture(autouse=True)
@@ -52,7 +53,7 @@ class FakeEndpoint:
 
 @pytest.fixture
 def _patch_endpoint(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
+    monkeypatch.setattr(es_mod, "Endpoint", FakeEndpoint)
     yield
 
 
@@ -117,7 +118,7 @@ def test_middleware_can_mutate_calls_single_and_results(_patch_endpoint) -> None
         def before_request(self, ctx, calls):
             # rewrite method name (toy)
             c = calls[0]
-            calls[0] = provider_mod._BatchCall(  # type: ignore[attr-defined]
+            calls[0] = _BatchCall(  # type: ignore[attr-defined]
                 method="eth_chainId",
                 params=c.params,
                 formatter=c.formatter,

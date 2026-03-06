@@ -8,7 +8,9 @@ from typing import Any, Deque
 import pytest
 
 import fastweb3.provider as provider_mod
+import fastweb3.provider.endpoint_selection as es_mod
 from fastweb3.errors import AllEndpointsFailed, RPCError, RPCErrorDetails, TransportError
+from fastweb3.formatters import to_int
 
 
 class _StubPoolManager:
@@ -63,7 +65,7 @@ def _rpc_err(code: int = -32000, message: str = "boom") -> RPCError:
 
 
 def test_provider_request_batch_primary_no_tip_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
+    monkeypatch.setattr(es_mod, "Endpoint", FakeEndpoint)
 
     # No internal endpoints; pool_manager None => desired_pool_size ends up 0
     p = provider_mod.Provider(internal_endpoints=None, pool_manager=None)
@@ -101,7 +103,7 @@ def test_provider_request_batch_primary_no_tip_probe(monkeypatch: pytest.MonkeyP
 def test_provider_request_batch_primary_with_tip_probe_when_internal_endpoints_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
+    monkeypatch.setattr(es_mod, "Endpoint", FakeEndpoint)
 
     # internal_endpoints forces desired_pool_size >= 1
     p = provider_mod.Provider(internal_endpoints=["http://a"], pool_manager=None)
@@ -116,19 +118,19 @@ def test_provider_request_batch_primary_with_tip_probe_when_internal_endpoints_p
 
     batch = ep.batch_calls[0]
     assert batch[0][0] == "eth_blockNumber"
-    assert batch[0][2] is provider_mod.to_int
+    assert batch[0][2] is to_int
 
 
 def test_provider_request_batch_primary_requires_primary(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
+    monkeypatch.setattr(es_mod, "Endpoint", FakeEndpoint)
     p = provider_mod.Provider(internal_endpoints=["http://a"], pool_manager=None)
 
-    with pytest.raises(provider_mod.NoPrimaryEndpoint):
+    with pytest.raises(es_mod.NoPrimaryEndpoint):
         p.request_batch([("net_version", (), None, None)], route="primary")
 
 
 def test_provider_request_batch_pool_includes_tip_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
+    monkeypatch.setattr(es_mod, "Endpoint", FakeEndpoint)
 
     p = provider_mod.Provider(
         internal_endpoints=["http://a"],
@@ -155,7 +157,7 @@ def test_provider_request_batch_pool_includes_tip_probe(monkeypatch: pytest.Monk
     # First call in the batch should be the provider-added tip probe
     batch = ep.batch_calls[0]
     assert batch[0][0] == "eth_blockNumber"
-    assert batch[0][2] is provider_mod.to_int
+    assert batch[0][2] is to_int
     assert batch[1] == ("foo", (1,), None)
     assert batch[2] == ("bar", (), None)
 
@@ -163,7 +165,7 @@ def test_provider_request_batch_pool_includes_tip_probe(monkeypatch: pytest.Monk
 def test_provider_request_batch_pool_rpc_errors_returned_in_position(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
+    monkeypatch.setattr(es_mod, "Endpoint", FakeEndpoint)
 
     p = provider_mod.Provider(
         internal_endpoints=["http://a"],
@@ -191,7 +193,7 @@ def test_provider_request_batch_pool_rpc_errors_returned_in_position(
 def test_provider_request_batch_freshness_rejects_entire_batch_and_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
+    monkeypatch.setattr(es_mod, "Endpoint", FakeEndpoint)
 
     p = provider_mod.Provider(
         internal_endpoints=["http://a", "http://b"],
@@ -227,7 +229,7 @@ def test_provider_request_batch_freshness_rejects_entire_batch_and_retries(
 def test_provider_request_batch_tip_probe_rpcerror_rotates_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
+    monkeypatch.setattr(es_mod, "Endpoint", FakeEndpoint)
 
     p = provider_mod.Provider(
         internal_endpoints=["http://a", "http://b"],
@@ -254,7 +256,7 @@ def test_provider_request_batch_tip_probe_rpcerror_rotates_endpoint(
 def test_provider_request_batch_transport_errors_raise_allendpointsfailed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
+    monkeypatch.setattr(es_mod, "Endpoint", FakeEndpoint)
 
     p = provider_mod.Provider(
         internal_endpoints=["http://a", "http://b"],

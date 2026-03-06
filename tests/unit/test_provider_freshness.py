@@ -6,9 +6,10 @@ from typing import Any, Callable, Optional
 
 import pytest
 
-import fastweb3.provider as provider_mod
-from fastweb3.errors import NoEndpoints
-from fastweb3.provider import Provider
+import fastweb3.provider.endpoint_selection as es_mod
+import fastweb3.provider.execution as exec_mod
+from fastweb3.errors import AllEndpointsFailed, NoEndpoints
+from fastweb3.provider import Provider, RetryPolicy
 
 
 class DummyPoolManager:
@@ -64,7 +65,7 @@ class FakeEndpoint:
 @pytest.fixture
 def patch_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     # Patch the Endpoint class used inside Provider to our FakeEndpoint.
-    monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
+    monkeypatch.setattr(es_mod, "Endpoint", FakeEndpoint)
 
 
 def _fresh_latest(_resp: Any, required_tip: int, returned_tip: int) -> bool:
@@ -191,7 +192,7 @@ def test_rpc_error_bubbles_immediately(
         pass
 
     # Patch provider_mod.RPCError to our dummy so Provider's except RPCError catches it.
-    monkeypatch.setattr(provider_mod, "RPCError", DummyRPCError)
+    monkeypatch.setattr(exec_mod, "RPCError", DummyRPCError)
 
     def raise_rpc_error(*args: Any, **kwargs: Any) -> Any:
         raise DummyRPCError("rpc boom")
@@ -210,7 +211,7 @@ def test_freshness_unmet_eventually_errors(patch_endpoint: None) -> None:
         ["http://a", "http://b"],
         pool_manager=pm,
         desired_pool_size=2,
-        retry_policy_pool=provider_mod.RetryPolicy(max_attempts=3, backoff_seconds=0.0),
+        retry_policy_pool=RetryPolicy(max_attempts=3, backoff_seconds=0.0),
     )
     p._FRESHNESS_WAIT_CAP_SECONDS = 0.0  # type: ignore[attr-defined]
 
@@ -226,5 +227,5 @@ def test_freshness_unmet_eventually_errors(patch_endpoint: None) -> None:
     a.queue_batch(49, "A")
     b.queue_batch(49, "B")
 
-    with pytest.raises(provider_mod.AllEndpointsFailed):
+    with pytest.raises(AllEndpointsFailed):
         p.request("eth_test", [], route="pool", freshness=_fresh_latest)

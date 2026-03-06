@@ -7,7 +7,7 @@ from typing import Any, Deque
 
 import pytest
 
-import fastweb3.provider as provider_mod
+import fastweb3.provider.endpoint_selection as es_mod
 import fastweb3.utils as utils_mod
 from fastweb3.errors import (
     AllEndpointsFailed,
@@ -159,13 +159,13 @@ def _rpc_error(code: int = -32000, message: str = "boom", data: Any = None) -> R
 @pytest.fixture(autouse=True)
 def _patch_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     # Ensure Provider constructs FakeEndpoint.
-    monkeypatch.setattr(provider_mod, "Endpoint", FakeEndpoint)
+    monkeypatch.setattr(es_mod, "Endpoint", FakeEndpoint)
 
 
 @pytest.fixture(autouse=True)
 def _patch_normalize(monkeypatch: pytest.MonkeyPatch) -> None:
     # Ensure Provider uses the real normalize_target by default (includes env expansion).
-    monkeypatch.setattr(provider_mod, "normalize_target", utils_mod.normalize_target)
+    monkeypatch.setattr(es_mod, "normalize_target", utils_mod.normalize_target)
 
 
 @pytest.fixture
@@ -175,7 +175,7 @@ def no_sleep(monkeypatch: pytest.MonkeyPatch):
     def _sleep(secs: float) -> None:
         sleeps.append(float(secs))
 
-    monkeypatch.setattr(provider_mod.time, "sleep", _sleep)
+    monkeypatch.setattr(es_mod.time, "sleep", _sleep)
     return sleeps
 
 
@@ -186,13 +186,13 @@ def fixed_time(monkeypatch: pytest.MonkeyPatch):
     def _time() -> float:
         return float(now["t"])
 
-    monkeypatch.setattr(provider_mod.time, "time", _time)
+    monkeypatch.setattr(es_mod.time, "time", _time)
     return now
 
 
 def _ep(p: Provider, target: str) -> FakeEndpoint:
     # Helper: grab cached endpoint by normalized target.
-    nt = provider_mod.normalize_target(target)
+    nt = es_mod.normalize_target(target)
     return p._eps_by_target[nt]  # type: ignore[attr-defined]
 
 
@@ -338,7 +338,7 @@ def test_cooldown_skips_failed_endpoint_until_expired(fixed_time, no_sleep) -> N
 
 
 def test_add_endpoint_dedups_normalized_target(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(provider_mod, "normalize_target", lambda u: u.strip().lower())
+    monkeypatch.setattr(es_mod, "normalize_target", lambda u: u.strip().lower())
 
     p = Provider([])
     p.add_endpoint("HTTP://EXAMPLE.INVALID ")
@@ -349,7 +349,7 @@ def test_add_endpoint_dedups_normalized_target(monkeypatch: pytest.MonkeyPatch) 
 def test_remove_endpoint_removes_from_internal_pool_but_does_not_close_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(provider_mod, "normalize_target", lambda u: u.strip().lower())
+    monkeypatch.setattr(es_mod, "normalize_target", lambda u: u.strip().lower())
 
     p = Provider(["http://example.invalid", "http://other.invalid"])
     ep = p._eps_by_target["http://example.invalid"]  # type: ignore[attr-defined]
