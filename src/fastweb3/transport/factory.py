@@ -1,3 +1,5 @@
+"""Transport factory for endpoint targets."""
+
 from __future__ import annotations
 
 import os
@@ -15,6 +17,26 @@ def make_transport(
     wss: WSSTransportConfig | None = None,
     ipc: IPCTransportConfig | None = None,
 ) -> Transport:
+    """Create a transport instance for an endpoint target.
+
+    Args:
+        target: Endpoint target string. Supported formats:
+
+            * ``http://...`` / ``https://...``
+            * ``ws://...`` / ``wss://...`` (requires ``websocket-client``)
+            * ``ipc://<path>``
+            * absolute file path (treated as IPC)
+
+        http: Optional HTTP transport configuration.
+        wss: Optional WebSocket transport configuration.
+        ipc: Optional IPC transport configuration.
+
+    Returns:
+        A transport instance.
+
+    Raises:
+        ValueError: If the target cannot be mapped to a known transport.
+    """
     t = target.strip()
 
     if t.startswith(("http://", "https://")):

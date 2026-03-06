@@ -1,3 +1,5 @@
+"""Transport interfaces and configuration types."""
+
 from .base import Transport
 from .factory import make_transport
 from .http import HTTPTransportConfig

@@ -1,4 +1,6 @@
 # src/fastweb3/transport/ipc.py
+"""IPC (Unix domain socket) transport implementation."""
+
 from __future__ import annotations
 
 import json
@@ -13,6 +15,17 @@ from .base import JSONPayload, JSONResp
 
 @dataclass(frozen=True)
 class IPCTransportConfig:
+    """Configuration for `IPCTransport`.
+
+    Attributes:
+        connect_timeout: Timeout for connecting to the socket.
+        recv_timeout: Timeout for receiving a response.
+        send_timeout: Timeout for sending a request.
+        read_chunk_bytes: Size of each recv() chunk.
+        max_response_bytes: Hard cap on response size to prevent unbounded
+            memory use.
+    """
+
     connect_timeout: float = 2.0
     recv_timeout: float = 20.0
     send_timeout: float = 20.0
@@ -25,16 +38,21 @@ class IPCTransportConfig:
 
 
 class IPCTransport:
-    """
-    Sync IPC (Unix domain socket) transport for JSON-RPC.
+    """Synchronous IPC (Unix domain socket) transport for JSON-RPC.
 
     Notes:
-      - Single in-flight request per transport (guarded by a lock).
-      - If the socket drops, we reconnect on the next send().
-      - Uses socket.settimeout(...) (portable) rather than SO_*TIMEO (platform-specific).
+        * Single in-flight request per transport (guarded by a lock).
+        * If the socket drops, the next `send()` reconnects.
+        * Uses ``socket.settimeout`` for portability.
     """
 
     def __init__(self, path: str, *, config: IPCTransportConfig | None = None) -> None:
+        """Create an IPC transport.
+
+        Args:
+            path: Filesystem path to the Unix domain socket.
+            config: Optional transport configuration.
+        """
         self.path = path
         self.config = config or IPCTransportConfig()
 
@@ -43,6 +61,7 @@ class IPCTransport:
         self._closed = False
 
     def close(self) -> None:
+        """Close the transport and any open socket."""
         self._closed = True
         with self._lock:
             if self._sock is not None:
@@ -78,6 +97,18 @@ class IPCTransport:
         return self._sock
 
     def send(self, payload: JSONPayload) -> JSONResp:
+        """Send a JSON-RPC payload over IPC.
+
+        Args:
+            payload: JSON-RPC payload (single object or batch list).
+
+        Returns:
+            Decoded JSON response.
+
+        Raises:
+            TransportError: For connection and protocol errors.
+            TypeError: If the decoded JSON is not an object or list of objects.
+        """
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
 
         with self._lock:

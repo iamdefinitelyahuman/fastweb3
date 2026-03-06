@@ -1,4 +1,16 @@
 # src/fastweb3/endpoint.py
+"""Endpoint-level JSON-RPC request/response handling.
+
+An `fastweb3.endpoint.Endpoint` encapsulates JSON-RPC semantics for a
+single RPC target (URL or IPC path), including:
+
+* request ID generation
+* JSON-RPC envelope construction
+* response validation and JSON-RPC error parsing
+
+Wire I/O is delegated to a `fastweb3.transport.base.Transport`.
+"""
+
 from __future__ import annotations
 
 import itertools
@@ -13,27 +25,31 @@ Formatter = Callable[[Any], Any]
 
 @dataclass(frozen=True)
 class EndpointConfig:
+    """Configuration for an `Endpoint`.
+
+    This is currently a placeholder for future per-endpoint knobs (timeouts,
+    weights, tags, etc.).
+    """
+
     # placeholder for later: per-endpoint timeouts, tags, weights, etc.
     pass
 
 
 class Endpoint:
-    """
-    JSON-RPC semantics for a single endpoint target.
+    """JSON-RPC semantics for a single endpoint target.
 
-    Owns:
-      - request id counter
-      - JSON-RPC envelope
-      - response validation / error parsing
-    Delegates wire I/O to Transport (HTTP / WSS / IPC).
+    An endpoint is responsible for JSON-RPC request IDs, envelope construction,
+    and response validation. It delegates wire I/O to a transport (HTTP/WSS/IPC).
 
-    Notes on batch semantics:
-      - request() raises RPCError for JSON-RPC "error" responses.
-      - request_batch() returns a list aligned to request order, where each element is either:
-          * the (optionally formatted) result value, or
-          * an RPCError instance for that specific call
-        Batch-level failures (transport, malformed response shape, missing/duplicate ids, etc.)
-        still raise immediately.
+    Batch semantics:
+        * `request()` raises `fastweb3.errors.RPCError` when a JSON-RPC
+          response includes an ``error`` object.
+        * `request_batch()` returns a list aligned to the request order.
+          Each element is either a result value or a `fastweb3.errors.RPCError`
+          instance for that particular call.
+
+          Batch-level failures (transport errors, malformed response shape,
+          missing/duplicate IDs, etc.) raise immediately.
     """
 
     def __init__(
@@ -43,6 +59,15 @@ class Endpoint:
         transport: Optional[Transport] = None,
         config: EndpointConfig | None = None,
     ) -> None:
+        """Create an endpoint.
+
+        Args:
+            target: Endpoint target string. Typically an HTTP(S) or WS(S) URL,
+                or an IPC target.
+            transport: Optional transport instance. If omitted, a transport is
+                created based on ``target``.
+            config: Optional endpoint configuration.
+        """
         self.target = target
         self.config = config or EndpointConfig()
         self.transport = transport or make_transport(target)
@@ -77,6 +102,7 @@ class Endpoint:
         return RPCError(details)
 
     def close(self) -> None:
+        """Close the underlying transport."""
         self.transport.close()
 
     def request(
@@ -85,6 +111,22 @@ class Endpoint:
         params: list[Any] | tuple[Any, ...],
         formatter: Formatter | None = None,
     ) -> Any:
+        """Execute a single JSON-RPC request.
+
+        Args:
+            method: JSON-RPC method name (e.g. ``"eth_getBalance"``).
+            params: JSON-RPC params.
+            formatter: Optional function applied to the raw ``result``.
+
+        Returns:
+            The (optionally formatted) JSON-RPC ``result``.
+
+        Raises:
+            RPCError: If the JSON-RPC response includes an ``error`` object.
+            RPCMalformedResponse: If the response shape does not match the
+                JSON-RPC 2.0 expectations.
+            TransportError: For network/transport failures.
+        """
         request_id = next(self._counter)
         payload: Mapping[str, Any] = self._build_payload(request_id, method, params)
 
@@ -108,21 +150,21 @@ class Endpoint:
         | tuple[str, Sequence[Any], Formatter]
         | tuple[str, Sequence[Any], None],
     ) -> list[Any | RPCError]:
-        """
-        Execute a JSON-RPC batch request.
+        """Execute a JSON-RPC batch request.
 
-        Each call is either:
-          - (method, params)
-          - (method, params, formatter)
+        Each call is one of:
 
-        Return value:
-          A list aligned to the call order. Each element is either:
-            - the (optionally formatted) result value, or
-            - an RPCError instance if that specific call returned a JSON-RPC error object.
+        * ``(method, params)``
+        * ``(method, params, formatter)``
+
+        Returns:
+            A list aligned to the call order. Each element is either a result
+            value (optionally formatted) or a `fastweb3.errors.RPCError`
+            instance if that specific call returned a JSON-RPC error.
 
         Raises:
-          - TransportError for network/transport failures
-          - RPCMalformedResponse for invalid/malformed batch responses
+            RPCMalformedResponse: If the batch response shape is invalid.
+            TransportError: For network/transport failures.
         """
         if not calls:
             return []

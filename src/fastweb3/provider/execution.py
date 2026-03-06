@@ -1,3 +1,13 @@
+"""Request execution logic for `fastweb3.provider.Provider`.
+
+This mixin contains the core logic for single and batch execution, including:
+
+* endpoint retries and cooldowns
+* optional hedged requests
+* optional "freshness" enforcement using block tip pinning
+* optional RPC error retry for safe read methods
+"""
+
 from __future__ import annotations
 
 import queue
@@ -23,6 +33,8 @@ from .types import (
 
 
 class ExecutionMixin:
+    """Mixin that implements Provider.request and Provider.request_batch."""
+
     def _attempt(
         self,
         ep,
@@ -574,6 +586,29 @@ class ExecutionMixin:
         formatter=None,
         freshness=None,
     ) -> Any:
+        """Execute a single JSON-RPC call.
+
+        Args:
+            method: JSON-RPC method name.
+            params: JSON-RPC params.
+            route: Routing hint: ``"pool"`` uses the pool (internal endpoints
+                + pool manager), and ``"primary"`` routes to the primary
+                endpoint.
+            formatter: Optional formatter applied to the result.
+            freshness: Optional freshness predicate
+                ``freshness(result, required_tip, returned_tip) -> bool``.
+
+        Returns:
+            The result (optionally formatted).
+
+        Raises:
+            RPCError: If the call results in a JSON-RPC error response.
+            TransportError: For transport-level failures that cannot be
+                recovered.
+            AllEndpointsFailed: If all eligible endpoints failed.
+            NoPrimaryEndpoint: If ``route="primary"`` is used without a
+                configured primary.
+        """
         if route not in ("pool", "primary"):
             raise ValueError("route must be 'pool' or 'primary'")
 
@@ -614,6 +649,31 @@ class ExecutionMixin:
         *,
         route: str = "pool",
     ) -> list[Any | RPCError]:
+        """Execute a JSON-RPC batch.
+
+        Args:
+            calls: List of call tuples. Each call is one of:
+
+                * ``(method, params)``
+                * ``(method, params, formatter)``
+                * ``(method, params, formatter, freshness)``
+
+                ``freshness`` is a predicate
+                ``freshness(result, required_tip, returned_tip) -> bool``.
+            route: Routing hint: ``"pool"`` or ``"primary"``.
+
+        Returns:
+            A list aligned to ``calls``. Each element is either a result value
+            (optionally formatted) or a `fastweb3.errors.RPCError`
+            instance for the corresponding call.
+
+        Raises:
+            TransportError: For transport-level failures that cannot be
+                recovered.
+            AllEndpointsFailed: If all eligible endpoints failed.
+            NoPrimaryEndpoint: If ``route="primary"`` is used without a
+                configured primary.
+        """
         if route not in ("pool", "primary"):
             raise ValueError("route must be 'pool' or 'primary'")
         if not calls:

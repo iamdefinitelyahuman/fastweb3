@@ -1,3 +1,9 @@
+"""Endpoint selection and endpoint lifecycle management.
+
+This mixin tracks internal endpoints, an optional primary endpoint, and an
+optional pool-manager-derived set of public endpoints.
+"""
+
 from __future__ import annotations
 
 import time
@@ -9,6 +15,8 @@ from .types import _EndpointState
 
 
 class EndpointSelectionMixin:
+    """Mixin implementing endpoint management for `fastweb3.provider.Provider`."""
+
     def _get_or_create_endpoint(self, target: str) -> Endpoint:
         nt = normalize_target(target)
         with self._lock:
@@ -21,19 +29,30 @@ class EndpointSelectionMixin:
             return ep
 
     def set_primary(self, target: str) -> None:
+        """Set the primary endpoint.
+
+        The primary endpoint is used for node-local/stateful methods or when
+        explicitly routing requests to ``route="primary"``.
+
+        Args:
+            target: Endpoint target string.
+        """
         ep = self._get_or_create_endpoint(target)
         with self._lock:
             self._primary = ep
 
     def clear_primary(self) -> None:
+        """Clear the configured primary endpoint."""
         with self._lock:
             self._primary = None
 
     def primary_endpoint(self) -> str | None:
+        """Return the primary endpoint target, if configured."""
         with self._lock:
             return self._primary.target if self._primary is not None else None
 
     def has_primary(self) -> bool:
+        """Return ``True`` if a primary endpoint is configured."""
         with self._lock:
             return self._primary is not None
 
@@ -44,6 +63,12 @@ class EndpointSelectionMixin:
             return self._primary
 
     def add_endpoint(self, target: str, *, priority: bool = False) -> None:
+        """Add an internal endpoint target.
+
+        Args:
+            target: Endpoint target string.
+            priority: If ``True``, insert at the front of the internal list.
+        """
         nt = normalize_target(target)
         with self._lock:
             if nt in self._internal_seen:
@@ -56,6 +81,11 @@ class EndpointSelectionMixin:
         self._get_or_create_endpoint(nt)
 
     def remove_endpoint(self, target: str) -> None:
+        """Remove an internal endpoint target.
+
+        Args:
+            target: Endpoint target string.
+        """
         nt = normalize_target(target)
         with self._lock:
             if nt not in self._internal_seen:
@@ -66,10 +96,12 @@ class EndpointSelectionMixin:
                 self._primary = None
 
     def internal_endpoints(self) -> list[str]:
+        """Return a snapshot of configured internal endpoint targets."""
         with self._lock:
             return list(self._internal_targets)
 
     def close(self) -> None:
+        """Close all managed endpoints and clear internal state."""
         with self._lock:
             eps = list(self._eps_by_target.values())
             self._eps_by_target.clear()

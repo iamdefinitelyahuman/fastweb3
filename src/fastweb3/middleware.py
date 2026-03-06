@@ -1,4 +1,12 @@
 # src/fastweb3/middleware.py
+"""Provider-level middleware interfaces.
+
+Middlewares are installed on `fastweb3.provider.Provider` instances and
+allow observing or transforming requests and responses.
+
+The public protocol is `ProviderMiddleware`.
+"""
+
 from __future__ import annotations
 
 import threading
@@ -13,110 +21,128 @@ if TYPE_CHECKING:
 
 @dataclass
 class MiddlewareContext:
-    """
-    @notice
-        Per-request scratchpad passed to middleware hooks.
+    """Per-request scratchpad passed to middleware hooks.
 
-        This exists so a middleware can:
-          - compute some mapping/metadata in `before_request(...)`, store it on `ctx.state`,
-          - and then use it later in `after_request(...)` (or `on_exception(...)`).
+    This exists so a middleware can store per-request state in
+    `MiddlewareContext.state` during `ProviderMiddleware.before_request()` and
+    reuse it during `ProviderMiddleware.after_request()` or
+    `ProviderMiddleware.on_exception()`.
 
-        This avoids storing per-request state on the middleware instance itself
-        (which is error-prone if the same middleware object is reused across
-        multiple Provider instances or concurrent calls).
-
-    @dev
-        `state` is intentionally an unstructured dict:
-          - keys SHOULD be stable and unique per middleware (using `self` is fine)
-          - values can be anything (mappings, timestamps, counters, etc.)
+    Attributes:
+        state: An unstructured dictionary for middleware-owned state. Keys
+            should be stable and unique per middleware (using ``self`` is fine).
     """
 
     state: dict[object, Any]
 
 
 class ProviderMiddleware(Protocol):
-    """
-    @notice
-        Provider-level middleware interface.
+    """Provider-level middleware interface.
 
-        Middlewares are installed per Provider instance via `Provider.add_middleware(...)`.
+    Middlewares are installed per provider instance via
+    `fastweb3.provider.Provider.add_middleware()`.
 
-        All hooks are OPTIONAL: Provider checks for method existence with `getattr()`.
-        Implement only what you need.
+    All hooks are optional. The provider checks for hook existence via
+    `getattr()`.
 
-    @dev
-        Execution order for middlewares [A, B, C] in attach order:
+    Execution order for middlewares ``[A, B, C]`` in attach order:
 
-            before_request:  A -> B -> C
-            core request:                Provider routing/Endpoint calls happen here
-            after_request:   C -> B -> A
-            on_exception:    C -> B -> A   (only when the core raises an exception)
+    * ``before_request``: ``A -> B -> C``
+    * core request: provider routing/endpoint calls happen here
+    * ``after_request``: ``C -> B -> A``
+    * ``on_exception``: ``C -> B -> A`` (only when the core raises)
 
-        Important distinction:
-          - Per-call JSON-RPC failures inside a batch are returned as `RPCError` items
-            in the `results` list and will flow through `after_request(...)`.
-          - Transport-wide failures (timeouts, connection errors, HTTP errors, etc.)
-            raise exceptions (usually `TransportError`) and trigger `on_exception(...)`.
+    Important distinction:
+
+    * Per-call JSON-RPC failures inside a batch are returned as
+      `fastweb3.errors.RPCError` items in the ``results`` list and flow
+      through ``after_request``.
+    * Transport-wide failures (timeouts, connection errors, HTTP errors, etc.)
+      raise exceptions (usually `fastweb3.errors.TransportError`) and
+      trigger ``on_exception``.
 
     Typical patterns:
 
-      1) Caching / Dedupe / Batch shaping
-         - Implement `before_request` to drop/rewrite calls.
-         - Store a mapping in `ctx.state`.
-         - Implement `after_request` to expand/rewrite results back to the original shape.
+    1. Caching / dedupe / batch shaping
+       * Implement ``before_request`` to drop/rewrite calls.
+       * Store a mapping in ``ctx.state``.
+       * Implement ``after_request`` to expand/rewrite results back.
 
-      2) Observability (logging/metrics/tracing)
-         - Implement `before_request` to record a start time in `ctx.state`.
-         - Implement `after_request` to record duration, sizes, etc.
-         - Optionally implement `on_exception` to record failures.
+    2. Observability (logging/metrics/tracing)
+       * Implement ``before_request`` to record a start time.
+       * Implement ``after_request`` to record duration and sizes.
+       * Optionally implement ``on_exception`` to record failures.
 
-      3) Recovery on transport failures (advanced)
-         - Implement `on_exception` to retry or fall back.
-         - If you can recover, return a `results` list aligned 1:1 with the `calls`
-           list that the Provider attempted to execute.
-         - If you cannot recover, return the exception (or raise) to propagate.
+    3. Recovery on transport failures (advanced)
+       * Implement ``on_exception`` to retry or fall back.
+       * If you can recover, return a ``results`` list aligned 1:1 with the
+         ``calls`` list the provider attempted to execute.
+       * If you cannot recover, return or raise the exception to propagate.
 
-    Constraints & best practices:
+    Constraints:
 
-      - `before_request(ctx, calls)`:
-          * receives a list of canonical call objects (`_BatchCall`)
-          * may return a NEW list (or the same list) to change what gets executed
-          * for `Provider.request()` (single call), the Provider expects the middleware
-            chain to leave exactly ONE call; transforming it into many calls is an error.
-
-      - `after_request(ctx, calls, results)`:
-          * receives the final executed `calls` list (after all `before_request` hooks)
-          * `results` is aligned to `calls` (same length, same order)
-          * may return a NEW list of results (usually same length as `calls`),
-            or (if your middleware shrank the calls) you can return results expanded
-            to the original call list shape using a mapping saved in `ctx.state`.
-
-      - `on_exception(ctx, calls, exc)`:
-          * called only when the core raises an exception (e.g., `TransportError`)
-          * may return:
-              - `results` list (recovered), OR
-              - an `Exception` (propagate)
-          * if multiple middlewares implement `on_exception`, they are invoked in
-            reverse attach order until one returns recovered results, or the chain ends.
+    * ``before_request(ctx, calls)`` receives canonical call objects
+      (``_BatchCall``) and may return a new list.
+    * For single-call ``Provider.request()``, the middleware chain must leave
+      exactly one call; transforming it into many calls is an error.
+    * ``after_request(ctx, calls, results)`` receives executed ``calls``
+      (post-``before_request``) and results aligned to those calls.
+    * ``on_exception(ctx, calls, exc)`` is invoked in reverse attach order until
+      one middleware returns recovered results or the chain ends.
     """
 
     def before_request(
         self, ctx: MiddlewareContext, calls: list["_BatchCall"]
-    ) -> list["_BatchCall"]: ...
+    ) -> list["_BatchCall"]:
+        """Hook executed before the provider makes the request(s).
+
+        Args:
+            ctx: Per-request context.
+            calls: Canonical call objects. Middleware may return a new list to
+                change what the provider executes.
+
+        Returns:
+            The call list to execute.
+        """
+        ...
 
     def after_request(
         self,
         ctx: MiddlewareContext,
         calls: list["_BatchCall"],
         results: list[Any | RPCError],
-    ) -> list[Any | RPCError]: ...
+    ) -> list[Any | RPCError]:
+        """Hook executed after the provider receives results.
+
+        Args:
+            ctx: Per-request context.
+            calls: The executed call list (post-``before_request``).
+            results: Results aligned to ``calls``. Elements are either values
+                or `fastweb3.errors.RPCError` instances.
+
+        Returns:
+            The results list to return to the caller.
+        """
+        ...
 
     def on_exception(
         self,
         ctx: MiddlewareContext,
         calls: list["_BatchCall"],
         exc: Exception,
-    ) -> list[Any | RPCError] | Exception: ...
+    ) -> list[Any | RPCError] | Exception:
+        """Hook executed when the provider raises an exception.
+
+        Args:
+            ctx: Per-request context.
+            calls: The call list that was attempted.
+            exc: The exception raised by the provider.
+
+        Returns:
+            Either a recovered results list aligned to ``calls`` or an
+            exception to propagate.
+        """
+        ...
 
 
 DefaultMiddlewareFactory = Callable[["Provider"], ProviderMiddleware | None]
@@ -127,32 +153,24 @@ _default_specs: list[DefaultMiddlewareSpec] = []
 
 
 def register_default_middleware(spec: DefaultMiddlewareSpec, *, prepend: bool = False) -> None:
-    """
-    @notice
-        Register a default middleware spec applied to newly-created Provider instances.
+    """Register a default middleware applied to newly-created providers.
 
-    @dev
-        This is global process state.
+    This is global process state.
 
-        `spec` forms:
-          - middleware instance:
-              register_default_middleware(MyMiddleware())
-              NOTE: the same instance will be attached to every Provider that is created.
+    Args:
+        spec: One of:
 
-          - middleware class:
-              register_default_middleware(MyMiddleware)
-              A new instance will be created for each Provider.
+            * Middleware instance: the same instance is attached to every
+              provider.
+            * Middleware class: instantiated once per provider.
+            * Factory: ``factory(provider) -> middleware | None`` (return ``None``
+              to skip).
 
-          - factory:
-              def factory(provider) -> ProviderMiddleware | None: ...
-              register_default_middleware(factory)
-              The factory runs once per Provider init. Return None to skip.
+        prepend: If ``True``, insert the spec at the front of the default list.
 
-        Ordering:
-          - Defaults are applied to each Provider in registration order.
-          - If prepend=True, the spec is inserted at the front of the defaults list.
-
-        This does not affect already-instantiated Providers.
+    Notes:
+        Defaults are applied to each provider in registration order. This does
+        not affect already-instantiated providers.
     """
     with _default_lock:
         if prepend:
@@ -189,15 +207,17 @@ def _resolve_middleware(
 
 
 def _apply_default_middlewares(provider: "Provider") -> None:
-    """
-    @dev
-        Called by Provider.__init__ to attach global defaults to the new instance.
+    """Attach registered default middlewares to a new provider.
 
-        Two-pass behavior:
-          1) resolve all eligible middlewares without mutating provider._middlewares
-          2) add them in order
+    Called by ``Provider.__init__``.
 
-        This avoids factories observing side effects from earlier additions during the same init.
+    The attachment happens in two passes:
+
+    1. Resolve all eligible middlewares without mutating the provider.
+    2. Add them in order.
+
+    This prevents factories from observing side effects from earlier additions
+    during the same provider initialization.
     """
     with _default_lock:
         specs = list(_default_specs)

@@ -1,3 +1,5 @@
+"""Heuristics for retrying safe JSON-RPC calls when RPC errors occur."""
+
 from __future__ import annotations
 
 import re

@@ -1,3 +1,15 @@
+"""Provider implementation.
+
+The provider layer powers `fastweb3.web3.web3.Web3`. It coordinates:
+
+* endpoint selection (internal endpoints, primary endpoint, and the public pool)
+* request execution with retry/hedging
+* middleware orchestration
+
+Most users should use `fastweb3.web3.web3.Web3` instead of creating a
+provider directly.
+"""
+
 from __future__ import annotations
 
 import threading
@@ -17,7 +29,11 @@ def _default_is_retryable_exc(exc: Exception) -> bool:
 
 
 class Provider(MiddlewareMixin, EndpointSelectionMixin, ExecutionMixin):
-    """Facade over endpoint selection, execution, and middleware orchestration."""
+    """Facade over endpoint selection, execution, and middleware orchestration.
+
+    This is an advanced interface. In typical usage, you should construct and
+    interact with `fastweb3.web3.web3.Web3` instead.
+    """
 
     _FRESHNESS_WAIT_CAP_SECONDS: float = 5.0
     _HEDGE_MIN_DELAY_SECONDS: float = 0.05
@@ -33,6 +49,29 @@ class Provider(MiddlewareMixin, EndpointSelectionMixin, ExecutionMixin):
         hedge_after_seconds: float | None = 0.2,
         hedge_slow_cooldown_seconds: float = 10.0,
     ) -> None:
+        """Create a provider.
+
+        Args:
+            internal_endpoints: Optional sequence of endpoint targets to use as
+                the internal pool. These are deduplicated and merged with any
+                pool-manager URLs.
+            pool_manager: Optional pool manager used to discover public RPC
+                endpoints for the configured chain.
+            desired_pool_size: Desired total pool size when using a pool
+                manager. The provider will attempt to fill the pool up to this
+                size (including internal endpoints).
+            retry_policy_pool: Retry policy for pool requests.
+            is_retryable_exc: Predicate used to classify exceptions as
+                retryable.
+            hedge_after_seconds: If set, issue a "hedged" second request to a
+                different endpoint after this delay when the first request has
+                not completed.
+            hedge_slow_cooldown_seconds: Cooldown applied to an endpoint that
+                loses a hedged race.
+
+        Raises:
+            ValueError: If ``hedge_after_seconds`` is set below the minimum.
+        """
         self._lock = threading.Lock()
         self._rr = 0
         self._middlewares: list[object] = []

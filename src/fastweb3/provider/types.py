@@ -1,3 +1,9 @@
+"""Internal provider types.
+
+This module contains small dataclasses used by the provider implementation.
+Only `RetryPolicy` is considered part of the advanced public API.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,12 +15,21 @@ from ..errors import RPCError, TransportError
 
 @dataclass(frozen=True)
 class RetryPolicy:
+    """Retry configuration for pool requests.
+
+    Attributes:
+        max_attempts: Maximum number of attempts across distinct endpoints.
+        backoff_seconds: Fixed backoff applied between attempts.
+    """
+
     max_attempts: int = 3
     backoff_seconds: float = 0.05
 
 
 @dataclass(frozen=True)
 class _BatchCall:
+    """Internal canonical representation of a single call in a batch."""
+
     method: str
     params: list[Any] | tuple[Any, ...]
     formatter: Formatter | None = None
@@ -23,6 +38,8 @@ class _BatchCall:
 
 @dataclass
 class _EndpointState:
+    """Internal per-endpoint health and cooldown state."""
+
     # Cooldown due to request/transport failures (exponential-ish backoff)
     error_cooldown_until: float = 0.0
     failures: int = 0
@@ -43,6 +60,8 @@ class _FreshnessUnmet(TransportError):
 
 @dataclass(frozen=True)
 class _AttemptOutcome:
+    """Internal result container for a single attempt."""
+
     value: Any | None
     exc: Exception | None
     returned_tip: int | None
@@ -50,6 +69,8 @@ class _AttemptOutcome:
 
 @dataclass(frozen=True)
 class _BatchAttemptOutcome:
+    """Internal result container for a batch attempt."""
+
     values: list[Any | RPCError] | None
     exc: Exception | None
     returned_tip: int | None

@@ -1,3 +1,9 @@
+"""Provider middleware orchestration.
+
+This mixin implements the execution order described by
+`fastweb3.middleware.ProviderMiddleware`.
+"""
+
 from __future__ import annotations
 
 from ..errors import RPCError
@@ -6,7 +12,16 @@ from .types import _BatchCall
 
 
 class MiddlewareMixin:
+    """Mixin implementing middleware registration and hook execution."""
+
     def add_middleware(self, mw, *, prepend: bool = False) -> None:
+        """Attach a middleware to this provider.
+
+        Args:
+            mw: Middleware instance.
+            prepend: If ``True``, place the middleware at the front of the
+                chain.
+        """
         with self._lock:
             if prepend:
                 self._middlewares.insert(0, mw)
@@ -16,6 +31,7 @@ class MiddlewareMixin:
     def _run_middlewares_before(
         self, ctx: MiddlewareContext, calls: list[_BatchCall]
     ) -> list[_BatchCall]:
+        """Run ``before_request`` hooks in attach order."""
         with self._lock:
             mws = list(self._middlewares)
         for mw in mws:
@@ -30,6 +46,7 @@ class MiddlewareMixin:
         calls: list[_BatchCall],
         results: list[object | RPCError],
     ) -> list[object | RPCError]:
+        """Run ``after_request`` hooks in reverse attach order."""
         with self._lock:
             mws = list(self._middlewares)
         for mw in reversed(mws):
@@ -44,6 +61,11 @@ class MiddlewareMixin:
         calls: list[_BatchCall],
         exc: Exception,
     ) -> list[object | RPCError] | Exception:
+        """Run ``on_exception`` hooks in reverse attach order.
+
+        The chain stops early once a middleware returns a non-exception
+        (recovered results).
+        """
         with self._lock:
             mws = list(self._middlewares)
         out: list[object | RPCError] | Exception = exc

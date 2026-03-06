@@ -1,4 +1,6 @@
 # src/fastweb3/utils.py
+"""Small helpers for target normalization and environment expansion."""
+
 import os
 import re
 from urllib.parse import urlsplit, urlunsplit
@@ -7,10 +9,16 @@ _ENV_VAR_RE = re.compile(r"\$(\w+)|\$\{([^}]+)\}")
 
 
 def _expand_env_vars(s: str) -> str:
-    """
-    Expand $VARNAME and ${VARNAME} using os.environ.
+    """Expand ``$VARNAME`` and ``${VARNAME}`` using :data:`os.environ`.
 
-    Raises ValueError if a referenced env var is not set.
+    Args:
+        s: String containing environment variable references.
+
+    Returns:
+        The expanded string.
+
+    Raises:
+        ValueError: If a referenced environment variable is not set.
     """
 
     def repl(m: re.Match[str]) -> str:
@@ -25,22 +33,35 @@ def _expand_env_vars(s: str) -> str:
 
 
 def is_url_target(target: str) -> bool:
-    """
-    Return True if `target` is an HTTP(S)/WS(S) URL-like endpoint target.
-    This is a deliberately simple prefix check to avoid mis-parsing IPC paths.
+    """Return ``True`` if ``target`` is an HTTP(S)/WS(S) URL.
+
+    This is deliberately a simple prefix check to avoid mis-parsing IPC paths.
+
+    Args:
+        target: Endpoint target string.
+
+    Returns:
+        ``True`` for HTTP(S)/WS(S) URLs, otherwise ``False``.
     """
     t = target.strip().lower()
     return t.startswith(("http://", "https://", "ws://", "wss://"))
 
 
 def normalize_target(target: str) -> str:
-    """
-    Normalize an endpoint *target* for deduplication.
+    """Normalize an endpoint target for deduplication.
 
-    - expand env vars ($FOO / ${FOO})
-    - strip whitespace
-    - if the target is a URL (http/https/ws/wss), apply normalize_url()
-    - otherwise return the expanded/stripped target unchanged (IPC paths, etc.)
+    The normalization steps are:
+
+    * expand environment variables (``$FOO`` / ``${FOO}``)
+    * strip whitespace
+    * if the target is a URL, apply `normalize_url()`
+    * otherwise return the expanded/stripped value unchanged (IPC paths, etc.)
+
+    Args:
+        target: Endpoint target string.
+
+    Returns:
+        Normalized target.
     """
     t = _expand_env_vars(target).strip()
     if is_url_target(t):
@@ -49,16 +70,22 @@ def normalize_target(target: str) -> str:
 
 
 def normalize_url(url: str) -> str:
-    """
-    Normalize URLs for deduplication.
+    """Normalize a URL for deduplication.
 
-    URL-specific normalization:
-    - expand env vars ($FOO / ${FOO})
-    - strip whitespace
-    - lowercase scheme + host
-    - collapse default port
-    - normalize path (strip trailing slash except root)
-    - preserve query/fragment
+    URL normalization includes:
+
+    * expand environment variables (``$FOO`` / ``${FOO}``)
+    * strip whitespace
+    * lowercase scheme + host
+    * collapse default ports
+    * normalize the path (strip trailing slash except root)
+    * preserve query/fragment
+
+    Args:
+        url: URL string.
+
+    Returns:
+        Normalized URL string.
     """
     url = _expand_env_vars(url).strip()
     parts = urlsplit(url)

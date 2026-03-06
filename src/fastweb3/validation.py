@@ -1,3 +1,5 @@
+"""Client-side validators and normalizers for common Ethereum JSON-RPC types."""
+
 from __future__ import annotations
 
 from typing import Any, Mapping
@@ -20,13 +22,21 @@ def _require(cond: bool, msg: str) -> None:
 
 
 def normalize_address(addr: str | bytes, *, strict: bool) -> str:
-    """
-    Accepts:
-      - str: 0x + 40 hex chars (any case). Does NOT enforce EIP-55 checksum.
-      - bytes: length 20
+    """Normalize an Ethereum address.
+
+    Args:
+        addr: Address as a ``0x``-prefixed hex string or 20-byte value.
+        strict: If ``True``, validate the address shape and normalize to
+            lowercase. If ``False``, strings are passed through (stripped).
+
     Returns:
-      - normalized 0x + lowercase hex in strict mode
-      - passthrough (stripped) in non-strict mode for str inputs
+        Normalized ``0x``-prefixed hex address.
+
+    Raises:
+        ValidationError: If the address is invalid in strict mode.
+
+    Notes:
+        This function does not enforce EIP-55 checksum casing.
     """
     if isinstance(addr, bytes):
         if not strict:
@@ -46,11 +56,19 @@ def normalize_address(addr: str | bytes, *, strict: bool) -> str:
 
 
 def hash32(x: str | bytes, *, name: str, strict: bool) -> str:
-    """
-    Accepts:
-      - str: 0x + 64 hex chars
-      - bytes: length 32
-    Returns lowercase 0x-hex in strict mode; passthrough (stripped) in non-strict mode for str input
+    """Normalize a 32-byte hash value.
+
+    Args:
+        x: Hash as a ``0x``-prefixed hex string or 32-byte value.
+        name: Name used in error messages.
+        strict: If ``True``, validate and normalize to lowercase.
+            If ``False``, strings are passed through (stripped).
+
+    Returns:
+        Normalized ``0x``-prefixed lowercase hex string.
+
+    Raises:
+        ValidationError: If the value is invalid in strict mode.
     """
     if isinstance(x, bytes):
         if not strict:
@@ -70,12 +88,20 @@ def hash32(x: str | bytes, *, name: str, strict: bool) -> str:
 
 
 def data_hex(x: str | bytes, *, name: str, strict: bool, allow_empty: bool = True) -> str:
-    """
-    Accepts:
-      - str: 0x-prefixed even-length hex (empty allowed if allow_empty)
-      - bytes: any length (empty allowed if allow_empty)
+    """Normalize arbitrary binary data encoded as hex.
 
-    Returns lowercase 0x-hex in strict mode; passthrough (stripped) in non-strict mode for str input
+    Args:
+        x: Data as a ``0x``-prefixed hex string or bytes.
+        name: Name used in error messages.
+        strict: If ``True``, validate and normalize hex strings to lowercase.
+            If ``False``, strings are passed through (stripped).
+        allow_empty: Whether empty values are allowed.
+
+    Returns:
+        Normalized ``0x``-prefixed lowercase hex string.
+
+    Raises:
+        ValidationError: If the value is invalid.
     """
     if isinstance(x, bytes):
         if not x and allow_empty:
@@ -103,10 +129,18 @@ def data_hex(x: str | bytes, *, name: str, strict: bool, allow_empty: bool = Tru
 
 
 def quantity(x: int | str, *, strict: bool) -> str:
-    """
-    JSON-RPC quantity:
-      - int -> 0x hex (must be 0 <= n <= 2**256-1)
-      - str -> 0x-prefixed hex (validated in strict mode), bound-checked to uint256 in strict mode
+    """Normalize a JSON-RPC quantity.
+
+    Args:
+        x: Quantity as an ``int`` or ``0x``-prefixed hex string.
+        strict: If ``True``, validate the value and enforce uint256 bounds.
+            If ``False``, strings are passed through (stripped).
+
+    Returns:
+        ``0x``-prefixed lowercase hex quantity string.
+
+    Raises:
+        ValidationError: If the quantity is invalid.
     """
     if isinstance(x, int):
         _require(0 <= x <= UINT256_MAX, "quantity ints must be 0 <= n <= 2**256-1")
@@ -130,16 +164,27 @@ def quantity(x: int | str, *, strict: bool) -> str:
 
 
 def index(x: int | str, *, strict: bool) -> str:
-    """Same validation rules as quantity()."""
+    """Normalize an index value.
+
+    This uses the same validation rules as `quantity()`.
+    """
     return quantity(x, strict=strict)
 
 
 def block_id(x: int | str, *, strict: bool) -> str:
-    """
-    Block parameter:
-      - int >= 0 -> hex quantity
-      - str tag -> latest|pending|earliest|safe|finalized (strict mode)
-      - str hex quantity -> validated in strict mode
+    """Normalize a JSON-RPC block identifier.
+
+    Args:
+        x: Block number as an ``int``/hex string, or a tag such as
+            ``"latest"``.
+        strict: If ``True``, validate tags and hex formatting.
+            If ``False``, strings are passed through (stripped).
+
+    Returns:
+        Normalized block identifier.
+
+    Raises:
+        ValidationError: If the block identifier is invalid.
     """
     if isinstance(x, int):
         _require(x >= 0, "block number must be >= 0")
@@ -160,13 +205,18 @@ def block_id(x: int | str, *, strict: bool) -> str:
 def topics(
     topics: list[str | bytes | list[str | bytes] | None] | None, *, strict: bool
 ) -> list[str | list[str] | None] | None:
-    """
-    Filter topics:
-      - list entries can be:
-          - None
-          - topic hash32 (str|bytes)
-          - list of topic hash32 (OR semantics)
-    In strict mode, all hashes are validated as 32-byte values.
+    """Normalize an ``eth_getLogs`` topics filter.
+
+    Args:
+        topics: Topics filter list. Entries may be ``None``, a topic hash, or a
+            list of topic hashes (OR semantics).
+        strict: If ``True``, validate and normalize topic hashes.
+
+    Returns:
+        Normalized topics list (preserving structure) or ``None``.
+
+    Raises:
+        ValidationError: If the topics structure is invalid in strict mode.
     """
     if topics is None:
         return None
@@ -194,11 +244,17 @@ def topics(
 
 
 def validate_tx_object(tx: Mapping[str, Any], *, strict: bool) -> None:
-    """
-    Validate invariants on a JSON-RPC "transaction object" dict.
+    """Validate generic invariants on a transaction object dict.
 
-    This is NOT method-specific ("eth_call" vs "eth_sendTransaction") —
-    it's the generic object shape rules that are basically always user error when violated.
+    This is not method-specific (e.g. ``eth_call`` vs ``eth_sendTransaction``).
+    It checks common shape rules that are typically user errors.
+
+    Args:
+        tx: Transaction object.
+        strict: If ``False``, validation is skipped.
+
+    Raises:
+        ValidationError: If invariants are violated.
     """
     if not strict:
         return
@@ -222,8 +278,14 @@ def validate_tx_object(tx: Mapping[str, Any], *, strict: bool) -> None:
 
 
 def validate_filter_object(flt: Mapping[str, Any], *, strict: bool) -> None:
-    """
-    Validate invariants on a JSON-RPC filter object dict.
+    """Validate generic invariants on a filter object dict.
+
+    Args:
+        flt: Filter object.
+        strict: If ``False``, validation is skipped.
+
+    Raises:
+        ValidationError: If invariants are violated.
     """
     if not strict:
         return

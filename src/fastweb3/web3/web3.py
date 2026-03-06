@@ -1,4 +1,10 @@
 # src/fastweb3/web3.py
+"""High-level Web3 client.
+
+Most users should interact with `Web3` (and its namespaces such as
+`Web3.eth`).
+"""
+
 from __future__ import annotations
 
 import threading
@@ -33,15 +39,26 @@ FreshnessFn = Callable[[Any, int, int], bool]
 
 @dataclass(frozen=True)
 class Web3Config:
+    """Configuration for `Web3`.
+
+    Attributes:
+        strict: If ``True``, validate and normalize inputs for common RPC
+            methods.
+        desired_pool_size: Desired total pool size for pool routing.
+        retry_policy_pool: Retry policy used when routing via the pool.
+    """
+
     strict: bool = True
     desired_pool_size: int = 6
     retry_policy_pool: RetryPolicy = RetryPolicy(max_attempts=3, backoff_seconds=0.05)
 
 
 def _get_default_primary_chain_id_once() -> Optional[int]:
-    """
-    Probe FASTWEB3_PRIMARY_ENDPOINT's chain id once per process.
-    Returns None if not set or probe fails.
+    """Probe the chain ID of ``FASTWEB3_PRIMARY_ENDPOINT`` once per process.
+
+    Returns:
+        The discovered chain ID, or ``None`` if the env var is unset or the
+        probe fails.
     """
     global _DEFAULT_PRIMARY_CHAIN_ID_SET, _DEFAULT_PRIMARY_CHAIN_ID
 
@@ -138,6 +155,11 @@ def _tls_state() -> _BatchState:
 
 
 class _BatchContext:
+    """Introspection helpers for an active batch scope.
+
+    Instances of this class are returned from `Web3.batch_requests()`.
+    """
+
     def __init__(self, w3: "Web3", batch_id: int) -> None:
         self._w3 = w3
         self._batch_id = batch_id
@@ -149,18 +171,26 @@ class _BatchContext:
         return st
 
     def flush(self) -> None:
+        """Flush all currently queued calls.
+
+        Raises:
+            RPCError: If any queued call resulted in a JSON-RPC error.
+        """
         self._w3._flush_batch(raise_on_error=True)
 
     def pending_count(self) -> int:
+        """Return the number of queued calls that have not been flushed."""
         return len(self._state().queue or [])
 
     def pending_methods(self) -> dict[str, int]:
+        """Return a count of queued method names."""
         c: Counter[str] = Counter()
         for q in self._state().queue or []:
             c[q.method] += 1
         return dict(c)
 
     def pending_preview(self, n: int = 10) -> list[dict[str, Any]]:
+        """Return a lightweight preview of the first ``n`` queued calls."""
         out: list[dict[str, Any]] = []
         for q in (self._state().queue or [])[: max(0, int(n))]:
             out.append(
@@ -173,6 +203,7 @@ class _BatchContext:
         return out
 
     def describe(self) -> str:
+        """Return a human-friendly description of the current batch state."""
         st = self._state()
         return (
             f"BatchContext(depth={st.depth}, pending={len(st.queue or [])}, "
@@ -251,6 +282,23 @@ class Web3:
         probe_timeout_s: float = 1.5,
         probe_workers: int = 32,
     ) -> None:
+        """Create a `Web3` client.
+
+        Args:
+            chain_id: Optional chain ID used for pool discovery.
+            endpoints: Optional list of explicit endpoints to use as the
+                internal pool.
+            primary_endpoint: Optional primary endpoint target.
+            provider: Optional fully custom provider (advanced).
+            config: Optional `Web3Config`.
+            target_pool: Target pool size for public discovery.
+            max_lag_blocks: Maximum tolerated lag behind the best observed tip.
+            probe_timeout_s: Per-probe timeout for pool discovery.
+            probe_workers: Maximum number of probe worker threads.
+
+        Raises:
+            NoEndpoints: If no usable configuration is provided.
+        """
         self.config = config or Web3Config()
         self._chain_id = int(chain_id) if chain_id is not None else None
         self._pool_chain_id: Optional[int] = None
@@ -334,6 +382,7 @@ class Web3:
         self.eth = Eth(self)
 
     def close(self) -> None:
+        """Close resources held by this client."""
         fin = self._pool_finalizer
         if fin is not None and fin.alive:
             fin()
@@ -427,15 +476,25 @@ class Web3:
         formatter=None,
         freshness: FreshnessFn | None = None,
     ) -> Any:
-        """
-        Perform a raw JSON-RPC request.
+        """Perform a raw JSON-RPC request.
 
-        method: e.g. "eth_getBalance"
-        params: JSON-RPC params list. No validation is performed on this list.
-        route: "pool" or "primary" (routing hint)
-        formatter: optional post-processor for result
-        freshness: optional freshness policy:
-            freshness(response, required_tip, returned_tip) -> bool
+        This is the lowest-level request API on `Web3`.
+
+        Args:
+            method: JSON-RPC method name (e.g. ``"eth_getBalance"``).
+            params: JSON-RPC params list. No validation is performed on this
+                list.
+            route: Routing hint: ``"pool"`` or ``"primary"``.
+            formatter: Optional post-processor for the result value.
+            freshness: Optional freshness predicate
+                ``freshness(response, required_tip, returned_tip) -> bool``.
+
+        Returns:
+            The (optionally formatted) result.
+
+        Raises:
+            RPCError: If the response includes a JSON-RPC error object.
+            TransportError: For transport-level failures.
         """
         st = _tls_state()
         if st.depth > 0 and not st.flushing and self._should_batch(method):
@@ -467,4 +526,15 @@ class Web3:
         return deferred_response(bg_func, format_func=formatter, ref_func=None)
 
     def batch_requests(self, methods: set[str] | None = None) -> _BatchManager:
+        """Context manager that batches eligible requests issued inside the scope.
+
+        Args:
+            methods: Optional set of method names to batch. If omitted, all
+                methods are eligible except those in the internal
+                ``_NEVER_BATCH_METHODS`` set.
+
+        Returns:
+            A context manager. Requests issued inside the ``with`` scope return
+            proxy objects that resolve when the batch flushes.
+        """
         return _BatchManager(self, methods)

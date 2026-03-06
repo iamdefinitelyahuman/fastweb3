@@ -1,4 +1,6 @@
 # src/fastweb3/transport/http.py
+"""HTTP transport implementation."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,6 +17,20 @@ JSONResp = Union[dict[str, Any], list[dict[str, Any]]]
 
 @dataclass(frozen=True)
 class HTTPTransportConfig:
+    """Configuration for `HTTPTransport`.
+
+    Attributes:
+        timeout: Default request timeout.
+        connect_timeout: Connection establishment timeout.
+        read_timeout: Read timeout.
+        write_timeout: Write timeout.
+        pool_timeout: Connection pool acquisition timeout.
+        max_connections: Maximum number of concurrent connections.
+        max_keepalive_connections: Maximum number of keep-alive connections.
+        keepalive_expiry: Keep-alive expiry time.
+        headers: Optional headers to include in requests.
+    """
+
     timeout: float = 20.0
     connect_timeout: float = 5.0
     read_timeout: float = 20.0
@@ -29,9 +45,7 @@ class HTTPTransportConfig:
 
 
 class HTTPTransport:
-    """
-    Sync HTTP transport for JSON-RPC.
-    """
+    """Synchronous HTTP transport for JSON-RPC."""
 
     def __init__(
         self,
@@ -40,6 +54,14 @@ class HTTPTransport:
         config: HTTPTransportConfig | None = None,
         client: httpx.Client | None = None,
     ) -> None:
+        """Create an HTTP transport.
+
+        Args:
+            url: HTTP(S) URL.
+            config: Optional transport configuration.
+            client: Optional pre-configured `httpx.Client`. If provided,
+                the caller owns the client lifecycle.
+        """
         self.url = url
         self.config = config or HTTPTransportConfig()
 
@@ -68,10 +90,23 @@ class HTTPTransport:
         self._owns_client = True
 
     def close(self) -> None:
+        """Close the underlying `httpx.Client` if owned."""
         if self._owns_client:
             self._client.close()
 
     def send(self, payload: JSONPayload) -> JSONResp:
+        """Send a JSON-RPC payload and return the decoded JSON response.
+
+        Args:
+            payload: JSON-RPC payload (single object or batch list).
+
+        Returns:
+            Decoded JSON response.
+
+        Raises:
+            TransportError: For network errors and non-2xx HTTP responses.
+            TypeError: If the response JSON is not an object or list of objects.
+        """
         try:
             resp = self._client.post(self.url, json=payload)
             resp.raise_for_status()

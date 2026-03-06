@@ -1,4 +1,13 @@
 # fastweb3/env.py
+"""Environment-variable configuration helpers.
+
+These helpers read environment variables that influence endpoint selection:
+
+* ``FASTWEB3_POOL_MODE`` controls whether the public pool is used.
+* ``FASTWEB3_PRIMARY_ENDPOINT`` and ``FASTWEB3_PRIMARY_ENDPOINTS`` configure
+  primary (node-local) endpoints.
+"""
+
 from __future__ import annotations
 
 import os
@@ -12,12 +21,24 @@ _ENV_POOL_MODE = "FASTWEB3_POOL_MODE"
 
 
 def get_pool_mode(env: Optional[dict[str, str]] = None) -> PoolMode:
-    """
-    FASTWEB3_POOL_MODE:
-      - unset / "default": use pool everywhere
-      - "split": disable pool only on chains that have a configured primary
-                (for FASTWEB3_PRIMARY_ENDPOINT this requires knowing its chain id)
-      - "off": never use pool
+    """Return the configured pool mode.
+
+    ``FASTWEB3_POOL_MODE`` values:
+
+    * unset / ``"default"``: use the pool everywhere.
+    * ``"split"``: disable the pool only on chains that have a configured
+      primary.
+    * ``"off"``: never use the pool.
+
+    Args:
+        env: Optional environment mapping to read from. Defaults to
+            :data:`os.environ`.
+
+    Returns:
+        The resolved pool mode.
+
+    Raises:
+        ValueError: If ``FASTWEB3_POOL_MODE`` has an unrecognized value.
     """
     env = os.environ if env is None else env
     raw = env.get(_ENV_POOL_MODE, "").strip().lower()
@@ -31,6 +52,17 @@ def get_pool_mode(env: Optional[dict[str, str]] = None) -> PoolMode:
 
 
 def get_default_primary_endpoint(env: Optional[dict[str, str]] = None) -> Optional[str]:
+    """Return the global primary endpoint, if configured.
+
+    This reads ``FASTWEB3_PRIMARY_ENDPOINT``.
+
+    Args:
+        env: Optional environment mapping to read from. Defaults to
+            :data:`os.environ`.
+
+    Returns:
+        The configured endpoint URL/target, or ``None`` if unset/empty.
+    """
     env = os.environ if env is None else env
     val = env.get(_ENV_PRIMARY)
     if val is None:
@@ -40,9 +72,20 @@ def get_default_primary_endpoint(env: Optional[dict[str, str]] = None) -> Option
 
 
 def parse_primary_endpoints(env: Optional[dict[str, str]] = None) -> Dict[int, str]:
-    """
-    FASTWEB3_PRIMARY_ENDPOINTS format:
-        "1=https://...;10=https://...;8453=https://..."
+    """Parse per-chain primary endpoints from ``FASTWEB3_PRIMARY_ENDPOINTS``.
+
+    The expected format is a semicolon-separated list:
+    ``"1=https://...;10=https://...;8453=https://..."``.
+
+    Args:
+        env: Optional environment mapping to read from. Defaults to
+            :data:`os.environ`.
+
+    Returns:
+        Mapping of ``chain_id`` to endpoint URL.
+
+    Raises:
+        ValueError: If an entry is malformed.
     """
     env = os.environ if env is None else env
     raw = (env.get(_ENV_PRIMARY_MAP) or "").strip()
@@ -88,18 +131,28 @@ def resolve_primary_endpoint(
     env: Optional[dict[str, str]] = None,
     default_primary_chain_id: Optional[int] = None,
 ) -> Optional[str]:
-    """
-    Returns the primary endpoint URL (if any) for `chain_id`, based on env vars.
+    """Resolve the primary endpoint (if any) for a given chain.
 
-    Resolution:
-      1) FASTWEB3_PRIMARY_ENDPOINTS[chain_id] (per-chain) wins.
-      2) else FASTWEB3_PRIMARY_ENDPOINT (global) may apply.
+    Resolution order:
 
-    Important behavior for POOL_MODE=split:
-      - A per-chain primary always counts as "configured primary" for that chain.
-      - A global primary only counts for the chain that *the global endpoint is on*.
-        To enforce that, pass `default_primary_chain_id` (discovered elsewhere,
-        e.g. by calling eth_chainId on the global endpoint directly).
+    1. ``FASTWEB3_PRIMARY_ENDPOINTS[chain_id]`` (per-chain) wins.
+    2. Otherwise, ``FASTWEB3_PRIMARY_ENDPOINT`` (global) may apply.
+
+    Behavior in ``POOL_MODE=split``:
+        A per-chain primary always counts as "configured" for that chain.
+        A global primary only counts for the chain that the global endpoint is
+        on. To enforce that, pass ``default_primary_chain_id`` (e.g. discovered
+        by calling ``eth_chainId`` on the global endpoint).
+
+    Args:
+        chain_id: Chain ID to resolve.
+        env: Optional environment mapping to read from. Defaults to
+            :data:`os.environ`.
+        default_primary_chain_id: Chain ID of the global primary endpoint, if
+            known.
+
+    Returns:
+        Primary endpoint URL/target, or ``None`` if no primary applies.
     """
     env = os.environ if env is None else env
 
@@ -126,8 +179,17 @@ def should_use_pool(
     env: Optional[dict[str, str]] = None,
     default_primary_chain_id: Optional[int] = None,
 ) -> bool:
-    """
-    Returns whether the pool manager should be used for `chain_id` under env config.
+    """Return whether the public pool should be used for a chain.
+
+    Args:
+        chain_id: Chain ID to check.
+        env: Optional environment mapping to read from. Defaults to
+            :data:`os.environ`.
+        default_primary_chain_id: Chain ID of the global primary endpoint, if
+            known.
+
+    Returns:
+        ``True`` if the pool should be used, otherwise ``False``.
     """
     env = os.environ if env is None else env
     mode = get_pool_mode(env)

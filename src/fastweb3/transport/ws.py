@@ -1,3 +1,5 @@
+"""WebSocket transport implementation."""
+
 from __future__ import annotations
 
 import json
@@ -17,6 +19,15 @@ except Exception:  # pragma: no cover
 
 @dataclass(frozen=True)
 class WSSTransportConfig:
+    """Configuration for `WSSTransport`.
+
+    Attributes:
+        connect_timeout: Timeout for establishing the WebSocket connection.
+        recv_timeout: Timeout for receiving a response.
+        reconnect_backoff_s: Backoff when the receiver detects disconnect.
+        headers: Optional headers for the WebSocket handshake.
+    """
+
     connect_timeout: float = 5.0
     recv_timeout: float = 20.0
 
@@ -28,6 +39,8 @@ class WSSTransportConfig:
 
 
 class _Waiter:
+    """Waiter for a single in-flight JSON-RPC request/response."""
+
     __slots__ = ("cv", "done", "result", "exc")
 
     def __init__(self) -> None:
@@ -37,18 +50,21 @@ class _Waiter:
         self.exc: Optional[Exception] = None
 
     def set_result(self, r: dict[str, Any]) -> None:
+        """Resolve the waiter with a response object."""
         with self.cv:
             self.result = r
             self.done = True
             self.cv.notify_all()
 
     def set_exc(self, e: Exception) -> None:
+        """Resolve the waiter with an exception."""
         with self.cv:
             self.exc = e
             self.done = True
             self.cv.notify_all()
 
     def wait(self, timeout: float) -> dict[str, Any]:
+        """Wait for the response or raise on timeout/error."""
         end = time.time() + timeout
         with self.cv:
             while not self.done:
@@ -70,6 +86,15 @@ class WSSTransport:
     """
 
     def __init__(self, url: str, *, config: WSSTransportConfig | None = None) -> None:
+        """Create a WebSocket transport.
+
+        Args:
+            url: WebSocket URL.
+            config: Optional transport configuration.
+
+        Raises:
+            ImportError: If ``websocket-client`` is not installed.
+        """
         if websocket is None:  # pragma: no cover
             raise ImportError(
                 "WSSTransport requires 'websocket-client' (pip install websocket-client)"
@@ -87,6 +112,7 @@ class WSSTransport:
         self._inflight_lock = threading.Lock()
 
     def close(self) -> None:
+        """Close the transport and fail any in-flight requests."""
         self._closed = True
         with self._lock:
             if self._ws is not None:
@@ -99,6 +125,20 @@ class WSSTransport:
         self._fail_all_inflight(TransportError("WSS transport closed"))
 
     def send(self, payload: JSONPayload) -> JSONResp:
+        """Send a JSON-RPC payload and wait for the correlated response(s).
+
+        Args:
+            payload: JSON-RPC payload (single object or batch list). The payload
+                must include ``id`` fields so responses can be correlated.
+
+        Returns:
+            Decoded JSON response.
+
+        Raises:
+            TransportError: For connection issues, timeouts, and correlation
+                errors.
+            ValueError: If a batch payload is empty.
+        """
         # Normalize payload into (single|batch) and list of ids to wait for
         if isinstance(payload, list):
             if not payload:

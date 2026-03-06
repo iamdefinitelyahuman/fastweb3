@@ -1,3 +1,15 @@
+"""Error types raised by fastweb3.
+
+fastweb3 distinguishes between:
+
+* **Transport errors**: network/HTTP/IPC/WebSocket issues and other
+  wire-level failures.
+* **RPC errors**: JSON-RPC responses that include an ``error`` object.
+* **Client validation errors**: inputs rejected before an RPC call is made.
+
+Only a small subset of these errors are exported from the package root.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,6 +18,14 @@ from typing import Any
 
 @dataclass(frozen=True)
 class RPCErrorDetails:
+    """Structured information extracted from a JSON-RPC error object.
+
+    Attributes:
+        code: Error code if provided by the server.
+        message: Human-readable error message if provided.
+        data: Optional additional error data.
+    """
+
     code: int | None
     message: str | None
     data: Any = None

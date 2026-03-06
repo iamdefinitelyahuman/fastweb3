@@ -1,3 +1,5 @@
+"""Helpers for formatting and normalizing JSON-RPC values."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -34,9 +36,18 @@ HEX_QUANTITY_FIELDS = {
 
 
 def to_int(x: Any) -> int:
-    """
-    Common JSON-RPC hex quantity formatter.
-    Accepts 0x-prefixed hex strings or ints.
+    """Convert a JSON-RPC quantity-like value to an ``int``.
+
+    Args:
+        x: An integer or a string. Strings may be ``0x``-prefixed hex or a
+            decimal integer representation.
+
+    Returns:
+        The parsed integer.
+
+    Raises:
+        ValueError: If ``x`` is ``None``.
+        TypeError: If ``x`` is not an ``int`` or ``str``.
     """
     if x is None:
         raise ValueError("Cannot format None as int")
@@ -51,12 +62,34 @@ def to_int(x: Any) -> int:
 
 
 def to_hex_quantity(n: int) -> str:
+    """Convert an integer to a JSON-RPC hex quantity string.
+
+    Args:
+        n: Non-negative integer.
+
+    Returns:
+        ``0x``-prefixed lowercase hex string.
+
+    Raises:
+        ValueError: If ``n`` is not an ``int`` or is negative.
+    """
     if not isinstance(n, int) or n < 0:
         raise ValueError("Quantity must be a non-negative int")
     return hex(n)
 
 
 def normalize_rpc_obj(obj: Any) -> Any:
+    """Recursively normalize an RPC response object.
+
+    This function walks lists/dicts and converts known hex-quantity fields to
+    integers.
+
+    Args:
+        obj: RPC response value.
+
+    Returns:
+        Normalized value.
+    """
     if isinstance(obj, list):
         return [normalize_rpc_obj(x) for x in obj]
 

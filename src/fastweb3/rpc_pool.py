@@ -1,4 +1,17 @@
 # src/fastweb3/rpc_pool.py
+"""Public RPC endpoint discovery and pool health management.
+
+This module maintains a per-chain pool of candidate RPC endpoints and
+periodically probes them to keep a small set of "best" URLs.
+
+The pool is used by `fastweb3.provider.Provider` when constructed via
+`fastweb3.web3.web3.Web3` with a `chain_id`.
+
+Notes:
+    The chain registry metadata is fetched from the ethereum-lists/chains
+    repository.
+"""
+
 from __future__ import annotations
 
 import json
@@ -31,18 +44,40 @@ PROBE_DEADLINE_MIN_S = 5.0
 
 @dataclass(frozen=True)
 class ChainMeta:
+    """Chain metadata used for endpoint discovery.
+
+    Attributes:
+        chain_id: EIP-155 chain ID.
+        name: Human-readable chain name.
+        rpc: List of candidate RPC URLs.
+    """
+
     chain_id: int
     name: str
     rpc: list[str]
 
 
 class ChainsRegistry:
+    """Cache-backed loader for `ChainMeta`.
+
+    Args:
+        ttl_seconds: Cache TTL in seconds.
+    """
+
     def __init__(self, *, ttl_seconds: int = 24 * 3600) -> None:
         self._ttl = ttl_seconds
         self._cache: dict[int, tuple[float, ChainMeta]] = {}
         self._lock = threading.Lock()
 
     def get(self, chain_id: int) -> ChainMeta:
+        """Fetch chain metadata for a chain ID.
+
+        Args:
+            chain_id: EIP-155 chain ID.
+
+        Returns:
+            Chain metadata including candidate RPC URLs.
+        """
         now = time.time()
 
         with self._lock:
@@ -69,6 +104,14 @@ class ChainsRegistry:
 
 @dataclass(frozen=True)
 class ProbeResult:
+    """Result of probing a single RPC URL.
+
+    Attributes:
+        url: Probed URL.
+        rtt_ms: Round-trip time in milliseconds.
+        head: Reported block height.
+    """
+
     url: str
     rtt_ms: float
     head: int
@@ -199,8 +242,18 @@ def probe_urls_streaming(
     max_workers: int = 32,
     deadline_s: float | None = None,
 ) -> Iterator[ProbeResult]:
-    """
-    Probe candidate RPC URLs and stream back successes as they arrive.
+    """Probe candidate RPC URLs and stream back successes as they arrive.
+
+    Args:
+        urls: Candidate RPC URLs.
+        expected_chain_id: Chain ID that responses must match.
+        timeout_s: Per-probe timeout.
+        max_workers: Maximum number of worker threads.
+        deadline_s: Optional overall deadline for probing. If omitted, a
+            heuristic deadline is used based on ``timeout_s``.
+
+    Yields:
+        `ProbeResult` objects for successful probes.
     """
     seen: set[str] = set()
     candidates: list[str] = []
@@ -327,6 +380,16 @@ class PoolManager:
         self._next_epoch_ts: float = 0.0
 
     def best_urls(self, n: int, await_first: bool) -> list[str]:
+        """Return the best known URLs for this chain.
+
+        Args:
+            n: Maximum number of URLs to return.
+            await_first: If ``True`` and the pool is not yet ready, block until
+                at least one URL is available.
+
+        Returns:
+            Up to ``n`` URLs, ordered from best to worst by current RTT.
+        """
         if n <= 0:
             return []
 
@@ -341,6 +404,14 @@ class PoolManager:
             return list(self._active[:n])
 
     def maintain(self, *, now: float | None = None) -> None:
+        """Run a maintenance epoch.
+
+        This is called periodically by a global scheduler thread. It performs
+        health checks on active URLs and probes new candidate URLs.
+
+        Args:
+            now: Optional timestamp override (seconds since epoch).
+        """
         t = time.time() if now is None else float(now)
 
         if self._meta is None:
@@ -479,6 +550,7 @@ class _Scheduler:
         self._thread = None
 
     def ensure_running(self):
+        """Ensure the global maintenance thread is running."""
         with self._lock:
             if self._thread is not None and self._thread.is_alive() and not self._event.is_set():
                 return
@@ -489,6 +561,7 @@ class _Scheduler:
             self._thread.start()
 
     def stop_if_idle(self):
+        """Stop the global maintenance thread if no pools are referenced."""
         with _pool_lock:
             any_active = any(v > 0 for v in _pool_refcount.values())
         if any_active:
@@ -527,6 +600,22 @@ def acquire_pool_manager(
     probe_timeout_s: float = 1.5,
     probe_workers: int = 32,
 ) -> PoolManager:
+    """Acquire a shared pool manager for a chain.
+
+    The pool manager is reference-counted and maintained by a single global
+    scheduler thread.
+
+    Args:
+        chain_id: EIP-155 chain ID.
+        target_pool: Target number of active URLs.
+        max_lag_blocks: Maximum tolerated lag (in blocks) behind the observed
+            best tip.
+        probe_timeout_s: Per-probe timeout.
+        probe_workers: Maximum number of probe worker threads.
+
+    Returns:
+        A pool manager instance for the given chain.
+    """
     cid = int(chain_id)
     with _pool_lock:
         pm = _pool_by_chain.get(cid)
@@ -546,6 +635,7 @@ def acquire_pool_manager(
 
 
 def release_pool_manager(chain_id: int) -> None:
+    """Release a previously acquired pool manager reference."""
     cid = int(chain_id)
     with _pool_lock:
         cur = _pool_refcount.get(cid, 0)
