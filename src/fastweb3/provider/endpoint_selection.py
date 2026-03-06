@@ -184,6 +184,10 @@ class EndpointSelectionMixin:
         now = time.time()
         return [ep for ep in eps if not self._is_cooldown_active(ep, now)]
 
+    def _cooldown_endpoints(self) -> set[str]:
+        now = time.time()
+        return {ep.target for ep in self._state if self._is_cooldown_active(ep, now)}
+
     def _pool_candidates(self) -> list[Endpoint]:
         with self._lock:
             internal = list(self._internal_targets)
@@ -193,7 +197,11 @@ class EndpointSelectionMixin:
         manager_targets: list[str] = []
         if needed > 0 and self.pool_manager is not None:
             await_first = not (internal or primary)
-            manager_targets = self.pool_manager.best_urls(needed, await_first)
+            manager_targets = self.pool_manager.best_urls(
+                needed,
+                await_first=await_first,
+                exclude=self._cooldown_endpoints(),
+            )
 
         seen: set[str] = set()
         merged: list[str] = []

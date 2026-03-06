@@ -379,13 +379,16 @@ class PoolManager:
         # Scheduler-driven: run an epoch immediately.
         self._next_epoch_ts: float = 0.0
 
-    def best_urls(self, n: int, await_first: bool) -> list[str]:
+    def best_urls(
+        self, n: int, *, await_first: bool = False, exclude: set | None = None
+    ) -> list[str]:
         """Return the best known URLs for this chain.
 
         Args:
             n: Maximum number of URLs to return.
             await_first: If ``True`` and the pool is not yet ready, block until
                 at least one URL is available.
+            exclude: Optional set of urls to exclude from the result.
 
         Returns:
             Up to ``n`` URLs, ordered from best to worst by current RTT.
@@ -393,15 +396,21 @@ class PoolManager:
         if n <= 0:
             return []
 
+        if exclude is None:
+            exclude = set()
         with self._lock:
             if self._active:
-                return list(self._active[:n])
+                return [i for i in self._active if i not in exclude][:n]
 
         if await_first:
             self._ready.wait()
 
         with self._lock:
-            return list(self._active[:n])
+            return [i for i in self._active if i not in exclude][:n]
+
+    def pool_size(self):
+        """Return the total number of URLs for this chain."""
+        return len(self._active)
 
     def maintain(self, *, now: float | None = None) -> None:
         """Run a maintenance epoch.
