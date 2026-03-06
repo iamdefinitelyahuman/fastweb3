@@ -26,7 +26,7 @@ from ..env import (
 from ..errors import NoEndpoints, RPCError
 from ..formatters import to_int
 from ..provider import Provider, RetryPolicy
-from ..rpc_pool import acquire_pool_manager, release_pool_manager
+from ..provider.pool import acquire_pool_manager, release_pool_manager
 from .eth import Eth
 
 _DEFAULT_PRIMARY_CHAIN_ID_LOCK = threading.Lock()

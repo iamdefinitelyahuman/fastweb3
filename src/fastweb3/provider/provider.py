@@ -17,10 +17,10 @@ from typing import Callable, Sequence
 
 from ..errors import TransportError
 from ..middleware import _apply_default_middlewares
-from ..rpc_pool import PoolManager
 from .endpoint_selection import EndpointSelectionMixin
 from .execution import ExecutionMixin
 from .middleware import MiddlewareMixin
+from .pool import PoolManager
 from .types import RetryPolicy
 
 

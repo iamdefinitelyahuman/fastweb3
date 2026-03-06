@@ -1,4 +1,4 @@
-# src/fastweb3/rpc_pool.py
+# src/fastweb3/provider/pool.py
 """Public RPC endpoint discovery and pool health management.
 
 This module maintains a per-chain pool of candidate RPC endpoints and
@@ -23,9 +23,9 @@ from typing import Any, Iterator
 
 import httpx
 
-from .formatters import to_int
-from .transport import HTTPTransportConfig, WSSTransportConfig, make_transport
-from .utils import is_url_target, normalize_target, normalize_url
+from ..formatters import to_int
+from ..transport import HTTPTransportConfig, WSSTransportConfig, make_transport
+from ..utils import is_url_target, normalize_target, normalize_url
 
 CHAINS_URL = (
     "https://raw.githubusercontent.com/ethereum-lists/chains/master/_data/chains/"
