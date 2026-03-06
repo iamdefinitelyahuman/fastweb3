@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-import fastweb3.rpc_pool as rpc_pool
+import fastweb3.provider.pool as pool
 
 _REAL_THREAD = threading.Thread
 
@@ -59,8 +59,8 @@ def _batch_ok(chain_id: int, head_hex: str = "0x10"):
     ]
 
 
-def pr(url: str, rtt: float, head: int) -> rpc_pool.ProbeResult:
-    return rpc_pool.ProbeResult(url=url, rtt_ms=rtt, head=head)
+def pr(url: str, rtt: float, head: int) -> pool.ProbeResult:
+    return pool.ProbeResult(url=url, rtt_ms=rtt, head=head)
 
 
 @pytest.fixture(autouse=True)
@@ -68,7 +68,7 @@ def reset_shared_pool_registry():
     """Ensure each test starts with a clean global registry + no running scheduler thread."""
     # Best-effort stop scheduler if running
     try:
-        sched = getattr(rpc_pool, "_scheduler", None)
+        sched = getattr(pool, "_scheduler", None)
         if sched is not None:
             try:
                 sched.stop()
@@ -82,13 +82,13 @@ def reset_shared_pool_registry():
     except Exception:
         pass
 
-    with rpc_pool._pool_lock:
-        rpc_pool._pool_by_chain.clear()
-        rpc_pool._pool_refcount.clear()
+    with pool._pool_lock:
+        pool._pool_by_chain.clear()
+        pool._pool_refcount.clear()
 
     # Reset scheduler object to a pristine instance (fresh event/thread state)
     try:
-        rpc_pool._scheduler = rpc_pool._Scheduler()
+        pool._scheduler = pool._Scheduler()
     except Exception:
         pass
 
@@ -96,7 +96,7 @@ def reset_shared_pool_registry():
 
     # Clean again (in case tests left anything behind)
     try:
-        sched = getattr(rpc_pool, "_scheduler", None)
+        sched = getattr(pool, "_scheduler", None)
         if sched is not None:
             try:
                 sched.stop()
@@ -110,12 +110,12 @@ def reset_shared_pool_registry():
     except Exception:
         pass
 
-    with rpc_pool._pool_lock:
-        rpc_pool._pool_by_chain.clear()
-        rpc_pool._pool_refcount.clear()
+    with pool._pool_lock:
+        pool._pool_by_chain.clear()
+        pool._pool_refcount.clear()
 
     try:
-        rpc_pool._scheduler = rpc_pool._Scheduler()
+        pool._scheduler = pool._Scheduler()
     except Exception:
         pass
 
@@ -127,23 +127,23 @@ def fake_make_transport(monkeypatch: pytest.MonkeyPatch):
     def _fake_make_transport(url: str, **kwargs: Any) -> FakeTransport:
         return FakeTransport(url)
 
-    monkeypatch.setattr(rpc_pool, "make_transport", _fake_make_transport)
+    monkeypatch.setattr(pool, "make_transport", _fake_make_transport)
 
 
 def test_is_probeable(monkeypatch: pytest.MonkeyPatch):
     # default: assume no WSS support => ws/wss not probeable
-    monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: False)
+    monkeypatch.setattr(pool, "_has_wss_support", lambda: False)
 
-    assert rpc_pool._is_probeable("http://x")
-    assert rpc_pool._is_probeable("https://x")
+    assert pool._is_probeable("http://x")
+    assert pool._is_probeable("https://x")
 
-    assert not rpc_pool._is_probeable("ws://x")
-    assert not rpc_pool._is_probeable("wss://x")
-    assert not rpc_pool._is_probeable("ftp://x")
+    assert not pool._is_probeable("ws://x")
+    assert not pool._is_probeable("wss://x")
+    assert not pool._is_probeable("ftp://x")
 
-    monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: True)
-    assert rpc_pool._is_probeable("ws://x")
-    assert rpc_pool._is_probeable("wss://x")
+    monkeypatch.setattr(pool, "_has_wss_support", lambda: True)
+    assert pool._is_probeable("ws://x")
+    assert pool._is_probeable("wss://x")
 
 
 def test_registry_caches_within_ttl(monkeypatch: pytest.MonkeyPatch):
@@ -155,9 +155,9 @@ def test_registry_caches_within_ttl(monkeypatch: pytest.MonkeyPatch):
         calls["n"] += 1
         return DummyResp(body)
 
-    monkeypatch.setattr(rpc_pool.httpx, "get", fake_get)
+    monkeypatch.setattr(pool.httpx, "get", fake_get)
 
-    reg = rpc_pool.ChainsRegistry(ttl_seconds=60)
+    reg = pool.ChainsRegistry(ttl_seconds=60)
 
     m1 = reg.get(1)
     m2 = reg.get(1)
@@ -184,13 +184,13 @@ def test_registry_refreshes_after_ttl(monkeypatch: pytest.MonkeyPatch):
         return DummyResp(p1 if calls["n"] == 1 else p2)
 
     monkeypatch.setattr(
-        rpc_pool,
+        pool,
         "time",
         SimpleNamespace(time=fake_time, perf_counter=time.perf_counter, sleep=time.sleep),
     )
-    monkeypatch.setattr(rpc_pool.httpx, "get", fake_get)
+    monkeypatch.setattr(pool.httpx, "get", fake_get)
 
-    reg = rpc_pool.ChainsRegistry(ttl_seconds=10)
+    reg = pool.ChainsRegistry(ttl_seconds=10)
 
     m1 = reg.get(1)
     now["t"] += 11
@@ -206,7 +206,7 @@ def test_probe_one_success(monkeypatch: pytest.MonkeyPatch, fake_make_transport)
         "https://ok": _batch_ok(chain_id=1, head_hex="0x2a"),
     }
 
-    pr1 = rpc_pool._probe_one("https://ok", expected_chain_id=1, timeout_s=0.1)
+    pr1 = pool._probe_one("https://ok", expected_chain_id=1, timeout_s=0.1)
     assert pr1.url == "https://ok"
     assert pr1.head == 0x2A
     assert pr1.rtt_ms >= 0.0
@@ -228,7 +228,7 @@ def test_probe_one_strict_failures(
     FakeTransport.behavior = {"https://bad": resp}
 
     with pytest.raises(Exception) as e:
-        rpc_pool._probe_one("https://bad", expected_chain_id=1, timeout_s=0.1)
+        pool._probe_one("https://bad", expected_chain_id=1, timeout_s=0.1)
 
     assert err_substr in str(e.value)
 
@@ -236,11 +236,11 @@ def test_probe_one_strict_failures(
 def test_probe_urls_streaming_filters_and_dedups_http_only(
     monkeypatch: pytest.MonkeyPatch, fake_make_transport
 ):
-    monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: False)
-    monkeypatch.setattr(rpc_pool, "normalize_url", lambda u: u.strip().rstrip("/"))
-    monkeypatch.setattr(rpc_pool, "normalize_target", lambda u: u)
+    monkeypatch.setattr(pool, "_has_wss_support", lambda: False)
+    monkeypatch.setattr(pool, "normalize_url", lambda u: u.strip().rstrip("/"))
+    monkeypatch.setattr(pool, "normalize_target", lambda u: u)
     monkeypatch.setattr(
-        rpc_pool,
+        pool,
         "is_url_target",
         lambda u: u.startswith(("http://", "https://", "ws://", "wss://")),
     )
@@ -261,7 +261,7 @@ def test_probe_urls_streaming_filters_and_dedups_http_only(
     }
 
     results = list(
-        rpc_pool.probe_urls_streaming(
+        pool.probe_urls_streaming(
             urls,
             expected_chain_id=1,
             timeout_s=0.05,
@@ -277,11 +277,11 @@ def test_probe_urls_streaming_filters_and_dedups_http_only(
 def test_probe_urls_streaming_includes_wss_when_supported(
     monkeypatch: pytest.MonkeyPatch, fake_make_transport
 ):
-    monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: True)
-    monkeypatch.setattr(rpc_pool, "normalize_url", lambda u: u.strip().rstrip("/"))
-    monkeypatch.setattr(rpc_pool, "normalize_target", lambda u: u)
+    monkeypatch.setattr(pool, "_has_wss_support", lambda: True)
+    monkeypatch.setattr(pool, "normalize_url", lambda u: u.strip().rstrip("/"))
+    monkeypatch.setattr(pool, "normalize_target", lambda u: u)
     monkeypatch.setattr(
-        rpc_pool,
+        pool,
         "is_url_target",
         lambda u: u.startswith(("http://", "https://", "ws://", "wss://")),
     )
@@ -294,7 +294,7 @@ def test_probe_urls_streaming_includes_wss_when_supported(
     }
 
     results = list(
-        rpc_pool.probe_urls_streaming(
+        pool.probe_urls_streaming(
             urls,
             expected_chain_id=1,
             timeout_s=0.05,
@@ -309,11 +309,11 @@ def test_probe_urls_streaming_includes_wss_when_supported(
 def test_probe_urls_streaming_ignores_bad_responses(
     monkeypatch: pytest.MonkeyPatch, fake_make_transport
 ):
-    monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: False)
-    monkeypatch.setattr(rpc_pool, "normalize_url", lambda u: u)
-    monkeypatch.setattr(rpc_pool, "normalize_target", lambda u: u)
+    monkeypatch.setattr(pool, "_has_wss_support", lambda: False)
+    monkeypatch.setattr(pool, "normalize_url", lambda u: u)
+    monkeypatch.setattr(pool, "normalize_target", lambda u: u)
     monkeypatch.setattr(
-        rpc_pool,
+        pool,
         "is_url_target",
         lambda u: u.startswith(("http://", "https://", "ws://", "wss://")),
     )
@@ -327,7 +327,7 @@ def test_probe_urls_streaming_ignores_bad_responses(
     urls = ["https://ok", "https://wrong-chain", "https://non-batch"]
 
     results = list(
-        rpc_pool.probe_urls_streaming(
+        pool.probe_urls_streaming(
             urls,
             expected_chain_id=1,
             timeout_s=0.05,
@@ -339,16 +339,16 @@ def test_probe_urls_streaming_ignores_bad_responses(
 
 
 def test_probe_urls_streaming_empty_candidates_returns_no_items(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(rpc_pool, "_has_wss_support", lambda: False)
-    monkeypatch.setattr(rpc_pool, "normalize_url", lambda u: u)
-    monkeypatch.setattr(rpc_pool, "normalize_target", lambda u: u)
+    monkeypatch.setattr(pool, "_has_wss_support", lambda: False)
+    monkeypatch.setattr(pool, "normalize_url", lambda u: u)
+    monkeypatch.setattr(pool, "normalize_target", lambda u: u)
     monkeypatch.setattr(
-        rpc_pool,
+        pool,
         "is_url_target",
         lambda u: u.startswith(("http://", "https://", "ws://", "wss://")),
     )
     urls = ["ws://x", "wss://y", "https://x/${KEY}"]
-    assert list(rpc_pool.probe_urls_streaming(urls, expected_chain_id=1, deadline_s=0.05)) == []
+    assert list(pool.probe_urls_streaming(urls, expected_chain_id=1, deadline_s=0.05)) == []
 
 
 def test_acquire_pool_manager_returns_shared_instance_and_refcounts(
@@ -362,34 +362,34 @@ def test_acquire_pool_manager_returns_shared_instance_and_refcounts(
     def _stop() -> None:
         called["stop"] += 1
 
-    monkeypatch.setattr(rpc_pool._scheduler, "ensure_running", _ensure)
-    monkeypatch.setattr(rpc_pool._scheduler, "stop_if_idle", _stop)
+    monkeypatch.setattr(pool._scheduler, "ensure_running", _ensure)
+    monkeypatch.setattr(pool._scheduler, "stop_if_idle", _stop)
 
-    pm1 = rpc_pool.acquire_pool_manager(1)
-    pm2 = rpc_pool.acquire_pool_manager(1)
-    pm3 = rpc_pool.acquire_pool_manager(2)
+    pm1 = pool.acquire_pool_manager(1)
+    pm2 = pool.acquire_pool_manager(1)
+    pm3 = pool.acquire_pool_manager(2)
 
     assert pm1 is pm2
     assert pm1 is not pm3
 
-    with rpc_pool._pool_lock:
-        assert rpc_pool._pool_refcount[1] == 2
-        assert rpc_pool._pool_refcount[2] == 1
+    with pool._pool_lock:
+        assert pool._pool_refcount[1] == 2
+        assert pool._pool_refcount[2] == 1
 
     assert called["ensure"] == 3
 
-    rpc_pool.release_pool_manager(1)
-    with rpc_pool._pool_lock:
-        assert rpc_pool._pool_refcount[1] == 1
+    pool.release_pool_manager(1)
+    with pool._pool_lock:
+        assert pool._pool_refcount[1] == 1
 
     # Fully release => scheduler eligible to stop
-    rpc_pool.release_pool_manager(1)
-    rpc_pool.release_pool_manager(2)
+    pool.release_pool_manager(1)
+    pool.release_pool_manager(2)
     assert called["stop"] >= 1
 
 
 def test_poolmanager_fill_until_target_pool():
-    pm = rpc_pool.PoolManager(1, target_pool=2)
+    pm = pool.PoolManager(1, target_pool=2)
 
     pm._handle_probe_result(pr=pr("https://a", 100, 10), now=0.0)
     pm._handle_probe_result(pr=pr("https://b", 90, 11), now=0.0)
@@ -398,7 +398,7 @@ def test_poolmanager_fill_until_target_pool():
 
 
 def test_poolmanager_replace_worst_when_significantly_better():
-    pm = rpc_pool.PoolManager(1, target_pool=2)
+    pm = pool.PoolManager(1, target_pool=2)
 
     pm._handle_probe_result(pr=pr("https://slow", 200, 10), now=0.0)
     pm._handle_probe_result(pr=pr("https://fast", 80, 10), now=0.0)
@@ -412,7 +412,7 @@ def test_poolmanager_replace_worst_when_significantly_better():
 
 
 def test_poolmanager_replace_cooldown_blocks_replacement():
-    pm = rpc_pool.PoolManager(1, target_pool=2)
+    pm = pool.PoolManager(1, target_pool=2)
     pm._state.next_replace_ts = 100.0
 
     pm._handle_probe_result(pr=pr("https://slow", 200, 10), now=0.0)
@@ -426,7 +426,7 @@ def test_poolmanager_replace_cooldown_blocks_replacement():
 
 
 def test_poolmanager_eviction_cooldown_blocks_readd():
-    pm = rpc_pool.PoolManager(1, target_pool=2)
+    pm = pool.PoolManager(1, target_pool=2)
 
     pm._cooldown_until["https://a"] = 100.0
     pm._handle_probe_result(pr=pr("https://a", 50, 10), now=0.0)
@@ -435,7 +435,7 @@ def test_poolmanager_eviction_cooldown_blocks_readd():
 
 
 def test_poolmanager_health_check_eviction_on_lag(monkeypatch: pytest.MonkeyPatch):
-    pm = rpc_pool.PoolManager(1, target_pool=2, max_lag_blocks=5)
+    pm = pool.PoolManager(1, target_pool=2, max_lag_blocks=5)
 
     pm._handle_probe_result(pr=pr("https://a", 100, 100), now=0.0)
     assert pm.best_urls(10, await_first=False) == ["https://a"]
@@ -445,7 +445,7 @@ def test_poolmanager_health_check_eviction_on_lag(monkeypatch: pytest.MonkeyPatc
     def fake_probe_one(url: str, **kwargs):
         return pr(url, 100, 80)  # lagging by 20
 
-    monkeypatch.setattr(rpc_pool, "_probe_one", fake_probe_one)
+    monkeypatch.setattr(pool, "_probe_one", fake_probe_one)
 
     pm._state.next_health_ts = -1.0
     pm._health_check(now=0.0)
@@ -454,7 +454,7 @@ def test_poolmanager_health_check_eviction_on_lag(monkeypatch: pytest.MonkeyPatc
 
 
 def test_poolmanager_health_check_eviction_on_failure(monkeypatch: pytest.MonkeyPatch):
-    pm = rpc_pool.PoolManager(1, target_pool=2)
+    pm = pool.PoolManager(1, target_pool=2)
 
     pm._handle_probe_result(pr=pr("https://a", 100, 10), now=0.0)
     assert pm.best_urls(10, await_first=False) == ["https://a"]
@@ -462,7 +462,7 @@ def test_poolmanager_health_check_eviction_on_failure(monkeypatch: pytest.Monkey
     def fake_probe_one(url: str, **kwargs):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(rpc_pool, "_probe_one", fake_probe_one)
+    monkeypatch.setattr(pool, "_probe_one", fake_probe_one)
 
     pm._state.next_health_ts = -1.0
     pm._health_check(now=0.0)
@@ -471,12 +471,12 @@ def test_poolmanager_health_check_eviction_on_failure(monkeypatch: pytest.Monkey
 
 
 def test_poolmanager_best_urls_empty_returns_immediately_when_not_awaiting():
-    pm = rpc_pool.PoolManager(1, target_pool=2)
+    pm = pool.PoolManager(1, target_pool=2)
     assert pm.best_urls(5, await_first=False) == []
 
 
 def test_poolmanager_best_urls_blocks_when_awaiting_until_ready_then_returns():
-    pm = rpc_pool.PoolManager(1, target_pool=2)
+    pm = pool.PoolManager(1, target_pool=2)
 
     result: dict[str, object] = {}
     started = threading.Event()
@@ -508,7 +508,7 @@ def test_probe_urls_streaming_skips_missing_env_without_crashing(
 
     # This must not raise; it should just yield nothing.
     results = list(
-        rpc_pool.probe_urls_streaming(
+        pool.probe_urls_streaming(
             ["https://example.com/$NOPE"],
             expected_chain_id=1,
             timeout_s=0.01,

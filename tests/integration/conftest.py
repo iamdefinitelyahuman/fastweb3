@@ -13,7 +13,7 @@ def _stable_pool_probe_deadlines(monkeypatch: pytest.MonkeyPatch) -> None:
     library defaults.
     """
 
-    import fastweb3.rpc_pool as rpc_pool
+    import fastweb3.provider.pool as pool
 
-    monkeypatch.setattr(rpc_pool, "PROBE_DEADLINE_MIN_S", 0.5)
-    monkeypatch.setattr(rpc_pool, "PROBE_DEADLINE_MULTIPLIER", 0.0)
+    monkeypatch.setattr(pool, "PROBE_DEADLINE_MIN_S", 0.5)
+    monkeypatch.setattr(pool, "PROBE_DEADLINE_MULTIPLIER", 0.0)
