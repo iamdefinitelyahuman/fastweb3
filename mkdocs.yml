@@ -1,0 +1,11 @@
+site_name: fastweb3
+site_description: Fast, modern Python Web3 library
+site_url: https://iamdefinitelyahuman.github.io/fastweb3/
+repo_url: https://github.com/iamdefinitelyahuman/fastweb3
+repo_name: iamdefinitelyahuman/fastweb3
+
+theme:
+  name: material
+
+nav:
+  - Home: index.md
