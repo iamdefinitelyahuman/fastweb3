@@ -43,11 +43,13 @@ class Web3Config:
             methods.
         desired_pool_size: Desired total pool size for pool routing.
         retry_policy_pool: Retry policy used when routing via the pool.
+        max_lag_blocks: For pool endpoints, xaximum tolerated lag behind the best observed tip.
     """
 
     strict: bool = True
     desired_pool_size: int = 6
     retry_policy_pool: RetryPolicy = RetryPolicy(max_attempts=3, backoff_seconds=0.05)
+    max_lag_blocks: int = 8
 
 
 def _get_default_primary_chain_id_once() -> Optional[int]:
@@ -105,10 +107,6 @@ class Web3:
         primary_endpoint: Optional[str] = None,
         provider: Optional[Provider] = None,
         config: Optional[Web3Config] = None,
-        target_pool: int = 6,
-        max_lag_blocks: int = 8,
-        probe_timeout_s: float = 1.5,
-        probe_workers: int = 32,
     ) -> None:
         """Create a `Web3` client.
 
@@ -119,15 +117,13 @@ class Web3:
             primary_endpoint: Optional primary endpoint target.
             provider: Optional fully custom provider (advanced).
             config: Optional `Web3Config`.
-            target_pool: Target pool size for public discovery.
-            max_lag_blocks: Maximum tolerated lag behind the best observed tip.
-            probe_timeout_s: Per-probe timeout for pool discovery.
-            probe_workers: Maximum number of probe worker threads.
 
         Raises:
             NoEndpoints: If no usable configuration is provided.
         """
-        self.config = config or Web3Config()
+        if config is None:
+            config = Web3Config()
+        self.config = config
         self._chain_id = int(chain_id) if chain_id is not None else None
         self._pool_chain_id: Optional[int] = None
         self._pool_finalizer: weakref.finalize | None = None
@@ -156,10 +152,8 @@ class Web3:
                 ):
                     pool_manager = acquire_pool_manager(
                         int(chain_id),
-                        target_pool=target_pool,
-                        max_lag_blocks=max_lag_blocks,
-                        probe_timeout_s=probe_timeout_s,
-                        probe_workers=probe_workers,
+                        target_pool=max(config.desired_pool_size * 2, config.desired_pool_size + 3),
+                        max_lag_blocks=config.max_lag_blocks,
                     )
             if pool_manager is not None and chain_id is not None:
                 self._pool_chain_id = int(chain_id)
@@ -189,8 +183,8 @@ class Web3:
             self.provider = Provider(
                 internal_endpoints,
                 pool_manager=pool_manager,
-                desired_pool_size=self.config.desired_pool_size,
-                retry_policy_pool=self.config.retry_policy_pool,
+                desired_pool_size=config.desired_pool_size,
+                retry_policy_pool=config.retry_policy_pool,
             )
 
             if primary_endpoint is None:

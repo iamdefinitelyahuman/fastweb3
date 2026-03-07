@@ -40,6 +40,8 @@ POOL_EVICTION_COOLDOWN_S = 15 * 60
 
 PROBE_DEADLINE_MULTIPLIER = 4.0
 PROBE_DEADLINE_MIN_S = 5.0
+PROBE_WORKERS = 32
+PROBE_TIMEOUT_S = 1.5
 
 
 @dataclass(frozen=True)
@@ -212,16 +214,11 @@ def _probe_url(
         tr.close()
 
 
-def _probe_one(
-    url: str,
-    *,
-    expected_chain_id: int,
-    timeout_s: float,
-) -> ProbeResult:
+def _probe_one(url: str, *, expected_chain_id: int) -> ProbeResult:
     expected_hex = hex(expected_chain_id).lower()
 
     http_cfg, wss_cfg = _make_probe_transport_configs(
-        timeout_s=timeout_s,
+        timeout_s=PROBE_TIMEOUT_S,
         max_connections=10,
         max_keepalive_connections=5,
     )
@@ -235,20 +232,13 @@ def _probe_one(
 
 
 def probe_urls_streaming(
-    urls: list[str],
-    *,
-    expected_chain_id: int,
-    timeout_s: float = 1.5,
-    max_workers: int = 32,
-    deadline_s: float | None = None,
+    urls: list[str], *, expected_chain_id: int, deadline_s: float | None = None
 ) -> Iterator[ProbeResult]:
     """Probe candidate RPC URLs and stream back successes as they arrive.
 
     Args:
         urls: Candidate RPC URLs.
         expected_chain_id: Chain ID that responses must match.
-        timeout_s: Per-probe timeout.
-        max_workers: Maximum number of worker threads.
         deadline_s: Optional overall deadline for probing. If omitted, a
             heuristic deadline is used based on ``timeout_s``.
 
@@ -278,7 +268,7 @@ def probe_urls_streaming(
         return
 
     if deadline_s is None:
-        deadline_s = max(PROBE_DEADLINE_MIN_S, PROBE_DEADLINE_MULTIPLIER * float(timeout_s))
+        deadline_s = max(PROBE_DEADLINE_MIN_S, PROBE_DEADLINE_MULTIPLIER * float(PROBE_TIMEOUT_S))
 
     deadline = time.perf_counter() + float(deadline_s)
 
@@ -288,14 +278,14 @@ def probe_urls_streaming(
     for u in candidates:
         work_q.put(u)
 
-    worker_count = max(1, min(int(max_workers), len(candidates)))
+    worker_count = max(1, min(int(PROBE_WORKERS), len(candidates)))
     for _ in range(worker_count):
         work_q.put(None)
 
     expected_hex = hex(expected_chain_id).lower()
 
     http_cfg, wss_cfg = _make_probe_transport_configs(
-        timeout_s=timeout_s,
+        timeout_s=PROBE_TIMEOUT_S,
         max_connections=max(50, worker_count),
         max_keepalive_connections=min(20, worker_count),
     )
@@ -353,15 +343,11 @@ class PoolManager:
         *,
         target_pool: int = 6,
         max_lag_blocks: int = 8,
-        probe_timeout_s: float = 1.5,
-        probe_workers: int = 32,
         chains_registry: ChainsRegistry | None = None,
     ) -> None:
         self.chain_id = int(chain_id)
         self.target_pool = int(target_pool)
         self.max_lag_blocks = int(max_lag_blocks)
-        self.probe_timeout_s = float(probe_timeout_s)
-        self.probe_workers = int(probe_workers)
 
         self._reg = chains_registry or ChainsRegistry()
         self._meta: ChainMeta | None = None
@@ -431,12 +417,7 @@ class PoolManager:
         if t < self._next_epoch_ts:
             return
 
-        for pr in probe_urls_streaming(
-            self._meta.rpc,
-            expected_chain_id=self.chain_id,
-            timeout_s=self.probe_timeout_s,
-            max_workers=self.probe_workers,
-        ):
+        for pr in probe_urls_streaming(self._meta.rpc, expected_chain_id=self.chain_id):
             now2 = time.time()
             self._health_check(now=now2)
             self._handle_probe_result(pr=pr, now=now2)
@@ -484,11 +465,7 @@ class PoolManager:
             if self._cooldown_until.get(u, 0.0) > now:
                 continue
             try:
-                pr = _probe_one(
-                    u,
-                    expected_chain_id=self.chain_id,
-                    timeout_s=min(1.0, self.probe_timeout_s),
-                )
+                pr = _probe_one(u, expected_chain_id=self.chain_id)
                 self._rtt_by_url[u] = pr.rtt_ms
                 best_head = pr.head if best_head is None else max(best_head, pr.head)
 
@@ -602,12 +579,7 @@ _scheduler = _Scheduler()
 
 
 def acquire_pool_manager(
-    chain_id: int,
-    *,
-    target_pool: int = 6,
-    max_lag_blocks: int = 8,
-    probe_timeout_s: float = 1.5,
-    probe_workers: int = 32,
+    chain_id: int, *, target_pool: int = 6, max_lag_blocks: int = 8
 ) -> PoolManager:
     """Acquire a shared pool manager for a chain.
 
@@ -629,13 +601,7 @@ def acquire_pool_manager(
     with _pool_lock:
         pm = _pool_by_chain.get(cid)
         if pm is None:
-            pm = PoolManager(
-                cid,
-                target_pool=target_pool,
-                max_lag_blocks=max_lag_blocks,
-                probe_timeout_s=probe_timeout_s,
-                probe_workers=probe_workers,
-            )
+            pm = PoolManager(cid, target_pool=target_pool, max_lag_blocks=max_lag_blocks)
             _pool_by_chain[cid] = pm
 
         _pool_refcount[cid] = _pool_refcount.get(cid, 0) + 1
