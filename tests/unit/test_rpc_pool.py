@@ -206,7 +206,7 @@ def test_probe_one_success(monkeypatch: pytest.MonkeyPatch, fake_make_transport)
         "https://ok": _batch_ok(chain_id=1, head_hex="0x2a"),
     }
 
-    pr1 = pool._probe_one("https://ok", expected_chain_id=1, timeout_s=0.1)
+    pr1 = pool._probe_one("https://ok", expected_chain_id=1)
     assert pr1.url == "https://ok"
     assert pr1.head == 0x2A
     assert pr1.rtt_ms >= 0.0
@@ -228,7 +228,7 @@ def test_probe_one_strict_failures(
     FakeTransport.behavior = {"https://bad": resp}
 
     with pytest.raises(Exception) as e:
-        pool._probe_one("https://bad", expected_chain_id=1, timeout_s=0.1)
+        pool._probe_one("https://bad", expected_chain_id=1)
 
     assert err_substr in str(e.value)
 
@@ -264,8 +264,6 @@ def test_probe_urls_streaming_filters_and_dedups_http_only(
         pool.probe_urls_streaming(
             urls,
             expected_chain_id=1,
-            timeout_s=0.05,
-            max_workers=4,
             deadline_s=0.05,
         )
     )
@@ -293,15 +291,7 @@ def test_probe_urls_streaming_includes_wss_when_supported(
         "https://ok": _batch_ok(chain_id=1, head_hex="0x10"),
     }
 
-    results = list(
-        pool.probe_urls_streaming(
-            urls,
-            expected_chain_id=1,
-            timeout_s=0.05,
-            max_workers=2,
-            deadline_s=0.05,
-        )
-    )
+    results = list(pool.probe_urls_streaming(urls, expected_chain_id=1, deadline_s=0.05))
     got = sorted((r.url, r.head) for r in results)
     assert got == [("https://ok", 0x10), ("wss://ok", 0x12)]
 
@@ -326,15 +316,7 @@ def test_probe_urls_streaming_ignores_bad_responses(
 
     urls = ["https://ok", "https://wrong-chain", "https://non-batch"]
 
-    results = list(
-        pool.probe_urls_streaming(
-            urls,
-            expected_chain_id=1,
-            timeout_s=0.05,
-            max_workers=3,
-            deadline_s=0.05,
-        )
-    )
+    results = list(pool.probe_urls_streaming(urls, expected_chain_id=1, deadline_s=0.05))
     assert [r.url for r in results] == ["https://ok"]
 
 
@@ -509,11 +491,7 @@ def test_probe_urls_streaming_skips_missing_env_without_crashing(
     # This must not raise; it should just yield nothing.
     results = list(
         pool.probe_urls_streaming(
-            ["https://example.com/$NOPE"],
-            expected_chain_id=1,
-            timeout_s=0.01,
-            max_workers=1,
-            deadline_s=0.05,
+            ["https://example.com/$NOPE"], expected_chain_id=1, deadline_s=0.05
         )
     )
     assert results == []

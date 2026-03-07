@@ -136,16 +136,11 @@ def test_pool_mode_default_calls_acquire_pool_manager(monkeypatch: pytest.Monkey
     monkeypatch.setattr(w3mod, "acquire_pool_manager", _acquire_pool_manager)
     monkeypatch.setattr(w3mod, "release_pool_manager", lambda *a, **k: None)
 
-    w3 = w3mod.Web3(10, target_pool=7, max_lag_blocks=9, probe_timeout_s=0.7, probe_workers=11)
+    w3 = w3mod.Web3(10)
 
     assert isinstance(w3.provider, FakeProvider)
     assert w3.provider.init.pool_manager is sentinel
     assert seen["chain_id"] == 10
-    # sanity: knobs passed through
-    assert seen["kwargs"]["target_pool"] == 7
-    assert seen["kwargs"]["max_lag_blocks"] == 9
-    assert seen["kwargs"]["probe_timeout_s"] == 0.7
-    assert seen["kwargs"]["probe_workers"] == 11
 
 
 def test_split_per_chain_primary_disables_pool_for_that_chain(

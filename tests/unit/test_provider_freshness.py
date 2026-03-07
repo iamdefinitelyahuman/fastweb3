@@ -15,7 +15,7 @@ from fastweb3.provider import Provider, RetryPolicy
 class DummyPoolManager:
     """Minimal PoolManager stand-in to keep pooling enabled in Provider."""
 
-    def best_urls(self, needed: int, await_first: bool) -> list[str]:
+    def best_urls(self, needed: int, await_first: bool, exclude: set) -> list[str]:
         return []
 
 

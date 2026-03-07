@@ -145,7 +145,7 @@ class FakePoolManager:
         self._urls = list(urls)
         self.calls: list[tuple[int, bool]] = []
 
-    def best_urls(self, n: int, await_first: bool) -> list[str]:
+    def best_urls(self, n: int, await_first: bool, exclude: set) -> list[str]:
         self.calls.append((int(n), bool(await_first)))
         if n <= 0:
             return []

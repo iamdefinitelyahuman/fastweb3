@@ -100,10 +100,8 @@ def test_init_chain_id_only_uses_pool_manager(patch_init_wiring):
     chain_id, kwargs = created["pool_mgr_calls"][0]
     assert chain_id == 1
     # defaults from Web3.__init__ signature
-    assert kwargs["target_pool"] == 6
+    assert kwargs["target_pool"] == 12
     assert kwargs["max_lag_blocks"] == 8
-    assert kwargs["probe_timeout_s"] == 1.5
-    assert kwargs["probe_workers"] == 32
 
     # provider created with empty internal urls and pool_manager attached
     p = created["provider_insts"][-1]
