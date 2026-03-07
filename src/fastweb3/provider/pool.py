@@ -366,12 +366,12 @@ class PoolManager:
         self._next_epoch_ts: float = 0.0
 
     def best_urls(
-        self, n: int, *, await_first: bool = False, exclude: set | None = None
+        self, n: int | None, *, await_first: bool = False, exclude: set | None = None
     ) -> list[str]:
         """Return the best known URLs for this chain.
 
         Args:
-            n: Maximum number of URLs to return.
+            n: Maximum number of URLs to return. `None` for all.
             await_first: If ``True`` and the pool is not yet ready, block until
                 at least one URL is available.
             exclude: Optional set of urls to exclude from the result.
@@ -379,14 +379,11 @@ class PoolManager:
         Returns:
             Up to ``n`` URLs, ordered from best to worst by current RTT.
         """
-        if n <= 0:
+        if n is not None and n <= 0:
             return []
 
         if exclude is None:
             exclude = set()
-        with self._lock:
-            if self._active:
-                return [i for i in self._active if i not in exclude][:n]
 
         if await_first:
             self._ready.wait()

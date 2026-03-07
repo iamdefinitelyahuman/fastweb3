@@ -100,6 +100,72 @@ class EndpointSelectionMixin:
         with self._lock:
             return list(self._internal_targets)
 
+    def pool_size(self) -> int:
+        """
+        Return the number of RPC endpoints currently eligible for pool routing.
+
+        This counts endpoints that the provider may route requests to right now.
+        It includes:
+
+        - Internal endpoints configured directly on the provider.
+        - Public endpoints returned by the PoolManager.
+
+        Endpoints currently in cooldown are excluded. The returned value will
+        never exceed ``desired_pool_size``.
+
+        Returns:
+            int: Number of active, routable endpoints in the provider pool.
+        """
+        cooldown = self._cooldown_endpoints()
+        internal = [t for t in self.internal_endpoints() if t not in cooldown]
+
+        needed = max(0, self.desired_pool_size - len(internal))
+        manager_targets: list[str] = []
+        if needed > 0 and self.pool_manager is not None:
+            manager_targets = self.pool_manager.best_urls(
+                needed,
+                await_first=False,
+                exclude=cooldown,
+            )
+
+        seen: set[str] = set()
+        total = 0
+        for t in internal + manager_targets:
+            nt = normalize_target(t)
+            if nt in seen:
+                continue
+            seen.add(nt)
+            total += 1
+
+        return total
+
+    def pool_capacity(self) -> int:
+        """
+        Return the total number of distinct RPC endpoints available to the provider.
+
+        This represents the maximum pool size the provider could theoretically use.
+        It includes:
+
+        - All configured internal endpoints.
+        - All endpoints currently known to the PoolManager.
+
+        Cooldown state is ignored, and the value is not limited by
+        ``desired_pool_size``.
+
+        Returns:
+            int: Total number of unique endpoints available to the provider.
+        """
+        seen: set[str] = set()
+
+        for t in self.internal_endpoints():
+            seen.add(normalize_target(t))
+
+        if self.pool_manager is not None:
+            for t in self.pool_manager.best_urls(None):
+                seen.add(normalize_target(t))
+
+        return len(seen)
+
     def close(self) -> None:
         """Close all managed endpoints and clear internal state."""
         with self._lock:

@@ -203,6 +203,31 @@ class Web3:
 
         self.eth = Eth(self)
 
+    def active_pool_size(self) -> int:
+        """
+        Return the number of RPC endpoints currently available for request routing.
+
+        This is a passthrough to ``Provider.pool_size()`` and reflects the number
+        of endpoints the provider may actively route requests to. Endpoints that
+        are in cooldown are excluded.
+
+        Returns:
+            int: Number of currently active pool endpoints.
+        """
+        return self.provider.pool_size()
+
+    def pool_capacity(self) -> int:
+        """
+        Return the total number of RPC endpoints available to the provider.
+
+        This includes all internal endpoints and all endpoints currently known to
+        the PoolManager. Cooldown state and desired pool limits are ignored.
+
+        Returns:
+            int: Total number of unique endpoints available to the provider.
+        """
+        return self.provider.pool_capacity()
+
     def close(self) -> None:
         """Close resources held by this client."""
         fin = self._pool_finalizer
