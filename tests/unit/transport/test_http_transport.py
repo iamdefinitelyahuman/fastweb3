@@ -5,8 +5,8 @@ import json
 import httpx
 import pytest
 
-from fastweb3.errors import TransportError
-from fastweb3.transport.http import HTTPTransport, HTTPTransportConfig
+from fw3.errors import TransportError
+from fw3.transport.http import HTTPTransport, HTTPTransportConfig
 
 
 def _mock_client(handler) -> httpx.Client:

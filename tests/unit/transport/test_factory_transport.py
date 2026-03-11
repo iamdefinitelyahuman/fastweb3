@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from fastweb3.transport.factory import make_transport
-from fastweb3.transport.http import HTTPTransport
-from fastweb3.transport.ipc import IPCTransport
+from fw3.transport.factory import make_transport
+from fw3.transport.http import HTTPTransport
+from fw3.transport.ipc import IPCTransport
 
 
 def test_factory_creates_http_transport() -> None:
@@ -20,13 +20,13 @@ def test_factory_creates_http_transport() -> None:
 def test_factory_creates_ws_transport_if_available() -> None:
     # WSSTransport depends on websocket-client; if missing, make_transport should raise.
     try:
-        from fastweb3.transport.ws import WSSTransport  # noqa: F401
+        from fw3.transport.ws import WSSTransport  # noqa: F401
     except Exception:
         pytest.skip("websocket-client not installed; skipping WSS factory test")
 
     tr = make_transport("wss://example.invalid")
     # Import inside to avoid hard failure if dependency missing
-    from fastweb3.transport.ws import WSSTransport
+    from fw3.transport.ws import WSSTransport
 
     assert isinstance(tr, WSSTransport)
     tr.close()

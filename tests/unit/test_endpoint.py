@@ -6,8 +6,8 @@ from typing import Any, Deque, List, Mapping
 
 import pytest
 
-from fastweb3.endpoint import Endpoint
-from fastweb3.errors import RPCError, RPCMalformedResponse, TransportError
+from fw3.endpoint import Endpoint
+from fw3.errors import RPCError, RPCMalformedResponse, TransportError
 
 
 @dataclass
@@ -341,7 +341,7 @@ def test_endpoint_uses_factory_for_wss_target(monkeypatch: pytest.MonkeyPatch) -
     Endpoint should be transport-agnostic: if no transport is provided,
     it should call make_transport(url) and work for wss:// targets.
     """
-    import fastweb3.endpoint as endpoint_mod
+    import fw3.endpoint as endpoint_mod
 
     seen: list[str] = []
     t = ScriptedTransport()
@@ -365,7 +365,7 @@ def test_endpoint_uses_factory_for_ipc_target(monkeypatch: pytest.MonkeyPatch) -
     """
     Same as above but for ipc:// targets.
     """
-    import fastweb3.endpoint as endpoint_mod
+    import fw3.endpoint as endpoint_mod
 
     seen: list[str] = []
     t = ScriptedTransport()
@@ -388,7 +388,7 @@ def test_endpoint_factory_transport_supports_batch_for_wss(monkeypatch: pytest.M
     """
     Endpoint.request_batch() should work regardless of scheme as long as transport supports batch
     """
-    import fastweb3.endpoint as endpoint_mod
+    import fw3.endpoint as endpoint_mod
 
     t = ScriptedTransport()
     t.queue_return(

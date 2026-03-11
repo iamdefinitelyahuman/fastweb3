@@ -7,10 +7,10 @@ from typing import Any, Deque
 
 import pytest
 
-import fastweb3.provider as provider_mod
-import fastweb3.provider.endpoint_selection as es_mod
-from fastweb3.errors import AllEndpointsFailed, RPCError, RPCErrorDetails, TransportError
-from fastweb3.formatters import to_int
+import fw3.provider as provider_mod
+import fw3.provider.endpoint_selection as es_mod
+from fw3.errors import AllEndpointsFailed, RPCError, RPCErrorDetails, TransportError
+from fw3.formatters import to_int
 
 
 class _StubPoolManager:

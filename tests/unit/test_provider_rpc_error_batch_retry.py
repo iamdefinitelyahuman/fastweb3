@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from fastweb3.errors import RPCError, RPCErrorDetails
-from fastweb3.provider.provider import Provider
-from fastweb3.provider.types import _BatchCall
+from fw3.errors import RPCError, RPCErrorDetails
+from fw3.provider.provider import Provider
+from fw3.provider.types import _BatchCall
 
 
 class FakeEndpoint:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from fastweb3.provider.rpc_error_retry import _pin_calls_to_tip
-from fastweb3.provider.types import _BatchCall
+from fw3.provider.rpc_error_retry import _pin_calls_to_tip
+from fw3.provider.types import _BatchCall
 
 
 def test_pin_calls_to_tip_replaces_latest_in_second_position_and_preserves_container_type() -> None:

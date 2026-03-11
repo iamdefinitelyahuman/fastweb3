@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from fastweb3.web3 import web3 as web3_mod
+from fw3.web3 import web3 as web3_mod
 
 
 class DummyProvider:

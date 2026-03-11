@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from fastweb3 import validation
-from fastweb3.errors import ValidationError
+from fw3 import validation
+from fw3.errors import ValidationError
 
 # ----------------------------
 # helpers

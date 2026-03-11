@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-import fastweb3.provider.pool as pool
+import fw3.provider.pool as pool
 
 _REAL_THREAD = threading.Thread
 

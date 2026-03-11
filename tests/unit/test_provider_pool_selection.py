@@ -1,7 +1,7 @@
 import time
 
-from fastweb3.provider.pool import PoolManager
-from fastweb3.provider.provider import Provider
+from fw3.provider.pool import PoolManager
+from fw3.provider.provider import Provider
 
 
 class RecordingPoolManager:

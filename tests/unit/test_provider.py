@@ -7,9 +7,9 @@ from typing import Any, Deque
 
 import pytest
 
-import fastweb3.provider.endpoint_selection as es_mod
-import fastweb3.utils as utils_mod
-from fastweb3.errors import (
+import fw3.provider.endpoint_selection as es_mod
+import fw3.utils as utils_mod
+from fw3.errors import (
     AllEndpointsFailed,
     NoEndpoints,
     NoPrimaryEndpoint,
@@ -17,7 +17,7 @@ from fastweb3.errors import (
     RPCErrorDetails,
     TransportError,
 )
-from fastweb3.provider import Provider, RetryPolicy
+from fw3.provider import Provider, RetryPolicy
 
 
 @dataclass

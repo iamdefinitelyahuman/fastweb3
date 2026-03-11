@@ -5,8 +5,8 @@ import threading
 import time
 from typing import Any
 
-from fastweb3.provider import Provider
-from fastweb3.provider.types import _EndpointState
+from fw3.provider import Provider
+from fw3.provider.types import _EndpointState
 
 
 class FakeEndpoint:

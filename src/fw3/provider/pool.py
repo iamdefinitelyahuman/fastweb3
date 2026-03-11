@@ -125,7 +125,7 @@ def _has_wss_support() -> bool:
     we treat ws/wss URLs as not probeable to avoid exception hot paths.
     """
     try:
-        import fastweb3.transport.ws as ws_mod
+        import fw3.transport.ws as ws_mod
     except Exception:
         return False
     return ws_mod.websocket is not None

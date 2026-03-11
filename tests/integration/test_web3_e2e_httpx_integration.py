@@ -10,14 +10,14 @@ from typing import Any, Dict, List, Sequence
 import httpx
 import pytest
 
-from fastweb3 import Web3, Web3Config
-from fastweb3.provider import Provider
+from fw3 import Web3, Web3Config
+from fw3.provider import Provider
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _fast_probe_deadlines():
     """Speed up pool probing during tests by shortening probe deadlines."""
-    import fastweb3.provider.pool as pool
+    import fw3.provider.pool as pool
 
     mp = pytest.MonkeyPatch()
     mp.setattr(pool, "PROBE_DEADLINE_MIN_S", 0.1)
@@ -214,7 +214,7 @@ def httpx_mock() -> _HttpxMock:
     # Best-effort: stop any global pool scheduler threads before unpatching httpx
     # so nothing can accidentally hit the real network during teardown.
     try:
-        import fastweb3.provider.pool as _rpc_pool
+        import fw3.provider.pool as _rpc_pool
 
         stop = getattr(_rpc_pool, "_sched_stop", None)
         t = getattr(_rpc_pool, "_sched_thread", None)

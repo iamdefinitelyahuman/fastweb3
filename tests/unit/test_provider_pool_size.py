@@ -2,8 +2,8 @@
 
 import time
 
-import fastweb3.provider.endpoint_selection as endpoint_selection_mod
-from fastweb3.provider.provider import Provider
+import fw3.provider.endpoint_selection as endpoint_selection_mod
+from fw3.provider.provider import Provider
 
 
 class FakeEndpoint:

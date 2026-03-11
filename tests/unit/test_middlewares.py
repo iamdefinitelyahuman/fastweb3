@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-import fastweb3.middleware as mw_mod
-from fastweb3.provider import Provider
+import fw3.middleware as mw_mod
+from fw3.provider import Provider
 
 
 @pytest.fixture(autouse=True)

@@ -6,9 +6,9 @@ from typing import Any, Callable, Optional
 
 import pytest
 
-import fastweb3.web3.eth as eth
-import fastweb3.web3.web3 as w3mod
-from fastweb3.web3 import Web3
+import fw3.web3.eth as eth
+import fw3.web3.web3 as w3mod
+from fw3.web3 import Web3
 
 
 class _ImmediateHandle:

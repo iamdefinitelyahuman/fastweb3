@@ -1,6 +1,6 @@
 import pytest
 
-from fastweb3.formatters import normalize_rpc_obj, to_hex_quantity, to_int
+from fw3.formatters import normalize_rpc_obj, to_hex_quantity, to_int
 
 
 def test_to_int_accepts_hex_str_any_case_and_whitespace() -> None:

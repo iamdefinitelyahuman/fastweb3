@@ -11,8 +11,8 @@ from typing import Any, Callable
 
 import pytest
 
-from fastweb3.errors import TransportError
-from fastweb3.transport.ipc import IPCTransport, IPCTransportConfig
+from fw3.errors import TransportError
+from fw3.transport.ipc import IPCTransport, IPCTransportConfig
 
 
 def _supports_ipc_unix_socket() -> bool:

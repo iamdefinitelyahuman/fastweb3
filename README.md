@@ -27,7 +27,7 @@ pip install -e .
 `fastweb3` queries a [list of public RPC endpoints](https://github.com/ethereum-lists/chains), maintains a pool of useable nodes, distributes requests between them, and reroutes failed requests. Users can rely on public infrastructure without thinking about timeouts, rate limiting, nodes falling out of sync, etc.
 
 ```py
->>> from fastweb3 import Web3
+>>> from fw3 import Web3
 
 # only a chainId is needed to connect
 >>> w3 = Web3(1)

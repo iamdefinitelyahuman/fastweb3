@@ -5,9 +5,9 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from fastweb3.errors import ValidationError
-from fastweb3.provider import Provider
-from fastweb3.web3 import Web3, Web3Config
+from fw3.errors import ValidationError
+from fw3.provider import Provider
+from fw3.web3 import Web3, Web3Config
 
 
 @dataclass

@@ -7,8 +7,8 @@ from typing import Any, Callable, Optional
 
 import pytest
 
-from fastweb3.errors import TransportError
-from fastweb3.transport.ws import WSSTransport, WSSTransportConfig
+from fw3.errors import TransportError
+from fw3.transport.ws import WSSTransport, WSSTransportConfig
 
 
 class _FakeWebSocket:
@@ -55,7 +55,7 @@ class _FakeWebSocket:
 
 
 def test_wss_transport_single_request_roundtrip(monkeypatch: pytest.MonkeyPatch) -> None:
-    import fastweb3.transport.ws as ws_mod
+    import fw3.transport.ws as ws_mod
 
     if ws_mod.websocket is None:
         pytest.skip("websocket-client not installed; skipping WSS transport tests")
@@ -88,7 +88,7 @@ def test_wss_transport_single_request_roundtrip(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_wss_transport_batch_request_roundtrip(monkeypatch: pytest.MonkeyPatch) -> None:
-    import fastweb3.transport.ws as ws_mod
+    import fw3.transport.ws as ws_mod
 
     if ws_mod.websocket is None:
         pytest.skip("websocket-client not installed; skipping WSS transport tests")
@@ -125,7 +125,7 @@ def test_wss_transport_ignores_messages_without_id(monkeypatch: pytest.MonkeyPat
     """
     Subscription-like pushes have no 'id'. We ignore them and still satisfy the request.
     """
-    import fastweb3.transport.ws as ws_mod
+    import fw3.transport.ws as ws_mod
 
     if ws_mod.websocket is None:
         pytest.skip("websocket-client not installed; skipping WSS transport tests")
@@ -153,7 +153,7 @@ def test_wss_transport_ignores_messages_without_id(monkeypatch: pytest.MonkeyPat
 
 
 def test_wss_transport_times_out_waiting_for_response(monkeypatch: pytest.MonkeyPatch) -> None:
-    import fastweb3.transport.ws as ws_mod
+    import fw3.transport.ws as ws_mod
 
     if ws_mod.websocket is None:
         pytest.skip("websocket-client not installed; skipping WSS transport tests")
@@ -177,7 +177,7 @@ def test_wss_transport_times_out_waiting_for_response(monkeypatch: pytest.Monkey
 
 
 def test_wss_transport_decodes_bytes_responses(monkeypatch: pytest.MonkeyPatch) -> None:
-    import fastweb3.transport.ws as ws_mod
+    import fw3.transport.ws as ws_mod
 
     if ws_mod.websocket is None:
         pytest.skip("websocket-client not installed; skipping WSS transport tests")
@@ -206,7 +206,7 @@ def test_wss_transport_decodes_bytes_responses(monkeypatch: pytest.MonkeyPatch) 
 def test_wss_transport_batch_response_in_single_list_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import fastweb3.transport.ws as ws_mod
+    import fw3.transport.ws as ws_mod
 
     if ws_mod.websocket is None:
         pytest.skip("websocket-client not installed; skipping WSS transport tests")
@@ -247,7 +247,7 @@ def test_wss_transport_batch_response_in_single_list_message(
 def test_wss_transport_duplicate_inflight_request_id_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import fastweb3.transport.ws as ws_mod
+    import fw3.transport.ws as ws_mod
 
     if ws_mod.websocket is None:
         pytest.skip("websocket-client not installed; skipping WSS transport tests")
@@ -292,7 +292,7 @@ def test_wss_transport_duplicate_inflight_request_id_raises(
 
 
 def test_wss_transport_reconnects_after_recv_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    import fastweb3.transport.ws as ws_mod
+    import fw3.transport.ws as ws_mod
 
     if ws_mod.websocket is None:
         pytest.skip("websocket-client not installed; skipping WSS transport tests")
@@ -337,7 +337,7 @@ def test_wss_transport_reconnects_after_recv_failure(monkeypatch: pytest.MonkeyP
 def test_wss_transport_connect_failure_surfaces_as_transport_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import fastweb3.transport.ws as ws_mod
+    import fw3.transport.ws as ws_mod
 
     if ws_mod.websocket is None:
         pytest.skip("websocket-client not installed; skipping WSS transport tests")
@@ -359,7 +359,7 @@ def test_wss_transport_connect_failure_surfaces_as_transport_error(
 
 
 def test_wss_transport_dispatch_failure_fails_inflight(monkeypatch: pytest.MonkeyPatch) -> None:
-    import fastweb3.transport.ws as ws_mod
+    import fw3.transport.ws as ws_mod
 
     if ws_mod.websocket is None:
         pytest.skip("websocket-client not installed; skipping WSS transport tests")

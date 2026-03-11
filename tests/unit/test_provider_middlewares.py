@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import pytest
 
-import fastweb3.middleware as mw_mod
-import fastweb3.provider.endpoint_selection as es_mod
-from fastweb3.errors import TransportError
-from fastweb3.provider import Provider
-from fastweb3.provider.types import _BatchCall
+import fw3.middleware as mw_mod
+import fw3.provider.endpoint_selection as es_mod
+from fw3.errors import TransportError
+from fw3.provider import Provider
+from fw3.provider.types import _BatchCall
 
 
 @pytest.fixture(autouse=True)

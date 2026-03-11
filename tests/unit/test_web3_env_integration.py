@@ -6,8 +6,8 @@ from typing import Any
 
 import pytest
 
-import fastweb3.web3.web3 as w3mod
-from fastweb3.errors import NoEndpoints
+import fw3.web3.web3 as w3mod
+from fw3.errors import NoEndpoints
 
 
 @dataclass

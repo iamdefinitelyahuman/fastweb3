@@ -4,8 +4,8 @@ from typing import Any, Callable
 
 import pytest
 
-from fastweb3.errors import RPCError, RPCErrorDetails
-from fastweb3.web3.web3 import Web3
+from fw3.errors import RPCError, RPCErrorDetails
+from fw3.web3.web3 import Web3
 
 
 class FakeProvider:

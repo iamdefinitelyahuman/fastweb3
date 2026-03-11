@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastweb3"
-version = "0.1.0"
+version = "0.1.1"
 description = "High-performance Web3 client with batching and latency optimization."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -55,7 +55,7 @@ select = ["E", "F", "I"]
 
 [tool.pytest.ini_options]
 addopts = [
-  "--cov=fastweb3",
+  "--cov=fw3",
   "--cov-report=term-missing",
   "--cov-report=xml",
 ]

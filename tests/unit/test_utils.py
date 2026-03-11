@@ -1,6 +1,6 @@
 import pytest
 
-from fastweb3.utils import is_url_target, normalize_target, normalize_url
+from fw3.utils import is_url_target, normalize_target, normalize_url
 
 
 def test_normalize_url_expands_dollar_var(monkeypatch: pytest.MonkeyPatch) -> None:

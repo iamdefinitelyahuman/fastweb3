@@ -6,10 +6,10 @@ from typing import Any, Callable, Optional
 
 import pytest
 
-import fastweb3.provider.endpoint_selection as es_mod
-import fastweb3.provider.execution as exec_mod
-from fastweb3.errors import AllEndpointsFailed, NoEndpoints
-from fastweb3.provider import Provider, RetryPolicy
+import fw3.provider.endpoint_selection as es_mod
+import fw3.provider.execution as exec_mod
+from fw3.errors import AllEndpointsFailed, NoEndpoints
+from fw3.provider import Provider, RetryPolicy
 
 
 class DummyPoolManager:

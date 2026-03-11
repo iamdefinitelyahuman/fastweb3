@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from fastweb3.endpoint import Endpoint
+from fw3.endpoint import Endpoint
 
 
 class NoSendTransport:

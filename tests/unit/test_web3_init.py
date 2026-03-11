@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-import fastweb3.web3.web3 as web3_mod
-from fastweb3.errors import NoEndpoints
+import fw3.web3.web3 as web3_mod
+from fw3.errors import NoEndpoints
 
 
 class FakePoolManager:

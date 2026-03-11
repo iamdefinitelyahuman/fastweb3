@@ -2,7 +2,7 @@ import threading
 
 import pytest
 
-from fastweb3.deferred import Handle
+from fw3.deferred import Handle
 
 
 def test_set_value_raises_if_exc_set_during_formatting() -> None:

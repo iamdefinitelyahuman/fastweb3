@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from fastweb3.provider.rpc_error_retry import (
+from fw3.provider.rpc_error_retry import (
     _decide_rpc_error_retry,
     _normalize_rpc_error_message,
 )
-from fastweb3.provider.types import _BatchCall, _RPCErrorObservation
+from fw3.provider.types import _BatchCall, _RPCErrorObservation
 
 
 def _call(method: str = "eth_call") -> _BatchCall:

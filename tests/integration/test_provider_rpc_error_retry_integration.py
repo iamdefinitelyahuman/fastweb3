@@ -5,8 +5,8 @@ import json
 import httpx
 import pytest
 
-from fastweb3.errors import RPCError
-from fastweb3.provider import Provider
+from fw3.errors import RPCError
+from fw3.provider import Provider
 
 
 def _rpc_result(req_id: int, result):

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from fastweb3.env import (
+from fw3.env import (
     get_default_primary_endpoint,
     get_pool_mode,
     parse_primary_endpoints,

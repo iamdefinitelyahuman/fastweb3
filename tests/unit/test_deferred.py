@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from fastweb3.deferred import Handle, deferred_response
+from fw3.deferred import Handle, deferred_response
 
 
 def _assert_has_creation_note(exc: BaseException) -> None:
