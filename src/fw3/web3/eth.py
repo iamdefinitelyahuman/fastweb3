@@ -12,6 +12,7 @@ from ..formatters import normalize_rpc_obj, to_int
 BlockId = Union[
     str, int
 ]  # "latest" | "pending" | "earliest" | "safe" | "finalized" | hex str | int
+BlockRef = Union[BlockId, bytes]  # BlockId | 32-byte block hash
 
 
 def _is_latest_like_block(x: BlockId | None) -> bool:
@@ -213,7 +214,7 @@ class Eth:
     # chain-state
     # ----------------------------
 
-    def get_balance(self, address: str | bytes, block: BlockId = "latest") -> int:
+    def get_balance(self, address: str | bytes, block: BlockRef = "latest") -> int:
         """Return the balance of an account at a given block.
 
         Args:
@@ -225,14 +226,14 @@ class Eth:
         """
         strict = bool(self._w3.config.strict)
         addr = validation.normalize_address(address, strict=strict)
-        blk = validation.block_id(block, strict=strict)
+        blk = validation.block_ref(block, strict=strict)
         freshness = _fresh_latest if _is_latest_like_block(block) else None
         return self._w3.make_request(
             "eth_getBalance", [addr, blk], formatter=to_int, freshness=freshness
         )
 
     def get_storage_at(
-        self, address: str | bytes, position: int | str, block: BlockId = "latest"
+        self, address: str | bytes, position: int | str, block: BlockRef = "latest"
     ) -> str:
         """Return the value from a storage position at a given block.
 
@@ -247,11 +248,11 @@ class Eth:
         strict = bool(self._w3.config.strict)
         addr = validation.normalize_address(address, strict=strict)
         pos = validation.quantity(position, strict=strict)
-        blk = validation.block_id(block, strict=strict)
+        blk = validation.block_ref(block, strict=strict)
         freshness = _fresh_latest if _is_latest_like_block(block) else None
         return self._w3.make_request("eth_getStorageAt", [addr, pos, blk], freshness=freshness)
 
-    def get_transaction_count(self, address: str | bytes, block: BlockId = "latest") -> int:
+    def get_transaction_count(self, address: str | bytes, block: BlockRef = "latest") -> int:
         """Return the transaction count (nonce) for an account.
 
         Args:
@@ -263,7 +264,7 @@ class Eth:
         """
         strict = bool(self._w3.config.strict)
         addr = validation.normalize_address(address, strict=strict)
-        blk = validation.block_id(block, strict=strict)
+        blk = validation.block_ref(block, strict=strict)
         freshness = _fresh_latest if _is_latest_like_block(block) else None
         return self._w3.make_request(
             "eth_getTransactionCount",
@@ -308,7 +309,7 @@ class Eth:
             freshness=freshness,
         )
 
-    def get_code(self, address: str | bytes, block: BlockId = "latest") -> str:
+    def get_code(self, address: str | bytes, block: BlockRef = "latest") -> str:
         """Return contract code at a given address and block.
 
         Args:
@@ -320,7 +321,7 @@ class Eth:
         """
         strict = bool(self._w3.config.strict)
         addr = validation.normalize_address(address, strict=strict)
-        blk = validation.block_id(block, strict=strict)
+        blk = validation.block_ref(block, strict=strict)
         freshness = _fresh_latest if _is_latest_like_block(block) else None
         return self._w3.make_request("eth_getCode", [addr, blk], freshness=freshness)
 
@@ -511,7 +512,7 @@ class Eth:
         chain_id: int | str | None = None,
         type_: int | str | None = None,
         access_list: list[Mapping[str, Any]] | None = None,
-        block: BlockId = "latest",
+        block: BlockRef = "latest",
     ) -> str:
         """Execute a message call without creating a transaction.
 
@@ -555,7 +556,7 @@ class Eth:
             type_=type_,
             access_list=access_list,
         )
-        blk = validation.block_id(block, strict=strict)
+        blk = validation.block_ref(block, strict=strict)
         freshness = _fresh_latest if _is_latest_like_block(block) else None
         return self._w3.make_request("eth_call", [tx, blk], freshness=freshness)
 

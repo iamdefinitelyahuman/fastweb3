@@ -202,6 +202,37 @@ def block_id(x: int | str, *, strict: bool) -> str:
     return quantity(s, strict=True)
 
 
+def block_ref(x: int | str | bytes, *, strict: bool) -> str:
+    """Normalize a JSON-RPC block reference.
+
+    Args:
+        x: Block number, block tag, or block hash.
+        strict: If ``True``, validate tags, hashes, and hex formatting.
+            If ``False``, strings are passed through (stripped).
+
+    Returns:
+        Normalized block reference.
+
+    Raises:
+        ValidationError: If the block reference is invalid.
+    """
+    if isinstance(x, bytes):
+        return hash32(x, name="block", strict=strict)
+
+    if isinstance(x, int):
+        return block_id(x, strict=strict)
+
+    _require(isinstance(x, str), f"block ref must be int|str|bytes, got {type(x).__name__}")
+    s = x.strip()
+    if not strict:
+        return s
+
+    if s.startswith(("0x", "0X")) and len(s) == 66:
+        return hash32(s, name="block", strict=True)
+
+    return block_id(s, strict=True)
+
+
 def topics(
     topics: list[str | bytes | list[str | bytes] | None] | None, *, strict: bool
 ) -> list[str | list[str] | None] | None:
