@@ -754,6 +754,144 @@ class Eth:
             freshness=freshness,
         )
 
+    def blob_base_fee(self) -> int:
+        """Return the current base fee per blob gas in wei."""
+        return self._w3.make_request("eth_blobBaseFee", [], formatter=to_int)
+
+    def create_access_list(
+        self,
+        *,
+        to: str | bytes | None = None,
+        from_: str | bytes | None = None,
+        gas: int | str | None = None,
+        gas_price: int | str | None = None,
+        max_fee_per_gas: int | str | None = None,
+        max_priority_fee_per_gas: int | str | None = None,
+        value: int | str | None = None,
+        data: str | bytes | None = None,
+        nonce: int | str | None = None,
+        chain_id: int | str | None = None,
+        type_: int | str | None = None,
+        access_list: list[Mapping[str, Any]] | None = None,
+        block: BlockId | None = None,
+    ) -> dict[str, Any]:
+        """Generate an access list for a transaction-like call."""
+        strict = bool(self._w3.config.strict)
+        if strict and to is None and data is None:
+            raise ValidationError("eth_createAccessList requires at least one of 'to' or 'data'")
+
+        tx = self._tx_object(
+            from_=from_,
+            to=to,
+            gas=gas,
+            gas_price=gas_price,
+            max_fee_per_gas=max_fee_per_gas,
+            max_priority_fee_per_gas=max_priority_fee_per_gas,
+            value=value,
+            data=data,
+            nonce=nonce,
+            chain_id=chain_id,
+            type_=type_,
+            access_list=access_list,
+        )
+        params: list[Any] = [tx]
+        if block is not None:
+            params.append(validation.block_id(block, strict=strict))
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
+        return self._w3.make_request(
+            "eth_createAccessList",
+            params,
+            formatter=normalize_rpc_obj,
+            freshness=freshness,
+        )
+
+    def fee_history(
+        self,
+        block_count: int | str,
+        newest_block: BlockId,
+        reward_percentiles: list[float],
+    ) -> dict[str, Any]:
+        """Return fee history for a recent block range."""
+        strict = bool(self._w3.config.strict)
+        count = validation.quantity(block_count, strict=strict)
+        newest = validation.block_id(newest_block, strict=strict)
+        if strict:
+            prev = -1.0
+            for i, p in enumerate(reward_percentiles):
+                if p < 0 or p > 100:
+                    raise ValidationError(f"reward_percentiles[{i}] must be between 0 and 100")
+                if p < prev:
+                    raise ValidationError("reward_percentiles must be monotonically increasing")
+                prev = p
+
+        freshness = _fresh_latest if _is_latest_like_block(newest_block) else None
+        return self._w3.make_request(
+            "eth_feeHistory",
+            [count, newest, reward_percentiles],
+            formatter=normalize_rpc_obj,
+            freshness=freshness,
+        )
+
+    def get_block_access_list(self, block: BlockRef) -> Any:
+        """Return the block access list for a block by identifier or hash."""
+        strict = bool(self._w3.config.strict)
+        blk = validation.block_ref(block, strict=strict)
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
+        return self._w3.make_request("eth_getBlockAccessList", [blk], freshness=freshness)
+
+    def get_block_receipts(self, block: BlockRef) -> list[Any] | None:
+        """Return all transaction receipts for a block by identifier or hash."""
+        strict = bool(self._w3.config.strict)
+        blk = validation.block_ref(block, strict=strict)
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
+        return self._w3.make_request(
+            "eth_getBlockReceipts",
+            [blk],
+            formatter=normalize_rpc_obj,
+            freshness=freshness,
+        )
+
+    def get_proof(
+        self,
+        address: str | bytes,
+        storage_keys: list[str | bytes],
+        block: BlockRef = "latest",
+    ) -> dict[str, Any]:
+        """Return the Merkle proof for an account and storage slots."""
+        strict = bool(self._w3.config.strict)
+        addr = validation.normalize_address(address, strict=strict)
+        keys = [
+            validation.data_hex(k, name=f"storage_keys[{i}]", strict=strict, allow_empty=True)
+            for i, k in enumerate(storage_keys)
+        ]
+        blk = validation.block_ref(block, strict=strict)
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
+        return self._w3.make_request(
+            "eth_getProof",
+            [addr, keys, blk],
+            formatter=normalize_rpc_obj,
+            freshness=freshness,
+        )
+
+    def max_priority_fee_per_gas(self) -> int:
+        """Return the current max priority fee per gas in wei."""
+        return self._w3.make_request("eth_maxPriorityFeePerGas", [], formatter=to_int)
+
+    def simulate_v1(self, payload: Mapping[str, Any], block: BlockRef = "latest") -> list[Any]:
+        """Simulate one or more calls without creating transactions."""
+        strict = bool(self._w3.config.strict)
+        if strict and not isinstance(payload, Mapping):
+            raise ValidationError("eth_simulateV1 requires 'payload' to be a mapping")
+
+        blk = validation.block_ref(block, strict=strict)
+        freshness = _fresh_latest if _is_latest_like_block(block) else None
+        return self._w3.make_request(
+            "eth_simulateV1",
+            [dict(payload), blk],
+            formatter=normalize_rpc_obj,
+            freshness=freshness,
+        )
+
     # ----------------------------
     # filters (primary-only)
     # ----------------------------
