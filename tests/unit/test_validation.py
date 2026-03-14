@@ -193,6 +193,34 @@ def test_block_id_non_strict_passthrough() -> None:
 
 
 # ----------------------------
+# block_ref
+# ----------------------------
+
+
+def test_block_ref_strict_accepts_tags_numbers_and_hashes() -> None:
+    h = "0x" + ("aa" * 32)
+    assert validation.block_ref("LATEST", strict=True) == "latest"
+    assert validation.block_ref(16, strict=True) == "0x10"
+    assert validation.block_ref(h.upper(), strict=True) == h
+
+
+def test_block_ref_non_strict_passthrough_and_bytes_hexify() -> None:
+    assert validation.block_ref("  banana ", strict=False) == "banana"
+    assert validation.block_ref(b"\x11" * 32, strict=False) == "0x" + ("11" * 32)
+
+
+def test_block_ref_strict_rejects_invalid_values() -> None:
+    with pytest.raises(ValidationError, match=r"block ref must be int\|str\|bytes"):
+        validation.block_ref(object(), strict=True)  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError, match="length 32"):
+        validation.block_ref(b"\x11" * 31, strict=True)
+
+    with pytest.raises(ValidationError, match="0x-prefixed"):
+        validation.block_ref("nope", strict=True)
+
+
+# ----------------------------
 # topics
 # ----------------------------
 

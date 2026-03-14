@@ -635,3 +635,135 @@ def test_non_strict_does_not_lowercase_or_validate_str_address():
     assert c.params[0] == "0xAbCd"
     assert c.params[1] == "latest"
     assert c.route == "pool"
+
+
+def test_block_ref_methods_accept_block_hash_in_strict_mode():
+    bh = h32_bytes(0x77)
+    p = RecordingProvider(
+        results={
+            "eth_getBalance": "0x2a",
+            "eth_getCode": "0x6000",
+            "eth_getStorageAt": "0x" + "00" * 32,
+            "eth_getTransactionCount": "0x10",
+            "eth_call": "0x1234",
+            "eth_getProof": {
+                "address": "0x" + "11" * 20,
+                "balance": "0x0",
+                "storageHash": "0x" + "22" * 32,
+                "codeHash": "0x" + "33" * 32,
+                "accountProof": [],
+                "storageProof": [],
+            },
+        }
+    )
+    w3 = mk_w3(p, strict=True)
+
+    assert force(w3.eth.get_balance(addr_bytes(0x01), bh)) == 42
+    assert p.last_call().params == ["0x" + addr_bytes(0x01).hex(), "0x" + bh.hex()]
+
+    assert force(w3.eth.get_code("0x" + "ab" * 20, bh)) == "0x6000"
+    assert p.last_call().params == ["0x" + "ab" * 20, "0x" + bh.hex()]
+
+    force(w3.eth.get_storage_at("0x" + "cd" * 20, 5, bh))
+    assert p.last_call().params == ["0x" + "cd" * 20, "0x5", "0x" + bh.hex()]
+
+    assert force(w3.eth.get_transaction_count("0x" + "11" * 20, bh)) == 16
+    assert p.last_call().params == ["0x" + "11" * 20, "0x" + bh.hex()]
+
+    assert force(w3.eth.call(to=addr_bytes(0x02), data="0x", block=bh)) == "0x1234"
+    assert p.last_call().params[1] == "0x" + bh.hex()
+
+    proof = force(w3.eth.get_proof("0x" + "11" * 20, [b"", b"\x01\x02"], bh))
+    assert proof["address"] == "0x" + "11" * 20
+    assert p.last_call().params == ["0x" + "11" * 20, ["0x", "0x0102"], "0x" + bh.hex()]
+
+
+def test_eth_new_spec_methods_wiring_and_validation():
+    bh = h32_bytes(0x66)
+    p = RecordingProvider(
+        results={
+            "eth_blobBaseFee": "0x3",
+            "eth_createAccessList": {"accessList": [], "gasUsed": "0x5208"},
+            "eth_feeHistory": {
+                "oldestBlock": "0x10",
+                "baseFeePerGas": ["0x1", "0x2"],
+                "gasUsedRatio": [0.5],
+                "reward": [["0x3"]],
+            },
+            "eth_getBlockAccessList": [{"address": "0x" + "11" * 20, "storageKeys": []}],
+            "eth_getBlockReceipts": [{"blockNumber": "0x10", "transactionIndex": "0x0"}],
+            "eth_getProof": {
+                "address": "0x" + "11" * 20,
+                "balance": "0x0",
+                "storageHash": "0x" + "22" * 32,
+                "codeHash": "0x" + "33" * 32,
+                "accountProof": [],
+                "storageProof": [],
+            },
+            "eth_maxPriorityFeePerGas": "0x4",
+            "eth_simulateV1": [{"calls": []}],
+        }
+    )
+    w3 = mk_w3(p, strict=True)
+
+    assert force(w3.eth.blob_base_fee()) == 3
+    assert p.last_call().method == "eth_blobBaseFee"
+    assert p.last_call().params == []
+
+    out = force(w3.eth.create_access_list(to=addr_bytes(0x02), block="pending"))
+    assert out["gasUsed"] == 0x5208
+    c = p.last_call()
+    assert c.method == "eth_createAccessList"
+    assert c.params[0]["to"] == "0x" + addr_bytes(0x02).hex()
+    assert c.params[1] == "pending"
+
+    with pytest.raises(
+        ValidationError, match="eth_createAccessList requires at least one of 'to' or 'data'"
+    ):
+        force(w3.eth.create_access_list())
+
+    out = force(w3.eth.fee_history(2, "latest", [10.0, 50.0]))
+    assert out["oldestBlock"] == 16
+    assert out["baseFeePerGas"] == [1, 2]
+    assert out["reward"] == [[3]]
+    c = p.last_call()
+    assert c.method == "eth_feeHistory"
+    assert c.params == ["0x2", "latest", [10.0, 50.0]]
+
+    with pytest.raises(ValidationError, match="between 0 and 100"):
+        force(w3.eth.fee_history(2, "latest", [101.0]))
+
+    with pytest.raises(ValidationError, match="monotonically increasing"):
+        force(w3.eth.fee_history(2, "latest", [50.0, 10.0]))
+
+    out = force(w3.eth.get_block_access_list(bh))
+    assert out[0]["address"] == "0x" + "11" * 20
+    c = p.last_call()
+    assert c.method == "eth_getBlockAccessList"
+    assert c.params == ["0x" + bh.hex()]
+
+    out = force(w3.eth.get_block_receipts(bh))
+    assert out[0]["blockNumber"] == 16
+    assert out[0]["transactionIndex"] == 0
+    c = p.last_call()
+    assert c.method == "eth_getBlockReceipts"
+    assert c.params == ["0x" + bh.hex()]
+
+    out = force(w3.eth.get_proof("0x" + "11" * 20, [b"", b"\x01\x02"], bh))
+    assert out["address"] == "0x" + "11" * 20
+    c = p.last_call()
+    assert c.method == "eth_getProof"
+    assert c.params == ["0x" + "11" * 20, ["0x", "0x0102"], "0x" + bh.hex()]
+
+    assert force(w3.eth.max_priority_fee_per_gas()) == 4
+    assert p.last_call().method == "eth_maxPriorityFeePerGas"
+    assert p.last_call().params == []
+
+    out = force(w3.eth.simulate_v1({"blockStateCalls": []}, bh))
+    assert out[0]["calls"] == []
+    c = p.last_call()
+    assert c.method == "eth_simulateV1"
+    assert c.params == [{"blockStateCalls": []}, "0x" + bh.hex()]
+
+    with pytest.raises(ValidationError, match="eth_simulateV1 requires 'payload' to be a mapping"):
+        force(w3.eth.simulate_v1(["nope"]))  # type: ignore[arg-type]
