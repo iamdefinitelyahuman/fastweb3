@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 HEX_QUANTITY_FIELDS = {
-    # tx
+    # tx / call / proof
     "nonce",
     "gas",
     "gasPrice",
@@ -15,6 +15,7 @@ HEX_QUANTITY_FIELDS = {
     "transactionIndex",
     "type",
     "chainId",
+    "balance",
     # receipt
     "cumulativeGasUsed",
     "gasUsed",
@@ -23,7 +24,7 @@ HEX_QUANTITY_FIELDS = {
     "transactionIndex",
     "logIndex",
     "blockNumber",
-    # block
+    # block / fee history
     "number",
     "timestamp",
     "size",
@@ -32,6 +33,8 @@ HEX_QUANTITY_FIELDS = {
     "difficulty",
     "totalDifficulty",
     "baseFeePerGas",
+    "oldestBlock",
+    "reward",
 }
 
 
@@ -78,6 +81,15 @@ def to_hex_quantity(n: int) -> str:
     return hex(n)
 
 
+def _normalize_quantity_value(x: Any) -> Any:
+    """Recursively normalize quantity-like values inside a known quantity field."""
+    if isinstance(x, str) and x.startswith("0x"):
+        return int(x, 16)
+    if isinstance(x, list):
+        return [_normalize_quantity_value(v) for v in x]
+    return x
+
+
 def normalize_rpc_obj(obj: Any) -> Any:
     """Recursively normalize an RPC response object.
 
@@ -96,8 +108,8 @@ def normalize_rpc_obj(obj: Any) -> Any:
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            if k in HEX_QUANTITY_FIELDS and isinstance(v, str) and v.startswith("0x"):
-                out[k] = int(v, 16)
+            if k in HEX_QUANTITY_FIELDS:
+                out[k] = _normalize_quantity_value(v)
             else:
                 out[k] = normalize_rpc_obj(v)
         return out
