@@ -3,7 +3,7 @@
 
 These helpers read environment variables that influence endpoint selection:
 
-* ``FASTWEB3_POOL_MODE`` controls whether the public pool is used.
+* ``FASTWEB3_USE_PUBLIC_POOL`` controls whether the public pool is used.
 * ``FASTWEB3_PRIMARY_ENDPOINT`` and ``FASTWEB3_PRIMARY_ENDPOINTS`` configure
   primary (node-local) endpoints.
 """
@@ -11,44 +11,49 @@ These helpers read environment variables that influence endpoint selection:
 from __future__ import annotations
 
 import os
-from typing import Dict, Literal, Optional
-
-PoolMode = Literal["default", "split", "off"]
+from typing import Dict, Optional
 
 _ENV_PRIMARY = "FASTWEB3_PRIMARY_ENDPOINT"
 _ENV_PRIMARY_MAP = "FASTWEB3_PRIMARY_ENDPOINTS"
-_ENV_POOL_MODE = "FASTWEB3_POOL_MODE"
+_ENV_USE_PUBLIC_POOL = "FASTWEB3_USE_PUBLIC_POOL"
 
 
-def get_pool_mode(env: Optional[dict[str, str]] = None) -> PoolMode:
-    """Return the configured pool mode.
+def get_use_public_pool(env: Optional[dict[str, str]] = None) -> Optional[bool]:
+    """Return the configured public-pool preference, if any.
 
-    ``FASTWEB3_POOL_MODE`` values:
+    ``FASTWEB3_USE_PUBLIC_POOL`` values:
 
-    * unset / ``"default"``: use the pool everywhere.
-    * ``"split"``: disable the pool only on chains that have a configured
-      primary.
-    * ``"off"``: never use the pool.
+    * unset: no environment preference.
+    * ``true`` / ``1`` / ``yes`` / ``on``: prefer using the public pool.
+    * ``false`` / ``0`` / ``no`` / ``off``: prefer not using the public pool,
+      but only for chains that have a configured primary endpoint.
 
     Args:
         env: Optional environment mapping to read from. Defaults to
             :data:`os.environ`.
 
     Returns:
-        The resolved pool mode.
+        ``True``, ``False``, or ``None`` if unset.
 
     Raises:
-        ValueError: If ``FASTWEB3_POOL_MODE`` has an unrecognized value.
+        ValueError: If ``FASTWEB3_USE_PUBLIC_POOL`` has an unrecognized value.
     """
     env = os.environ if env is None else env
-    raw = env.get(_ENV_POOL_MODE, "").strip().lower()
+    raw = env.get(_ENV_USE_PUBLIC_POOL)
+    if raw is None:
+        return None
 
-    if raw in ("", "default"):
-        return "default"
-    if raw in ("split", "off"):
-        return raw  # type: ignore[return-value]
+    raw = raw.strip().lower()
+    if raw == "":
+        return None
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
 
-    raise ValueError(f"{_ENV_POOL_MODE} must be one of: default, split, off (got {raw!r})")
+    raise ValueError(
+        f"{_ENV_USE_PUBLIC_POOL} must be a boolean: true/false, 1/0, yes/no, on/off (got {raw!r})"
+    )
 
 
 def get_default_primary_endpoint(env: Optional[dict[str, str]] = None) -> Optional[str]:
@@ -138,11 +143,9 @@ def resolve_primary_endpoint(
     1. ``FASTWEB3_PRIMARY_ENDPOINTS[chain_id]`` (per-chain) wins.
     2. Otherwise, ``FASTWEB3_PRIMARY_ENDPOINT`` (global) may apply.
 
-    Behavior in ``POOL_MODE=split``:
-        A per-chain primary always counts as "configured" for that chain.
-        A global primary only counts for the chain that the global endpoint is
-        on. To enforce that, pass ``default_primary_chain_id`` (e.g. discovered
-        by calling ``eth_chainId`` on the global endpoint).
+    A global primary only applies to the chain that the global endpoint is on.
+    To enforce that, pass ``default_primary_chain_id`` (e.g. discovered by
+    calling ``eth_chainId`` on the global endpoint).
 
     Args:
         chain_id: Chain ID to resolve.
@@ -164,11 +167,8 @@ def resolve_primary_endpoint(
     if default_primary is None:
         return None
 
-    mode = get_pool_mode(env)
-    if mode == "split" and default_primary_chain_id is not None:
-        # Only treat the global primary as applicable to its own chain.
-        if chain_id != default_primary_chain_id:
-            return None
+    if default_primary_chain_id is not None and chain_id != default_primary_chain_id:
+        return None
 
     return default_primary
 
@@ -192,14 +192,11 @@ def should_use_pool(
         ``True`` if the pool should be used, otherwise ``False``.
     """
     env = os.environ if env is None else env
-    mode = get_pool_mode(env)
+    use_public_pool = get_use_public_pool(env)
 
-    if mode == "off":
-        return False
-    if mode == "default":
+    if use_public_pool is None or use_public_pool is True:
         return True
 
-    # split: pool only when there is no configured primary for this chain
     primary = resolve_primary_endpoint(
         chain_id, env=env, default_primary_chain_id=default_primary_chain_id
     )

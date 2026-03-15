@@ -18,7 +18,6 @@ from ..deferred import Handle, deferred_response
 from ..endpoint import Endpoint
 from ..env import (
     get_default_primary_endpoint,
-    get_pool_mode,
     resolve_primary_endpoint,
     should_use_pool,
 )
@@ -91,32 +90,35 @@ class Web3:
     Web3 entrypoint.
 
     Usage:
-        w3 = Web3(1)                                       # public pool for chain 1 (lazy-ready)
-        w3 = Web3(endpoints=[...])                         # manual internal pool only
-        w3 = Web3(1, endpoints=[...])                      # hybrid: internal pool + public pool
-        w3 = Web3(primary_endpoint="http://localhost:8545")# primary-only mode
-        w3 = Web3(1, primary_endpoint="http://localhost")  # hybrid: public pool + explicit primary
-        w3 = Web3(provider=my_provider)                    # fully custom provider (advanced)
+        w3 = Web3(1)                                        # public pool for chain 1 (lazy-ready)
+        w3 = Web3(1, use_public_pool=False, endpoints=[...])# manual internal pool only
+        w3 = Web3(1, endpoints=[...])                       # hybrid: internal pool + public pool
+        w3 = Web3(1, primary_endpoint="http://localhost")   # hybrid: public pool + explicit primary
+        w3 = Web3(1, use_public_pool=False, primary_endpoint="http://localhost:8545")
+        w3 = Web3(1, provider=my_provider)                  # fully custom provider (advanced)
     """
 
     def __init__(
         self,
-        chain_id: Optional[int] = None,
+        chain_id: int,
         *,
         endpoints: Optional[Sequence[str]] = None,
         primary_endpoint: Optional[str] = None,
         provider: Optional[Provider] = None,
         config: Optional[Web3Config] = None,
+        use_public_pool: bool | None = None,
     ) -> None:
         """Create a `Web3` client.
 
         Args:
-            chain_id: Optional chain ID used for pool discovery.
+            chain_id: Chain ID used for pool discovery.
             endpoints: Optional list of explicit endpoints to use as the
                 internal pool.
             primary_endpoint: Optional primary endpoint target.
             provider: Optional fully custom provider (advanced).
             config: Optional `Web3Config`.
+            use_public_pool: Whether to include the public RPC pool. If
+                ``None``, environment configuration is used.
 
         Raises:
             NoEndpoints: If no usable configuration is provided.
@@ -124,7 +126,7 @@ class Web3:
         if config is None:
             config = Web3Config()
         self.config = config
-        self._chain_id = int(chain_id) if chain_id is not None else None
+        self._chain_id = int(chain_id)
         self._pool_chain_id: Optional[int] = None
         self._pool_finalizer: weakref.finalize | None = None
 
@@ -133,51 +135,46 @@ class Web3:
         else:
             internal_endpoints = list(endpoints or [])
 
-            # If we're in env split mode, we need to know which chain the *global*
-            # FASTWEB3_PRIMARY_ENDPOINT is on, so we can disable pool only there.
             env_default_primary_chain_id: Optional[int] = None
-            if (
-                primary_endpoint is None
-                and chain_id is not None
-                and get_pool_mode() == "split"
-                and get_default_primary_endpoint() is not None
-            ):
+            if primary_endpoint is None and get_default_primary_endpoint() is not None:
                 env_default_primary_chain_id = _get_default_primary_chain_id_once()
 
-            pool_manager = None
-            if chain_id is not None:
-                if should_use_pool(
+            env_primary_for_chain = None
+            if primary_endpoint is None:
+                env_primary_for_chain = resolve_primary_endpoint(
                     int(chain_id),
                     default_primary_chain_id=env_default_primary_chain_id,
-                ):
-                    pool_manager = acquire_pool_manager(
-                        int(chain_id),
-                        target_pool=max(config.desired_pool_size * 2, config.desired_pool_size + 3),
-                        max_lag_blocks=config.max_lag_blocks,
-                    )
-            if pool_manager is not None and chain_id is not None:
+                )
+
+            effective_use_public_pool = (
+                use_public_pool
+                if use_public_pool is not None
+                else should_use_pool(
+                    int(chain_id),
+                    default_primary_chain_id=env_default_primary_chain_id,
+                )
+            )
+
+            pool_manager = None
+            if effective_use_public_pool:
+                pool_manager = acquire_pool_manager(
+                    int(chain_id),
+                    target_pool=max(config.desired_pool_size * 2, config.desired_pool_size + 3),
+                    max_lag_blocks=config.max_lag_blocks,
+                )
+            if pool_manager is not None:
                 self._pool_chain_id = int(chain_id)
                 self._pool_finalizer = weakref.finalize(self, release_pool_manager, int(chain_id))
 
-            # Allow env default primary-only mode when no chain_id/endpoints/primary provided
-            env_default_primary = None
-            if primary_endpoint is None:
-                env_default_primary = get_default_primary_endpoint()
-
             if (
-                chain_id is None
+                not effective_use_public_pool
                 and not internal_endpoints
                 and primary_endpoint is None
-                and env_default_primary is None
+                and env_primary_for_chain is None
             ):
-                extra = ""
-                if get_pool_mode() == "off":
-                    extra = " (pool disabled by FASTWEB3_POOL_MODE=off)"
                 raise NoEndpoints(
-                    "No chain_id provided and no endpoints provided. "
-                    "Use Web3(<chain_id>) for public discovery, "
-                    "Web3(endpoints=[...]) for manual mode, "
-                    "or Web3(primary_endpoint=...) for primary-only mode." + extra
+                    "No endpoints provided. "
+                    "Use Web3(<chain_id>, use_public_pool=True) for public discovery."
                 )
 
             self.provider = Provider(
@@ -187,16 +184,8 @@ class Web3:
                 retry_policy_pool=config.retry_policy_pool,
             )
 
-            if primary_endpoint is None:
-                if chain_id is not None:
-                    env_primary_for_chain = resolve_primary_endpoint(
-                        int(chain_id),
-                        default_primary_chain_id=env_default_primary_chain_id,
-                    )
-                    if env_primary_for_chain is not None:
-                        self.provider.set_primary(env_primary_for_chain)
-                elif env_default_primary is not None:
-                    self.provider.set_primary(env_default_primary)
+            if primary_endpoint is None and env_primary_for_chain is not None:
+                self.provider.set_primary(env_primary_for_chain)
 
         if primary_endpoint is not None:
             self.provider.set_primary(primary_endpoint)
