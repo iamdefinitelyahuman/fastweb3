@@ -116,7 +116,7 @@ def test_init_chain_id_only_uses_pool_manager(patch_init_wiring):
 def test_init_manual_endpoints_only_no_pool_manager(patch_init_wiring):
     created = patch_init_wiring
 
-    w3 = web3_mod.Web3(endpoints=["https://a", "https://b"])
+    w3 = web3_mod.Web3(1, endpoints=["https://a", "https://b"], use_public_pool=False)
 
     # no pool manager for manual mode
     assert created["pool_mgr_calls"] == []
@@ -131,9 +131,9 @@ def test_init_manual_endpoints_only_no_pool_manager(patch_init_wiring):
 def test_init_primary_only(patch_init_wiring):
     created = patch_init_wiring
 
-    w3 = web3_mod.Web3(primary_endpoint="http://localhost:8545")
+    w3 = web3_mod.Web3(1, primary_endpoint="http://localhost:8545", use_public_pool=False)
 
-    # no pool manager (no chain_id)
+    # no pool manager when public pool is explicitly disabled
     assert created["pool_mgr_calls"] == []
 
     p = created["provider_insts"][-1]
@@ -181,7 +181,7 @@ def test_init_chain_id_plus_endpoints_plus_primary_hybrid(patch_init_wiring):
 
 def test_init_no_chain_no_endpoints_no_primary_raises(patch_init_wiring):
     with pytest.raises(NoEndpoints):
-        web3_mod.Web3()
+        web3_mod.Web3(1, use_public_pool=False)
 
 
 def test_close_triggers_release_for_determinism(patch_init_wiring):

@@ -56,7 +56,6 @@ def _patch_web3_dependencies(monkeypatch, acquire_recorder: AcquireRecorder) -> 
     monkeypatch.setattr(
         web3_mod, "should_use_pool", lambda chain_id, default_primary_chain_id=None: True
     )
-    monkeypatch.setattr(web3_mod, "get_pool_mode", lambda: "auto")
     monkeypatch.setattr(web3_mod, "get_default_primary_endpoint", lambda: None)
     monkeypatch.setattr(
         web3_mod,

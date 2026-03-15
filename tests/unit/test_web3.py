@@ -72,7 +72,7 @@ def force(x: Any) -> Any:
 
 
 def mk_w3(provider: RecordingProvider, *, strict: bool = True) -> Web3:
-    return Web3(provider=provider, config=Web3Config(strict=strict))
+    return Web3(1, provider=provider, config=Web3Config(strict=strict))
 
 
 def addr_bytes(b: int = 0x11) -> bytes:

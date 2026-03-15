@@ -56,7 +56,7 @@ def test_batch_queues_and_flushes_on_proxy_interaction() -> None:
     p = FakeProvider()
     p.queue_batch_response([111, 222])
 
-    w3 = Web3(provider=p)
+    w3 = Web3(1, provider=p)
 
     with w3.batch_requests() as batch:
         x = w3.make_request("eth_call", [{"to": "0x0"}], formatter=int)
@@ -77,7 +77,7 @@ def test_batch_flushes_on_exit_if_no_proxy_interaction() -> None:
     p = FakeProvider()
     p.queue_batch_response([1, 2])
 
-    w3 = Web3(provider=p)
+    w3 = Web3(1, provider=p)
 
     with w3.batch_requests():
         x = w3.make_request("eth_call", [{"to": "0x0"}], formatter=int)
@@ -91,7 +91,7 @@ def test_batch_flushes_on_exit_if_no_proxy_interaction() -> None:
 
 def test_never_batch_methods_execute_immediately() -> None:
     p = FakeProvider()
-    w3 = Web3(provider=p)
+    w3 = Web3(1, provider=p)
 
     with w3.batch_requests():
         tx = w3.make_request("eth_sendRawTransaction", ["0xdeadbeef"], formatter=str)
@@ -105,7 +105,7 @@ def test_methods_filter_only_batches_selected_methods() -> None:
     p = FakeProvider()
     p.queue_batch_response([10])
 
-    w3 = Web3(provider=p)
+    w3 = Web3(1, provider=p)
 
     with w3.batch_requests(methods={"eth_call"}):
         x = w3.make_request("eth_call", [{"to": "0x0"}], formatter=int)
@@ -129,7 +129,7 @@ def test_nested_batches_create_boundaries() -> None:
     p.queue_batch_response([2])  # inner
     p.queue_batch_response([3])  # outer after inner
 
-    w3 = Web3(provider=p)
+    w3 = Web3(1, provider=p)
 
     with w3.batch_requests():
         a = w3.make_request("eth_call", [{"to": "0x0"}], formatter=int)
@@ -149,7 +149,7 @@ def test_flush_raises_if_any_call_errors() -> None:
     p = FakeProvider()
     p.queue_batch_response([_rpc_err(), 5])
 
-    w3 = Web3(provider=p)
+    w3 = Web3(1, provider=p)
 
     with w3.batch_requests():
         x = w3.make_request("eth_call", [{"to": "0x0"}], formatter=int)
@@ -166,7 +166,7 @@ def test_exit_with_exception_does_not_mask_original_exception() -> None:
     p = FakeProvider()
     p.queue_batch_response([7])
 
-    w3 = Web3(provider=p)
+    w3 = Web3(1, provider=p)
 
     x = None
     try:
@@ -184,7 +184,7 @@ def test_batch_is_thread_local() -> None:
     p = FakeProvider()
     p.queue_batch_response([123])
 
-    w3 = Web3(provider=p)
+    w3 = Web3(1, provider=p)
 
     results: dict[str, Any] = {}
 

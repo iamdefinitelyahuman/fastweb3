@@ -281,14 +281,14 @@ def _await_pool_ready(w3: Web3, *, timeout_s: float = 12.0) -> list[str]:
 def test_init_primary_only_and_make_calls(httpx_mock: _HttpxMock, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINT", raising=False)
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINTS", raising=False)
-    monkeypatch.delenv("FASTWEB3_POOL_MODE", raising=False)
+    monkeypatch.delenv("FASTWEB3_USE_PUBLIC_POOL", raising=False)
 
     primary = "http://primary.local"
     httpx_mock.add_rpc_endpoint(
         primary, chain_id=123, block_number=9001, gas_price=42, syncing=False
     )
 
-    w3 = Web3(primary_endpoint=primary)
+    w3 = Web3(123, primary_endpoint=primary, use_public_pool=False)
 
     chain_id = int(w3.eth.chain_id())
     assert chain_id == 123
@@ -313,7 +313,7 @@ def test_init_manual_endpoints_batches_pool_requests_and_reorders_batch(
 ):
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINT", raising=False)
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINTS", raising=False)
-    monkeypatch.delenv("FASTWEB3_POOL_MODE", raising=False)
+    monkeypatch.delenv("FASTWEB3_USE_PUBLIC_POOL", raising=False)
 
     internal = "http://internal.local"
 
@@ -324,7 +324,7 @@ def test_init_manual_endpoints_batches_pool_requests_and_reorders_batch(
     # Intentionally return batch responses out-of-order to verify Endpoint reorders by id.
     httpx_mock.reverse_batch_response_for.add(internal)
 
-    w3 = Web3(endpoints=[internal])
+    w3 = Web3(1, endpoints=[internal], use_public_pool=False)
 
     gas_price = int(w3.eth.gas_price())
     assert gas_price == 500
@@ -345,7 +345,7 @@ def test_init_chain_id_only_discovers_pool_and_routes_call(
 ):
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINT", raising=False)
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINTS", raising=False)
-    monkeypatch.setenv("FASTWEB3_POOL_MODE", "default")
+    monkeypatch.setenv("FASTWEB3_USE_PUBLIC_POOL", "true")
 
     chain_id = 13371337
     pool = "http://pool.local"
@@ -382,7 +382,7 @@ def test_init_chain_id_plus_primary_routes_primary_calls_to_primary(
 ):
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINT", raising=False)
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINTS", raising=False)
-    monkeypatch.setenv("FASTWEB3_POOL_MODE", "default")
+    monkeypatch.setenv("FASTWEB3_USE_PUBLIC_POOL", "true")
 
     chain_id = 13371338
     pool = "http://pool2.local"
@@ -426,7 +426,7 @@ def test_init_chain_id_plus_endpoints_failover_to_pool_manager(
 ):
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINT", raising=False)
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINTS", raising=False)
-    monkeypatch.setenv("FASTWEB3_POOL_MODE", "default")
+    monkeypatch.setenv("FASTWEB3_USE_PUBLIC_POOL", "true")
 
     chain_id = 13371339
     internal_bad = "http://internal-bad.local"
@@ -467,7 +467,7 @@ def test_init_via_custom_provider_still_wires_through_endpoint_and_transport(
 ):
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINT", raising=False)
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINTS", raising=False)
-    monkeypatch.delenv("FASTWEB3_POOL_MODE", raising=False)
+    monkeypatch.delenv("FASTWEB3_USE_PUBLIC_POOL", raising=False)
 
     internal = "http://custom-provider.local"
     httpx_mock.add_rpc_endpoint(
@@ -475,7 +475,7 @@ def test_init_via_custom_provider_still_wires_through_endpoint_and_transport(
     )
 
     provider = Provider([internal])
-    w3 = Web3(provider=provider)
+    w3 = Web3(1, provider=provider)
 
     price = int(w3.eth.gas_price())
     assert price == 4242
@@ -487,13 +487,13 @@ def test_init_via_custom_provider_still_wires_through_endpoint_and_transport(
     w3.close()
 
 
-def test_env_per_chain_primary_in_split_mode_disables_pool_and_routes_pool_calls_to_primary(
+def test_env_per_chain_primary_with_public_pool_false_disables_pool_and_routes_pool_call_to_primary(
     httpx_mock: _HttpxMock, monkeypatch: pytest.MonkeyPatch
 ):
     chain_id = 424242
     primary = "http://env-primary.local"
 
-    monkeypatch.setenv("FASTWEB3_POOL_MODE", "split")
+    monkeypatch.setenv("FASTWEB3_USE_PUBLIC_POOL", "false")
     monkeypatch.setenv("FASTWEB3_PRIMARY_ENDPOINTS", f"{chain_id}={primary}")
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINT", raising=False)
 
@@ -519,28 +519,27 @@ def test_env_per_chain_primary_in_split_mode_disables_pool_and_routes_pool_calls
     w3.close()
 
 
-def test_init_no_args_uses_env_default_primary(
+def test_init_chain_id_uses_env_default_primary_for_matching_chain(
     httpx_mock: _HttpxMock, monkeypatch: pytest.MonkeyPatch
 ):
-    """Covers the convenience path: Web3() with FASTWEB3_PRIMARY_ENDPOINT set."""
+    """Covers the env-primary path for a matching chain ID."""
 
     primary = "http://env-default-primary.local"
 
     monkeypatch.setenv("FASTWEB3_PRIMARY_ENDPOINT", primary)
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINTS", raising=False)
-    monkeypatch.delenv("FASTWEB3_POOL_MODE", raising=False)
+    monkeypatch.delenv("FASTWEB3_USE_PUBLIC_POOL", raising=False)
 
     httpx_mock.add_rpc_endpoint(
         primary, chain_id=99, block_number=1, gas_price=12345, syncing=False
     )
 
-    w3 = Web3()
+    w3 = Web3(99, use_public_pool=False)
 
-    # eth_chainId routes through pool by default, but with no pool it should fall back to primary.
     assert int(w3.eth.chain_id()) == 99
 
     pcalls = [c for c in httpx_mock.post_calls if c.url == primary]
-    assert len(pcalls) == 1
+    assert len(pcalls) == 2
     assert _methods_in_payload(pcalls[0].payload) == ["eth_chainId"]
 
     w3.close()
@@ -551,7 +550,7 @@ def test_init_chain_id_endpoints_and_primary_prefers_internal_for_pool_and_prima
 ):
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINT", raising=False)
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINTS", raising=False)
-    monkeypatch.setenv("FASTWEB3_POOL_MODE", "default")
+    monkeypatch.setenv("FASTWEB3_USE_PUBLIC_POOL", "true")
 
     chain_id = 13371340
     internal = "http://internal4.local"

@@ -98,7 +98,7 @@ def test_fresh_negative_requires_latest_callable_behavior() -> None:
 
 def test_web3_make_request_passes_freshness_through(patch_deferred: None) -> None:
     fp = FakeProvider()
-    w3 = Web3(provider=fp)
+    w3 = Web3(1, provider=fp)
 
     out = w3.make_request("eth_getBalance", ["0xabc", "latest"], freshness=eth._fresh_latest)
     assert out == "0x2a"
@@ -107,7 +107,7 @@ def test_web3_make_request_passes_freshness_through(patch_deferred: None) -> Non
 
 def test_eth_get_balance_latest_uses_fresh_latest(patch_deferred: None) -> None:
     fp = FakeProvider()
-    w3 = Web3(provider=fp)
+    w3 = Web3(1, provider=fp)
 
     # This should attach freshness since block is latest-like.
     out = w3.eth.get_balance("0x" + "11" * 20, "latest")
@@ -120,7 +120,7 @@ def test_eth_get_balance_latest_uses_fresh_latest(patch_deferred: None) -> None:
 
 def test_eth_get_balance_historic_block_uses_no_freshness(patch_deferred: None) -> None:
     fp = FakeProvider()
-    w3 = Web3(provider=fp)
+    w3 = Web3(1, provider=fp)
 
     _ = w3.eth.get_balance("0x" + "11" * 20, 123)
     call = fp.calls[-1]
@@ -130,7 +130,7 @@ def test_eth_get_balance_historic_block_uses_no_freshness(patch_deferred: None) 
 
 def test_eth_call_pending_uses_fresh_latest(patch_deferred: None) -> None:
     fp = FakeProvider()
-    w3 = Web3(provider=fp)
+    w3 = Web3(1, provider=fp)
 
     _ = w3.eth.call(to="0x" + "22" * 20, data="0x", block="pending")
     call = fp.calls[-1]
@@ -140,7 +140,7 @@ def test_eth_call_pending_uses_fresh_latest(patch_deferred: None) -> None:
 
 def test_eth_estimate_gas_block_none_uses_fresh_latest(patch_deferred: None) -> None:
     fp = FakeProvider()
-    w3 = Web3(provider=fp)
+    w3 = Web3(1, provider=fp)
 
     _ = w3.eth.estimate_gas(to="0x" + "22" * 20, data="0x")
     call = fp.calls[-1]
@@ -150,7 +150,7 @@ def test_eth_estimate_gas_block_none_uses_fresh_latest(patch_deferred: None) -> 
 
 def test_eth_get_transaction_by_hash_uses_negative_requires_latest(patch_deferred: None) -> None:
     fp = FakeProvider()
-    w3 = Web3(provider=fp)
+    w3 = Web3(1, provider=fp)
 
     _ = w3.eth.get_transaction_by_hash("0x" + "33" * 32)
     call = fp.calls[-1]
@@ -160,7 +160,7 @@ def test_eth_get_transaction_by_hash_uses_negative_requires_latest(patch_deferre
 
 def test_eth_get_transaction_receipt_uses_negative_requires_latest(patch_deferred: None) -> None:
     fp = FakeProvider()
-    w3 = Web3(provider=fp)
+    w3 = Web3(1, provider=fp)
 
     _ = w3.eth.get_transaction_receipt("0x" + "44" * 32)
     call = fp.calls[-1]
@@ -170,7 +170,7 @@ def test_eth_get_transaction_receipt_uses_negative_requires_latest(patch_deferre
 
 def test_eth_get_logs_latest_like_to_block_uses_fresh_latest(patch_deferred: None) -> None:
     fp = FakeProvider()
-    w3 = Web3(provider=fp)
+    w3 = Web3(1, provider=fp)
 
     _ = w3.eth.get_logs()  # to_block omitted => latest-like
     call = fp.calls[-1]
@@ -180,7 +180,7 @@ def test_eth_get_logs_latest_like_to_block_uses_fresh_latest(patch_deferred: Non
 
 def test_eth_get_logs_historic_to_block_uses_no_freshness(patch_deferred: None) -> None:
     fp = FakeProvider()
-    w3 = Web3(provider=fp)
+    w3 = Web3(1, provider=fp)
 
     _ = w3.eth.get_logs(from_block=100, to_block=200)
     call = fp.calls[-1]

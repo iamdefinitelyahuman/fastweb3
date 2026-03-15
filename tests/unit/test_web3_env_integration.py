@@ -76,7 +76,6 @@ def test_explicit_primary_endpoint_overrides_env_primary(monkeypatch: pytest.Mon
     _reset_default_primary_chain_id_cache()
 
     monkeypatch.setenv("FASTWEB3_PRIMARY_ENDPOINT", "http://env-primary")
-    monkeypatch.setenv("FASTWEB3_POOL_MODE", "default")
 
     monkeypatch.setattr(w3mod, "Provider", FakeProvider)
 
@@ -91,35 +90,38 @@ def test_explicit_primary_endpoint_overrides_env_primary(monkeypatch: pytest.Mon
     assert w3.provider.primary_set == ["http://explicit-primary"]
 
 
-def test_pool_mode_off_never_calls_acquire_pool_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_env_use_public_pool_false_without_primary_still_calls_acquire_pool_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _reset_default_primary_chain_id_cache()
 
-    monkeypatch.setenv("FASTWEB3_POOL_MODE", "off")
+    monkeypatch.setenv("FASTWEB3_USE_PUBLIC_POOL", "false")
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINT", raising=False)
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINTS", raising=False)
 
     monkeypatch.setattr(w3mod, "Provider", FakeProvider)
 
-    called = {"n": 0}
+    sentinel = object()
+    seen: dict[str, Any] = {}
 
-    def _boom(*args: Any, **kwargs: Any) -> Any:
-        called["n"] += 1
-        raise AssertionError("acquire_pool_manager should not be called when POOL_MODE=off")
+    def _acquire_pool_manager(chain_id: int, **kwargs: Any) -> Any:
+        seen["chain_id"] = chain_id
+        seen["kwargs"] = kwargs
+        return sentinel
 
-    monkeypatch.setattr(w3mod, "acquire_pool_manager", _boom)
+    monkeypatch.setattr(w3mod, "acquire_pool_manager", _acquire_pool_manager)
     monkeypatch.setattr(w3mod, "release_pool_manager", lambda *a, **k: None)
 
     w3 = w3mod.Web3(1)
 
     assert isinstance(w3.provider, FakeProvider)
-    assert called["n"] == 0
-    assert w3.provider.init.pool_manager is None
+    assert seen["chain_id"] == 1
+    assert w3.provider.init.pool_manager is sentinel
 
 
-def test_pool_mode_default_calls_acquire_pool_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_env_default_calls_acquire_pool_manager(monkeypatch: pytest.MonkeyPatch) -> None:
     _reset_default_primary_chain_id_cache()
 
-    monkeypatch.setenv("FASTWEB3_POOL_MODE", "default")
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINT", raising=False)
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINTS", raising=False)
 
@@ -143,12 +145,12 @@ def test_pool_mode_default_calls_acquire_pool_manager(monkeypatch: pytest.Monkey
     assert seen["chain_id"] == 10
 
 
-def test_split_per_chain_primary_disables_pool_for_that_chain(
+def test_env_false_per_chain_primary_disables_pool_for_that_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _reset_default_primary_chain_id_cache()
 
-    monkeypatch.setenv("FASTWEB3_POOL_MODE", "split")
+    monkeypatch.setenv("FASTWEB3_USE_PUBLIC_POOL", "false")
     monkeypatch.setenv("FASTWEB3_PRIMARY_ENDPOINTS", "10=http://ten-primary")
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINT", raising=False)
 
@@ -160,7 +162,7 @@ def test_split_per_chain_primary_disables_pool_for_that_chain(
         called["n"] += 1
         raise AssertionError(
             "acquire_pool_manager should not be called for chain"
-            " with per-chain primary in split mode"
+            " with per-chain primary when FASTWEB3_USE_PUBLIC_POOL=false"
         )
 
     monkeypatch.setattr(w3mod, "acquire_pool_manager", _boom)
@@ -175,12 +177,12 @@ def test_split_per_chain_primary_disables_pool_for_that_chain(
     assert w3.provider.primary_set == ["http://ten-primary"]
 
 
-def test_split_per_chain_primary_still_uses_pool_on_other_chains(
+def test_env_false_per_chain_primary_still_uses_pool_on_other_chains(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _reset_default_primary_chain_id_cache()
 
-    monkeypatch.setenv("FASTWEB3_POOL_MODE", "split")
+    monkeypatch.setenv("FASTWEB3_USE_PUBLIC_POOL", "false")
     monkeypatch.setenv("FASTWEB3_PRIMARY_ENDPOINTS", "10=http://ten-primary")
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINT", raising=False)
 
@@ -198,12 +200,12 @@ def test_split_per_chain_primary_still_uses_pool_on_other_chains(
     assert w3.provider.primary_set == []
 
 
-def test_split_global_primary_disables_pool_only_on_that_primary_chain(
+def test_env_false_global_primary_disables_pool_only_on_that_primary_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _reset_default_primary_chain_id_cache()
 
-    monkeypatch.setenv("FASTWEB3_POOL_MODE", "split")
+    monkeypatch.setenv("FASTWEB3_USE_PUBLIC_POOL", "false")
     monkeypatch.setenv("FASTWEB3_PRIMARY_ENDPOINT", "http://global-primary")
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINTS", raising=False)
 
@@ -220,13 +222,14 @@ def test_split_global_primary_disables_pool_only_on_that_primary_chain(
 
     monkeypatch.setattr(w3mod, "Provider", FakeProvider)
 
-    # On chain 1, pool should be disabled (because global primary is on chain 1)
+    # On chain 1, pool should be disabled because the global primary is on chain 1.
     called = {"n": 0}
 
     def _boom(*args: Any, **kwargs: Any) -> Any:
         called["n"] += 1
         raise AssertionError(
-            "acquire_pool_manager should not be called on the global-primary chain in split mode"
+            "acquire_pool_manager should not be called on the global-primary chain "
+            "when FASTWEB3_USE_PUBLIC_POOL=false"
         )
 
     monkeypatch.setattr(w3mod, "acquire_pool_manager", _boom)
@@ -248,41 +251,51 @@ def test_split_global_primary_disables_pool_only_on_that_primary_chain(
     assert w3_chain10.provider.primary_set == []
 
 
-def test_no_endpoints_error_mentions_pool_mode_off(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_no_endpoints_error_when_explicitly_disabling_public_pool_without_other_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _reset_default_primary_chain_id_cache()
 
-    monkeypatch.setenv("FASTWEB3_POOL_MODE", "off")
+    monkeypatch.setenv("FASTWEB3_USE_PUBLIC_POOL", "false")
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINT", raising=False)
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINTS", raising=False)
 
     monkeypatch.setattr(w3mod, "Provider", FakeProvider)
 
-    with pytest.raises(NoEndpoints, match=r"pool disabled by FASTWEB3_POOL_MODE=off"):
-        w3mod.Web3()  # no chain_id, no endpoints, no env primary
+    with pytest.raises(NoEndpoints):
+        w3mod.Web3(1, use_public_pool=False)
 
 
-def test_env_default_primary_allows_primary_only_mode_without_chain_id(
+def test_env_default_primary_applies_for_matching_chain_when_public_pool_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _reset_default_primary_chain_id_cache()
 
-    monkeypatch.setenv("FASTWEB3_POOL_MODE", "default")
     monkeypatch.setenv("FASTWEB3_PRIMARY_ENDPOINT", "http://env-primary")
+    monkeypatch.setenv("FASTWEB3_USE_PUBLIC_POOL", "false")
     monkeypatch.delenv("FASTWEB3_PRIMARY_ENDPOINTS", raising=False)
 
+    monkeypatch.setattr(w3mod, "Endpoint", FakeEndpoint)
+
+    def _endpoint_request(self: FakeEndpoint, method: str, params: Any, *, formatter=None) -> Any:
+        assert method == "eth_chainId"
+        raw = "0x1"
+        return formatter(raw) if formatter is not None else raw
+
+    monkeypatch.setattr(FakeEndpoint, "request", _endpoint_request)
     monkeypatch.setattr(w3mod, "Provider", FakeProvider)
 
-    w3 = w3mod.Web3()  # no chain_id, no endpoints, should still work due to env primary
+    w3 = w3mod.Web3(1)
 
     assert isinstance(w3.provider, FakeProvider)
     assert w3.provider.init.internal_urls == []
+    assert w3.provider.init.pool_manager is None
     assert w3.provider.primary_set == ["http://env-primary"]
 
 
 def test_explicit_provider_bypasses_env_and_pool_manager(monkeypatch: pytest.MonkeyPatch) -> None:
     _reset_default_primary_chain_id_cache()
 
-    monkeypatch.setenv("FASTWEB3_POOL_MODE", "default")
     monkeypatch.setenv("FASTWEB3_PRIMARY_ENDPOINT", "http://env-primary")
     monkeypatch.setenv("FASTWEB3_PRIMARY_ENDPOINTS", "1=http://per-chain")
 
