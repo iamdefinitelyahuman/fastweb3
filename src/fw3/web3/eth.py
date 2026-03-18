@@ -7,7 +7,7 @@ from typing import Any, Mapping, Union
 
 from .. import validation
 from ..errors import ValidationError
-from ..formatters import normalize_rpc_obj, to_int
+from ..formatters import build_transaction_object, normalize_rpc_obj, to_int
 
 BlockId = Union[
     str, int
@@ -64,55 +64,6 @@ class Eth:
     # ----------------------------
     # builders
     # ----------------------------
-
-    def _tx_object(
-        self,
-        *,
-        from_: str | bytes | None = None,
-        to: str | bytes | None = None,
-        gas: int | str | None = None,
-        gas_price: int | str | None = None,
-        max_fee_per_gas: int | str | None = None,
-        max_priority_fee_per_gas: int | str | None = None,
-        value: int | str | None = None,
-        data: str | bytes | None = None,
-        nonce: int | str | None = None,
-        chain_id: int | str | None = None,
-        type_: int | str | None = None,
-        access_list: list[Mapping[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        strict = bool(self._w3.config.strict)
-        tx: dict[str, Any] = {}
-
-        if from_ is not None:
-            tx["from"] = validation.normalize_address(from_, strict=strict)
-        if to is not None:
-            tx["to"] = validation.normalize_address(to, strict=strict)
-        if gas is not None:
-            tx["gas"] = validation.quantity(gas, strict=strict)
-        if gas_price is not None:
-            tx["gasPrice"] = validation.quantity(gas_price, strict=strict)
-        if max_fee_per_gas is not None:
-            tx["maxFeePerGas"] = validation.quantity(max_fee_per_gas, strict=strict)
-        if max_priority_fee_per_gas is not None:
-            tx["maxPriorityFeePerGas"] = validation.quantity(
-                max_priority_fee_per_gas, strict=strict
-            )
-        if value is not None:
-            tx["value"] = validation.quantity(value, strict=strict)
-        if data is not None:
-            tx["data"] = validation.data_hex(data, name="data", strict=strict, allow_empty=True)
-        if nonce is not None:
-            tx["nonce"] = validation.quantity(nonce, strict=strict)
-        if chain_id is not None:
-            tx["chainId"] = validation.quantity(chain_id, strict=strict)
-        if type_ is not None:
-            tx["type"] = validation.quantity(type_, strict=strict)
-        if access_list is not None:
-            tx["accessList"] = access_list
-
-        validation.validate_tx_object(tx, strict=strict)
-        return tx
 
     def _filter_object(
         self,
@@ -395,7 +346,7 @@ class Eth:
             if to is None and data is None:
                 raise ValidationError("eth_signTransaction requires at least one of 'to' or 'data'")
 
-        tx = self._tx_object(
+        tx = build_transaction_object(
             from_=from_,
             to=to,
             gas=gas,
@@ -408,6 +359,7 @@ class Eth:
             chain_id=chain_id,
             type_=type_,
             access_list=access_list,
+            strict=bool(self._w3.config.strict),
         )
         return self._w3.make_request("eth_signTransaction", [tx], route="primary")
 
@@ -459,7 +411,7 @@ class Eth:
             if to is None and data is None:
                 raise ValidationError("eth_sendTransaction requires at least one of 'to' or 'data'")
 
-        tx = self._tx_object(
+        tx = build_transaction_object(
             from_=from_,
             to=to,
             gas=gas,
@@ -472,6 +424,7 @@ class Eth:
             chain_id=chain_id,
             type_=type_,
             access_list=access_list,
+            strict=bool(self._w3.config.strict),
         )
         return self._w3.make_request("eth_sendTransaction", [tx], route="primary")
 
@@ -542,7 +495,7 @@ class Eth:
         if strict and to is None and data is None:
             raise ValidationError("eth_call requires at least one of 'to' or 'data'")
 
-        tx = self._tx_object(
+        tx = build_transaction_object(
             from_=from_,
             to=to,
             gas=gas,
@@ -555,6 +508,7 @@ class Eth:
             chain_id=chain_id,
             type_=type_,
             access_list=access_list,
+            strict=bool(self._w3.config.strict),
         )
         blk = validation.block_ref(block, strict=strict)
         freshness = _fresh_latest if _is_latest_like_block(block) else None
@@ -605,7 +559,7 @@ class Eth:
         if strict and to is None and data is None:
             raise ValidationError("eth_estimateGas requires at least one of 'to' or 'data'")
 
-        tx = self._tx_object(
+        tx = build_transaction_object(
             from_=from_,
             to=to,
             gas=gas,
@@ -618,6 +572,7 @@ class Eth:
             chain_id=chain_id,
             type_=type_,
             access_list=access_list,
+            strict=bool(self._w3.config.strict),
         )
         params: list[Any] = [tx]
         if block is not None:
@@ -780,7 +735,7 @@ class Eth:
         if strict and to is None and data is None:
             raise ValidationError("eth_createAccessList requires at least one of 'to' or 'data'")
 
-        tx = self._tx_object(
+        tx = build_transaction_object(
             from_=from_,
             to=to,
             gas=gas,
@@ -793,6 +748,7 @@ class Eth:
             chain_id=chain_id,
             type_=type_,
             access_list=access_list,
+            strict=bool(self._w3.config.strict),
         )
         params: list[Any] = [tx]
         if block is not None:
