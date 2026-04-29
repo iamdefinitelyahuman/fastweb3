@@ -615,23 +615,19 @@ class ExecutionMixin:
         calls = [_BatchCall(method=method, params=params, formatter=formatter, freshness=freshness)]
         ctx = MiddlewareContext(state={})
         calls = self._run_middlewares_before(ctx, calls)
-        if len(calls) != 1:
+        if len(calls) > 1:
             raise ValueError("Middleware transformed request() into a batch; use request_batch()")
 
+        out: list[Any | RPCError]
         try:
-            out = self._execute_single(calls[0], route=route)
+            out = [self._execute_single(calls[0], route=route)] if calls else []
         except Exception as exc:
             recovered = self._run_middlewares_on_exception(ctx, calls, exc)
             if isinstance(recovered, Exception):
                 raise recovered
-            if not recovered:
-                raise TransportError("Empty batch response")
-            item = recovered[0]
-            if isinstance(item, RPCError):
-                raise item
-            out = item
+            out = list(recovered)
 
-        results = self._run_middlewares_after(ctx, calls, [out])
+        results = self._run_middlewares_after(ctx, calls, out)
         if not results:
             raise TransportError("Empty batch response")
         item = results[0]
@@ -704,7 +700,7 @@ class ExecutionMixin:
         ctx = MiddlewareContext(state={})
         parsed = self._run_middlewares_before(ctx, parsed)
         try:
-            out = self._execute_batch(parsed, route=route)
+            out = self._execute_batch(parsed, route=route) if parsed else []
         except Exception as exc:
             recovered = self._run_middlewares_on_exception(ctx, parsed, exc)
             if isinstance(recovered, Exception):
