@@ -189,10 +189,10 @@ class ExecutionMixin:
 
         def _observe(idx: int, obs_ep, err: RPCError) -> list[_RPCErrorObservation]:
             prev = history_by_index.get(idx, [])
-            message = str(getattr(err, "message", err))
+            message = err.details.message or ""
             obs = _RPCErrorObservation(
                 endpoint_url=getattr(obs_ep, "url", str(obs_ep)),
-                code=getattr(err, "code", None),
+                code=err.details.code,
                 message=message,
                 normalized_message=_normalize_rpc_error_message(message),
             )
