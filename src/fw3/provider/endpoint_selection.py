@@ -246,9 +246,33 @@ class EndpointSelectionMixin:
             if tip < best:
                 st.tip_cooldown_until = max(st.tip_cooldown_until, now + 2.0)
 
-    def _eligible_endpoints(self, eps: list[Endpoint]) -> list[Endpoint]:
+    def _mark_method_unsupported(self, ep: Endpoint, method: str) -> None:
+        with self._lock:
+            st = self._state.get(ep)
+            if st is None:
+                return
+            if st.unsupported_methods is None:
+                st.unsupported_methods = set()
+            st.unsupported_methods.add(method)
+
+    def _supports_methods(self, ep: Endpoint, methods: set[str]) -> bool:
+        with self._lock:
+            st = self._state.get(ep)
+            if st is None or st.unsupported_methods is None:
+                return True
+            return not bool(st.unsupported_methods.intersection(methods))
+
+    def _eligible_endpoints(
+        self, eps: list[Endpoint], methods: set[str] | None = None
+    ) -> list[Endpoint]:
         now = time.time()
-        return [ep for ep in eps if not self._is_cooldown_active(ep, now)]
+        required_methods = methods or set()
+        return [
+            ep
+            for ep in eps
+            if not self._is_cooldown_active(ep, now)
+            and self._supports_methods(ep, required_methods)
+        ]
 
     def _cooldown_endpoints(self) -> set[str]:
         now = time.time()

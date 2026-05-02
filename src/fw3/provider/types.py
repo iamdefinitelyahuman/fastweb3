@@ -53,6 +53,9 @@ class _EndpointState:
     # Last tip observed from this endpoint target (LB backends may vary)
     last_tip: int | None = None
 
+    # RPC methods this endpoint has explicitly rejected as unavailable.
+    unsupported_methods: set[str] | None = None
+
 
 class _FreshnessUnmet(TransportError):
     """Internal sentinel for 'response received, but endpoint tip is too stale for this call'."""
@@ -82,6 +85,7 @@ class _RPCErrorRetryDecision:
 
     retry: bool = False
     demote_current_endpoint: bool = False
+    unsupported_method: bool = False
 
 
 @dataclass(frozen=True)

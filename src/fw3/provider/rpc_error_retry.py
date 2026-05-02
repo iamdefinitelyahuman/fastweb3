@@ -28,8 +28,6 @@ RPC_ERROR_DETERMINISTIC_NEEDLES = (
     "invalid argument",
     "invalid params",
     "invalid parameter",
-    "method not found",
-    "does not exist/is not available",
     "unsupported method",
     "insufficient funds",
     "nonce too low",
@@ -46,6 +44,13 @@ RPC_ERROR_DETERMINISTIC_NEEDLES = (
     "sender doesn't have enough funds",
     "sender doesnt have enough funds",
     "invalid sender",
+)
+
+
+RPC_ERROR_UNSUPPORTED_METHOD_NEEDLES = (
+    "method not found",
+    "does not exist/is not available",
+    "rpc method is not whitelisted",
 )
 
 RPC_ERROR_RATE_LIMIT_NEEDLES = (
@@ -123,6 +128,12 @@ def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(n in text for n in needles)
 
 
+def _is_method_unsupported_rpc_error(code: int | None, normalized_message: str) -> bool:
+    return code == -32601 and _contains_any(
+        normalized_message, RPC_ERROR_UNSUPPORTED_METHOD_NEEDLES
+    )
+
+
 def _pin_calls_to_tip(calls: list[_BatchCall], tip: int) -> list[_BatchCall]:
     """Return copies of calls pinned to a specific block tip where applicable."""
     tip_hex = hex(tip)
@@ -170,6 +181,11 @@ def _decide_rpc_error_retry(
 
     if call.method not in RPC_ERROR_SAFE_READ_METHODS:
         return _RPCErrorRetryDecision()
+
+    if _is_method_unsupported_rpc_error(code, norm):
+        return _RPCErrorRetryDecision(
+            retry=True, demote_current_endpoint=True, unsupported_method=True
+        )
 
     if code in (-32601, -32602) or _contains_any(norm, RPC_ERROR_DETERMINISTIC_NEEDLES):
         return _RPCErrorRetryDecision()

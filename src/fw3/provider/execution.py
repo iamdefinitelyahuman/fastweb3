@@ -173,6 +173,74 @@ class ExecutionMixin:
 
         raise outcome.exc
 
+    def _observe_rpc_error(
+        self,
+        history: list[_RPCErrorObservation],
+        ep,
+        err: RPCError,
+    ) -> list[_RPCErrorObservation]:
+        message = err.details.message or ""
+        return [
+            *history,
+            _RPCErrorObservation(
+                endpoint_url=getattr(ep, "target", str(ep)),
+                code=err.details.code,
+                message=message,
+                normalized_message=_normalize_rpc_error_message(message),
+            ),
+        ]
+
+    def _maybe_retry_rpc_error_single(
+        self,
+        *,
+        ep,
+        call: _BatchCall,
+        err: RPCError,
+        history: list[_RPCErrorObservation],
+    ) -> tuple[bool, list[_RPCErrorObservation]]:
+        history = self._observe_rpc_error(history, ep, err)
+        decision = _decide_rpc_error_retry(call=call, history=history)
+        if decision.unsupported_method:
+            self._mark_method_unsupported(ep, call.method)
+        if decision.demote_current_endpoint:
+            self._mark_failure(ep, TransportError("RPCError selected for retry"))
+        return decision.retry, history
+
+    def _attempt_with_rpc_error_retry(
+        self,
+        ep,
+        call: _BatchCall,
+        history: list[_RPCErrorObservation],
+    ) -> tuple[Any | None, Exception | None, list[_RPCErrorObservation]]:
+        try:
+            value, exc = self._attempt(ep, call.method, call.params, call.formatter, call.freshness)
+            return value, exc, history
+        except RPCError as err:
+            retry, history = self._maybe_retry_rpc_error_single(
+                ep=ep, call=call, err=err, history=history
+            )
+            if retry:
+                return None, err, history
+            raise
+
+    def _apply_outcome_single_with_rpc_error_retry(
+        self,
+        ep,
+        call: _BatchCall,
+        outcome: _AttemptOutcome,
+        history: list[_RPCErrorObservation],
+    ) -> tuple[Any | None, Exception | None, list[_RPCErrorObservation]]:
+        try:
+            value, exc = self._apply_outcome_single(ep, outcome)
+            return value, exc, history
+        except RPCError as err:
+            retry, history = self._maybe_retry_rpc_error_single(
+                ep=ep, call=call, err=err, history=history
+            )
+            if retry:
+                return None, err, history
+            raise
+
     def _maybe_retry_rpc_errors_in_batch(
         self,
         *,
@@ -188,15 +256,7 @@ class ExecutionMixin:
         history_by_index: dict[int, list[_RPCErrorObservation]] = {}
 
         def _observe(idx: int, obs_ep, err: RPCError) -> list[_RPCErrorObservation]:
-            prev = history_by_index.get(idx, [])
-            message = err.details.message or ""
-            obs = _RPCErrorObservation(
-                endpoint_url=getattr(obs_ep, "url", str(obs_ep)),
-                code=err.details.code,
-                message=message,
-                normalized_message=_normalize_rpc_error_message(message),
-            )
-            history = [*prev, obs]
+            history = self._observe_rpc_error(history_by_index.get(idx, []), obs_ep, err)
             history_by_index[idx] = history
             return history
 
@@ -208,6 +268,8 @@ class ExecutionMixin:
                 continue
             history = _observe(i, ep, item)
             decision = _decide_rpc_error_retry(call=calls[i], history=history)
+            if decision.unsupported_method:
+                self._mark_method_unsupported(ep, calls[i].method)
             if decision.retry:
                 retry_indices.append(i)
                 demote_initial = demote_initial or decision.demote_current_endpoint
@@ -223,7 +285,11 @@ class ExecutionMixin:
         except Exception:
             return results
 
-        eligible = [e for e in self._eligible_endpoints(candidates) if e is not ep]
+        eligible = [
+            e
+            for e in self._eligible_endpoints(candidates, {calls[i].method for i in retry_indices})
+            if e is not ep
+        ]
         if not eligible:
             return results
 
@@ -258,6 +324,8 @@ class ExecutionMixin:
                     continue
                 history = _observe(idx, retry_ep, item)
                 decision = _decide_rpc_error_retry(call=calls[idx], history=history)
+                if decision.unsupported_method:
+                    self._mark_method_unsupported(retry_ep, calls[idx].method)
                 if decision.retry:
                     new_remaining.append(idx)
                 demote_retry_ep = demote_retry_ep or decision.demote_current_endpoint
@@ -346,12 +414,15 @@ class ExecutionMixin:
                 raise AllEndpointsFailed(last_exc) from last_exc
 
         candidates = self._pool_candidates()
-        eps = self._eligible_endpoints(candidates)
+        eps = self._eligible_endpoints(candidates, {call.method})
+        if not eps:
+            raise NoEndpoints("No endpoints available")
         with self._lock:
             start = self._rr % len(eps)
             self._rr = (self._rr + 1) % (1 << 30)
         rr_ep = eps[start]
         max_exc_attempts = min(max(1, policy.max_attempts), len(eps))
+        rpc_error_history: list[_RPCErrorObservation] = []
 
         if not wants_freshness:
             last_exc: Exception | None = None
@@ -366,7 +437,9 @@ class ExecutionMixin:
                     eps[start], eps[(start + 1) % len(eps)], call
                 )
                 skip_n = 2 if loser_ep is not None else 1
-                value, exc = self._apply_outcome_single(winner_ep, outcome)
+                value, exc, rpc_error_history = self._apply_outcome_single_with_rpc_error_retry(
+                    winner_ep, call, outcome, rpc_error_history
+                )
                 if exc is None:
                     if winner_was_second and loser_ep is not None:
                         self._mark_slow(loser_ep)
@@ -382,8 +455,8 @@ class ExecutionMixin:
                 if i < skip_n:
                     continue
                 ep = eps[(start + i) % len(eps)]
-                value, exc = self._attempt(
-                    ep, call.method, call.params, call.formatter, call.freshness
+                value, exc, rpc_error_history = self._attempt_with_rpc_error_retry(
+                    ep, call, rpc_error_history
                 )
                 if exc is None:
                     return value
@@ -407,7 +480,9 @@ class ExecutionMixin:
                 hedged_eps = (ep1, ep2)
                 outcome, winner_ep, loser_ep, winner_was_second = self._race_single(ep1, ep2, call)
                 skip_n = 2 if loser_ep is not None else 1
-                value, exc = self._apply_outcome_single(winner_ep, outcome)
+                value, exc, rpc_error_history = self._apply_outcome_single_with_rpc_error_retry(
+                    winner_ep, call, outcome, rpc_error_history
+                )
                 if exc is None:
                     if winner_was_second and loser_ep is not None:
                         self._mark_slow(loser_ep)
@@ -419,8 +494,8 @@ class ExecutionMixin:
             for idx, ep in enumerate(ordered):
                 if hedged_eps is not None and idx < skip_n and ep in hedged_eps:
                     continue
-                value, exc = self._attempt(
-                    ep, call.method, call.params, call.formatter, call.freshness
+                value, exc, rpc_error_history = self._attempt_with_rpc_error_retry(
+                    ep, call, rpc_error_history
                 )
                 if exc is None:
                     return value
@@ -434,7 +509,7 @@ class ExecutionMixin:
             if time.time() >= deadline:
                 raise AllEndpointsFailed(last_exc) from last_exc
             time.sleep(policy.backoff_seconds)
-            eps = self._eligible_endpoints(candidates)
+            eps = self._eligible_endpoints(candidates, {call.method})
             if not eps:
                 raise NoEndpoints("No endpoints available")
             rr_ep = eps[start % len(eps)]
@@ -464,7 +539,9 @@ class ExecutionMixin:
                 raise AllEndpointsFailed(last_exc) from last_exc
 
         candidates = self._pool_candidates()
-        eps = self._eligible_endpoints(candidates)
+        eps = self._eligible_endpoints(candidates, {c.method for c in parsed})
+        if not eps:
+            raise NoEndpoints("No endpoints available")
         with self._lock:
             start = self._rr % len(eps)
             self._rr = (self._rr + 1) % (1 << 30)
@@ -572,7 +649,7 @@ class ExecutionMixin:
             if time.time() >= deadline:
                 raise AllEndpointsFailed(last_exc) from last_exc
             time.sleep(policy.backoff_seconds)
-            eps = self._eligible_endpoints(candidates)
+            eps = self._eligible_endpoints(candidates, {c.method for c in parsed})
             if not eps:
                 raise NoEndpoints("No endpoints available")
             rr_ep = eps[start % len(eps)]
