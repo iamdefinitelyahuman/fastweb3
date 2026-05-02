@@ -99,7 +99,7 @@ class Endpoint:
             )
         else:
             details = RPCErrorDetails(code=None, message=str(err), data=None)
-        return RPCError(details)
+        return RPCError(details, endpoint=self.target)
 
     def close(self) -> None:
         """Close the underlying transport."""

@@ -46,9 +46,10 @@ class TransportError(FastWeb3Error):
 class RPCError(FastWeb3Error):
     """JSON-RPC-level error (error object in response)."""
 
-    def __init__(self, details: RPCErrorDetails) -> None:
+    def __init__(self, details: RPCErrorDetails, *, endpoint: str | None = None) -> None:
         super().__init__(f"RPCError {details.code}: {details.message}")
         self.details = details
+        self.endpoint = endpoint
 
 
 class RPCMalformedResponse(FastWeb3Error):
