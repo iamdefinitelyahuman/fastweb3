@@ -17,10 +17,13 @@ from typing import Callable, Sequence
 
 from ..errors import TransportError
 from ..middleware import _apply_default_middlewares
+from .attempts import AttemptMixin
 from .endpoint_selection import EndpointSelectionMixin
 from .execution import ExecutionMixin
+from .hedging import HedgingMixin
 from .middleware import MiddlewareMixin
 from .pool import PoolManager
+from .rpc_error_handling import RPCErrorHandlingMixin
 from .types import RetryPolicy
 
 
@@ -28,7 +31,14 @@ def _default_is_retryable_exc(exc: Exception) -> bool:
     return isinstance(exc, TransportError)
 
 
-class Provider(MiddlewareMixin, EndpointSelectionMixin, ExecutionMixin):
+class Provider(
+    MiddlewareMixin,
+    EndpointSelectionMixin,
+    AttemptMixin,
+    HedgingMixin,
+    RPCErrorHandlingMixin,
+    ExecutionMixin,
+):
     """Facade over endpoint selection, execution, and middleware orchestration.
 
     This is an advanced interface. In typical usage, you should construct and
