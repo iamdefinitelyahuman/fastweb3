@@ -7,8 +7,7 @@ from typing import Any, Callable, Optional
 import pytest
 
 import fw3.provider.endpoint_selection as es_mod
-import fw3.provider.execution as exec_mod
-from fw3.errors import AllEndpointsFailed, NoEndpoints
+from fw3.errors import AllEndpointsFailed, NoEndpoints, RPCError, RPCErrorDetails
 from fw3.provider import Provider, RetryPolicy
 
 
@@ -188,20 +187,18 @@ def test_rpc_error_bubbles_immediately(
     a = p._get_or_create_endpoint("http://a")
     assert isinstance(a, FakeEndpoint)
 
-    class DummyRPCError(Exception):
-        pass
-
-    # Patch provider_mod.RPCError to our dummy so Provider's except RPCError catches it.
-    monkeypatch.setattr(exec_mod, "RPCError", DummyRPCError)
+    err = RPCError(RPCErrorDetails(code=-32602, message="invalid params"))
 
     def raise_rpc_error(*args: Any, **kwargs: Any) -> Any:
-        raise DummyRPCError("rpc boom")
+        raise err
 
     # Patch only this endpoint's request_batch to raise.
     a.request_batch = raise_rpc_error  # type: ignore[method-assign]
 
-    with pytest.raises(DummyRPCError, match="rpc boom"):
+    with pytest.raises(RPCError) as excinfo:
         p.request("eth_test", [], route="pool", freshness=_fresh_latest)
+
+    assert excinfo.value is err
 
 
 def test_freshness_unmet_eventually_errors(patch_endpoint: None) -> None:

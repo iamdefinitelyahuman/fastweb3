@@ -309,11 +309,80 @@ def test_pool_rpcerror_does_not_retry_by_default(no_sleep) -> None:
     b.queue_return("OK")
 
     with pytest.raises(RPCError):
-        p.request("eth_call", ("x",), route="pool")
+        p.request("eth_sendRawTransaction", ("x",), route="pool")
 
     assert no_sleep == []
     assert len(a.calls) == 1
     assert len(b.calls) == 0
+
+
+def test_pool_method_not_whitelisted_retries_then_skips_endpoint_for_same_method(no_sleep) -> None:
+    p = Provider(["a", "b"], retry_policy_pool=RetryPolicy(max_attempts=2, backoff_seconds=0.5))
+    a = _ep(p, "a")
+    b = _ep(p, "b")
+
+    a.queue_raise(_rpc_error(code=-32601, message="rpc method is not whitelisted"))
+    b.queue_return("OK")
+
+    assert p.request("eth_call", ({"to": "0x1"}, "latest"), route="pool") == "OK"
+    assert no_sleep == [0.5]
+    assert len(a.calls) == 1
+    assert len(b.calls) == 1
+
+    b.queue_return("OK2")
+    assert p.request("eth_call", ({"to": "0x2"}, "latest"), route="pool") == "OK2"
+    assert len(a.calls) == 1
+    assert len(b.calls) == 2
+
+
+def test_pool_method_denylist_is_per_method(no_sleep, fixed_time) -> None:
+    p = Provider(["a", "b"], retry_policy_pool=RetryPolicy(max_attempts=2, backoff_seconds=0.0))
+    a = _ep(p, "a")
+    b = _ep(p, "b")
+
+    a.queue_raise(_rpc_error(code=-32601, message="rpc method is not whitelisted"))
+    b.queue_return("CALL_OK")
+    assert p.request("eth_call", ({"to": "0x1"}, "latest"), route="pool") == "CALL_OK"
+
+    a.queue_return("CHAIN_OK")
+    fixed_time["t"] += 1.0
+    p._rr = 0  # type: ignore[attr-defined]
+    assert p.request("eth_chainId", (), route="pool") == "CHAIN_OK"
+
+    assert a.calls == [
+        ("eth_call", [{"to": "0x1"}, "latest"]),
+        ("eth_chainId", []),
+    ]
+    assert b.calls == [("eth_call", [{"to": "0x1"}, "latest"])]
+
+
+def test_pool_does_not_denylist_method_for_invalid_params(no_sleep) -> None:
+    p = Provider(["a", "b"], retry_policy_pool=RetryPolicy(max_attempts=2, backoff_seconds=0.0))
+    a = _ep(p, "a")
+    b = _ep(p, "b")
+
+    a.queue_raise(_rpc_error(code=-32602, message="invalid params"))
+
+    with pytest.raises(RPCError):
+        p.request("eth_call", ({"to": "0x1"},), route="pool")
+
+    a.queue_return("OK")
+    p._rr = 0  # type: ignore[attr-defined]
+    assert p.request("eth_call", ({"to": "0x2"}, "latest"), route="pool") == "OK"
+    assert len(a.calls) == 2
+    assert len(b.calls) == 0
+
+
+def test_eligible_endpoints_filters_unsupported_methods() -> None:
+    p = Provider(["a", "b"])
+    a = _ep(p, "a")
+    b = _ep(p, "b")
+
+    p._mark_method_unsupported(a, "eth_call")  # type: ignore[attr-defined]
+    candidates = p._pool_candidates()  # type: ignore[attr-defined]
+
+    assert p._eligible_endpoints(candidates, {"eth_call"}) == [b]  # type: ignore[attr-defined]
+    assert p._eligible_endpoints(candidates, {"eth_chainId"}) == [a, b]  # type: ignore[attr-defined]
 
 
 def test_cooldown_skips_failed_endpoint_until_expired(fixed_time, no_sleep) -> None:

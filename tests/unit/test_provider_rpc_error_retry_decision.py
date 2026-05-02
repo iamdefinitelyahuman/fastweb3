@@ -41,7 +41,6 @@ def test_decide_retry_non_safe_method_never_retries() -> None:
     ("code", "message"),
     [
         (-32602, "invalid params"),
-        (-32601, "method not found"),
         (-32000, "execution reverted: nope"),
         (-32000, "nonce too low"),
     ],
@@ -53,6 +52,36 @@ def test_decide_retry_deterministic_errors_never_retry(code: int, message: str) 
     )
     assert decision.retry is False
     assert decision.demote_current_endpoint is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "method not found",
+        "the method eth_call does not exist/is not available",
+        "rpc method is not whitelisted",
+    ],
+)
+def test_decide_retry_method_unsupported_errors_retry_with_demote_and_unsupported_method(
+    message: str,
+) -> None:
+    decision = _decide_rpc_error_retry(
+        call=_call("eth_call"),
+        history=[_obs("a", -32601, message)],
+    )
+    assert decision.retry is True
+    assert decision.demote_current_endpoint is True
+    assert decision.unsupported_method is True
+
+
+def test_decide_retry_method_unsupported_error_does_not_retry_unsafe_method() -> None:
+    decision = _decide_rpc_error_retry(
+        call=_call("eth_sendRawTransaction"),
+        history=[_obs("a", -32601, "rpc method is not whitelisted")],
+    )
+    assert decision.retry is False
+    assert decision.demote_current_endpoint is False
+    assert decision.unsupported_method is False
 
 
 def test_decide_retry_rate_limit_retries_without_demote_then_stops_after_three_matching_endpoints():
