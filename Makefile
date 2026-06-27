@@ -1,4 +1,4 @@
-.PHONY: help clean install dev test lint format build publish
+.PHONY: help clean install dev test lint format build publish compress
 
 help:
 	@echo ""
@@ -11,6 +11,7 @@ help:
 	@echo "  make build     Build distribution artifacts"
 	@echo "  make publish   Build and upload to PyPI via twine"
 	@echo "  make clean     Remove build artifacts and caches"
+	@echo "  make compress  Create a tarfile of the repo"
 	@echo ""
 
 clean:
@@ -39,3 +40,6 @@ build: clean
 
 publish: build
 	twine upload dist/*
+
+compress: clean
+	tar -czf repo.tar.gz docs src tests Makefile mkdocs.yml pyproject.toml README.md
